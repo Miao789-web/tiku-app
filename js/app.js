@@ -194,7 +194,12 @@
             ? '<div class="mt8" style="border-radius:10px;overflow:hidden;border:1px solid var(--line)">' +
                 (url ? '<img src="' + url + '" style="width:100%;display:block">'
                      : '<div class="empty small" style="padding:18px">原图加载中…</div>') + '</div>'
-            : '<p class="muted mt8">（没有保存原图）</p>')
+            : '<p class="muted mt8">（没有保存原图）</p>') +
+          ((q.images && q.images.length)
+            ? '<div class="mt8">' + q.images.map(function (src) {
+                return '<img src="' + src + '" style="width:100%;display:block;border:1px solid var(--line);border-radius:10px;background:#fff;margin-top:6px">';
+              }).join('') + '</div>'
+            : '')
         : '') +
       (open ? sameBox(q) : '') +
       '<div class="qops" style="padding:10px 0 0">' +
@@ -288,6 +293,9 @@
           '<button data-act="doc:pick">' +
             '<span class="q-ico"><svg viewBox="0 0 24 24"><path d="M6 2.5h8l4 4v15H6z"/><path d="M14 2.5v4h4"/><path d="M9 12h6M9 15.5h6M9 8.5h2"/></svg></span>' +
             '<span class="q-t">导入文件</span><span class="q-d">PDF / Word 一字不差</span></button>' +
+          '<button data-act="ot:start">' +
+            '<span class="q-ico"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M13 9h5M13 12h5M5 16l4-4 3 3 3-3 4 4"/></svg></span>' +
+            '<span class="q-t">图转文字</span><span class="q-d">先解析后入库·保留图形</span></button>' +
         '</div>' +
 
         '<section class="card">' +
@@ -545,6 +553,11 @@
             '<span class="chip gray">难度 ' + d.difficulty + '</span>' +
           '</div>' +
           '<p class="qtext">' + esc(body) + '</p>' +
+          (d.images && d.images.length
+            ? '<div class="mt8">' + d.images.map(function (src) {
+                return '<img src="' + src + '" style="width:100%;display:block;border:1px solid var(--line);border-radius:10px;margin-top:6px;background:#fff">';
+              }).join('') + '<p class="muted" style="font-size:12px;margin-top:4px">↑ 题目图形（来自文档，随题保存）</p></div>'
+            : '') +
           (d.solution
             ? '<div class="solution-box"><b>解题思路</b>' + esc(d.solution) + '</div>'
             : '') +
@@ -591,6 +604,85 @@
           '<div class="bb-info">' + S.drafts.length + ' 题<br>待确认 ' + S.drafts.filter(function (d) { return d.needsConfirm && !d.aiPending; }).length + '</div>' +
           '<button class="btn primary grow" data-act="confirm:save"' + (S.drafts.length ? '' : ' disabled') + '>确认入库</button>' +
         '</div>';
+    }
+  };
+
+  /* =========================================================
+   * 图转文字（先解析预览，再导入题库）
+   * ======================================================= */
+  function copyText(text) {
+    return new Promise(function (resolve) {
+      function fallback() {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed'; ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.focus(); ta.select();
+          const ok = document.execCommand('copy');
+          document.body.removeChild(ta);
+          return ok;
+        } catch (e) { return false; }
+      }
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function () { resolve(true); }, function () { resolve(fallback()); });
+      } else resolve(fallback());
+    });
+  }
+
+  PAGES.otext = {
+    tab: false,
+    topbar() {
+      return backBtn() + '<div class="tb-title">图片转文字' +
+        '<div class="tb-sub">检查修改后再导入题库</div></div>' +
+        '<button class="tb-btn text" data-act="ot:copyAll">全部复制</button>';
+    },
+    html() {
+      const s = S.session;
+      if (!s) return '<div class="empty">没有解析结果，请先拍照</div>';
+      if (s.stage === 'ocr') {
+        return '<div class="scan-list" id="scanList">' + s.images.map(scanItemHtml).join('') + '</div>' +
+          '<section class="card" style="text-align:center;padding:28px 16px">' +
+            '<p style="font-weight:700;font-size:15px" id="ocrTip">正在识别文字…</p>' +
+            '<p class="muted mt8" id="ocrSub">首次使用会下载中文识别模型（约 15MB），请保持网络</p>' +
+            '<div class="bar mt16"><i id="ocrBar" style="width:8%"></i></div>' +
+          '</section>' +
+          '<button class="btn ghost block mt12" data-act="confirm:cancel">取消识别</button>';
+      }
+      if (s.stage !== 'otext') return '<div class="empty">没有解析结果，请先拍照</div>';
+      const blocks = s.images.map(function (im, i) {
+        const docImgs = im.docImages || [];
+        return '<section class="card">' +
+          '<div class="card-h"><h3>图 ' + (i + 1) + ' · 原图与图形</h3>' +
+            '<button class="small" style="color:var(--brand);font-weight:600" data-act="ot:copy" data-i="' + i + '">复制文字</button></div>' +
+          (im.url
+            ? '<img src="' + im.url + '" style="width:100%;display:block;border:1px solid var(--line);border-radius:10px;background:#fff">'
+            : '') +
+          '<textarea class="input mt8" data-otext="' + i + '" rows="8" ' +
+            'style="width:100%;line-height:1.7;font-size:14px">' + esc(im.text || '') + '</textarea>' +
+          (docImgs.length
+            ? '<div class="mt8">' + docImgs.map(function (src) {
+                return '<img src="' + src + '" style="width:100%;display:block;border:1px solid var(--line);border-radius:10px;background:#fff;margin-top:6px">';
+              }).join('') + '</div>'
+            : '') +
+        '</section>';
+      }).join('');
+      const okCount = s.images.filter(im => im.text && im.text.trim()).length;
+      return '<p class="muted" style="margin:8px 4px;line-height:1.6">拍照的原图和题目图形都保留在下方；识别文字可直接修改。确认后点底部按钮，按题号切题入库。</p>' +
+        blocks +
+        '<div class="bottombar">' +
+          '<button class="btn ghost" data-act="ot:more" style="white-space:nowrap">再拍几张</button>' +
+          '<button class="btn primary grow" data-act="ot:tobank"' + (okCount ? '' : ' disabled') + '>切题并导入题库' +
+            (okCount ? '（' + okCount + ' 图）' : '') + '</button>' +
+        '</div>';
+    },
+    after() {
+      document.querySelectorAll('[data-otext]').forEach(function (ta) {
+        ta.addEventListener('input', function () {
+          const im = S.session && S.session.images[+ta.dataset.otext];
+          if (im) im.text = ta.value;
+        });
+      });
     }
   };
 
@@ -1189,6 +1281,22 @@
     if (bar) bar.style.width = Math.round(((done + (running ? (running.pct || 0) : 0)) / s.images.length) * 100) + '%';
   }
 
+  /** 把文字里的【图N】占位替换掉，并把对应的图收集起来归属到该题 */
+  function stripImageMarkers(it, imgs) {
+    const found = [];
+    function clean(s) {
+      return String(s || '').replace(/【图(\d+)】/g, function (m, n) {
+        const idx = parseInt(n, 10) - 1;
+        if (imgs[idx]) { if (found.indexOf(imgs[idx]) < 0) found.push(imgs[idx]); return ''; }
+        return m;
+      });
+    }
+    it.text = clean(it.text).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    it.subs = (it.subs || []).map(clean);
+    it.options = (it.options || []).map(clean);
+    return found;
+  }
+
   function buildDrafts() {
     const s = S.session;
     const drafts = [];
@@ -1196,12 +1304,15 @@
       if (!im.text) return;
       // 手动粘贴路径没有经过 OCR.tidy，这里统一清洗（幂等，重复调用无副作用）
       const items = Splitter.split(OCR.tidy ? OCR.tidy(im.text) : im.text);
+      const docImgs = im.docImages || [];
       items.forEach(function (it) {
+        const found = docImgs.length ? stripImageMarkers(it, docImgs) : [];
         drafts.push({
           key: Util.uid('d'), imgIndex: idx, no: it.no,
           text: it.text, subs: it.subs, options: it.options,
           answer: it.answer, solution: it.solution,
           type: it.type, difficulty: it.difficulty,
+          images: found,
           point: '', pointId: '', confidence: 0, needsConfirm: true, aiPending: true
         });
       });
@@ -1213,7 +1324,7 @@
     const s = ensureSession();
     if (!s.images.length) return;
     s.stage = 'ocr';
-    await navigate('confirm');
+    await navigate(s.mode === 'text' ? 'otext' : 'confirm');
     await doOCR();
   }
 
@@ -1241,6 +1352,13 @@
 
     const failed = s.images.filter(im => im.status === 'error');
     if (failed.length) UI.toast(failed.length + ' 张识别失败：' + (failed[0].error || '未知错误'), 2600);
+
+    // 图转文字模式：停在预览页让老师检查/修改文字，不自动入库
+    if (s.mode === 'text') {
+      s.stage = 'otext';
+      await navigate('otext');
+      return;
+    }
 
     buildDrafts();
     s.stage = 'confirm';
@@ -1318,6 +1436,7 @@
         subs: d.subs || [],
         answer: d.answer || '',
         solution: d.solution || '',
+        images: (d.images && d.images.length) ? d.images : [],
         assetId: assetIds[d.imgIndex] || '',
         confidence: d.confidence,
         needsConfirm: !!d.needsConfirm,
@@ -1345,7 +1464,11 @@
         '</div>' +
         '<div id="ppList">' + ppListHtml(points) + '</div>' +
         '<div class="field mt12"><label>新建考点</label>' +
-          '<input class="input" id="ppNew" placeholder="如：三角形面积求高">' +
+          '<div class="row" style="gap:8px;align-items:center">' +
+            '<input class="input" id="ppNew" placeholder="如：三角形面积求高" style="flex:1">' +
+            '<button class="btn soft" data-act="pp:polish" style="white-space:nowrap;padding:10px 12px">AI 简短</button>' +
+          '</div>' +
+          '<p class="muted" style="font-size:12px;margin-top:4px">输入随手记的说法，点「AI 简短」自动提炼成简短通顺的考点名</p>' +
         '</div>' +
         '<div class="row" style="gap:8px">' +
           '<button class="btn ghost grow" data-act="pp:cancel">取消</button>' +
@@ -1524,7 +1647,43 @@
     },
 
     /* ---- 拍照 ---- */
-    'cap:start': function () { startCapture(); },
+    'cap:start': function () { ensureSession().mode = 'photo'; startCapture(); },
+    'ot:start': function () {
+      S.session = null;               // 全新解析会话
+      const s = ensureSession();
+      s.mode = 'text';
+      navigate('capture');
+    },
+    'ot:more': function () {
+      const s = ensureSession();
+      s.mode = 'text';
+      s.stage = 'pick';
+      navigate('capture');
+    },
+    'ot:copy': async function (d) {
+      const im = S.session && S.session.images[+d.i];
+      if (!im) return;
+      const ok = await copyText(im.text || '');
+      UI.toast(ok ? '已复制到剪贴板' : '复制失败，请长按文字手动选择复制', 2200);
+    },
+    'ot:copyAll': async function () {
+      const s = S.session;
+      if (!s) return;
+      const all = s.images.map(function (im, i) {
+        return '【图 ' + (i + 1) + '】\n' + (im.text || '');
+      }).join('\n\n');
+      const ok = await copyText(all);
+      UI.toast(ok ? '全部文字已复制' : '复制失败，请长按文字手动复制', 2200);
+    },
+    'ot:tobank': async function () {
+      const s = S.session;
+      if (!s) return;
+      buildDrafts();
+      if (!S.drafts.length) { UI.toast('没有解析出文字，请重新拍照'); return; }
+      s.stage = 'confirm';
+      await navigate('confirm');
+      await classifyDrafts();
+    },
     'cap:add': function () {
       UI.sheet({
         title: '添加图片',
@@ -1684,6 +1843,20 @@
       if (UI._resolve) { UI._resolve(v); UI._resolve = null; }
     },
     'pp:cancel': function () { UI.close(); if (UI._resolve) { UI._resolve(null); UI._resolve = null; } },
+    'pp:polish': async function () {
+      const el = document.getElementById('ppNew');
+      const raw = el ? el.value.trim() : '';
+      if (!raw) { UI.toast('先输入考点说法，再点「AI 简短」'); return; }
+      const btn = document.querySelector('[data-act="pp:polish"]');
+      if (btn) { btn.disabled = true; btn.textContent = '润色中…'; }
+      try {
+        const out = await AI.polish(raw);
+        if (el) el.value = out;
+        UI.toast(out ? '已提炼：' + out : '没有提炼出结果', 2200);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'AI 简短'; }
+      }
+    },
     'pp:new': function () {
       const el = document.getElementById('ppNew');
       const name = el ? el.value.trim() : '';
@@ -2331,14 +2504,16 @@
     const file = files[0];
     UI.toast('正在解析 ' + file.name + ' …', 4000);
     try {
-      const raw = await DocParse.extract(file);
-      const text = OCR.tidy ? OCR.tidy(raw) : raw;
+      const res = DocParse.extractDoc
+        ? await DocParse.extractDoc(file)
+        : { text: await DocParse.extract(file), images: [] };
+      const text = OCR.tidy ? OCR.tidy(res.text) : res.text;
       if (!text.trim()) {
         throw new Error('没有解析出文字。扫描版 PDF（图片型）无法提取文字，请回到首页用拍照录入');
       }
       const s = ensureSession();
       s.images.forEach(im => URL.revokeObjectURL(im.url));
-      s.images = [{ id: Util.uid('im'), blob: null, url: '', status: 'done', text: text, pct: 1 }];
+      s.images = [{ id: Util.uid('im'), blob: null, url: '', status: 'done', text: text, pct: 1, docImages: res.images || [] }];
       if (!s.batchName) s.batchName = file.name.replace(/\.[a-z0-9]+$/i, '');
       buildDrafts();
       s.stage = 'confirm';

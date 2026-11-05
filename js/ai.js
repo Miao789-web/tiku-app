@@ -232,6 +232,48 @@ const AI = (function () {
     }
   }
 
+  /** 考点语言润色：大模型提炼为简短规范名称；未配置/失败时本地兜底清洗 */
+  async function polish(text) {
+    const raw = String(text || '').trim();
+    if (!raw) return '';
+    function local() {
+      return raw
+        .replace(/^\s*\d{1,2}\s*[.、．,，)）]\s*/, '')
+        .replace(/[\s。，,；;：:！!？?、（）()\[\]【】"'’“”~～·]+/g, '')
+        .replace(/这个|那个|有关|相关问题|的题|题目|类型|知识点|知识点/g, '')
+        .slice(0, 14);
+    }
+    if (!enabled()) return local();
+    const cfg = CONFIG.llm;
+    const ctrl = new AbortController();
+    const timer = setTimeout(function () { ctrl.abort(); }, cfg.timeoutMs || 40000);
+    try {
+      const resp = await fetch(cfg.baseUrl.replace(/\/$/, '') + '/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + cfg.apiKey },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          model: cfg.model,
+          temperature: 0.2,
+          messages: [
+            { role: 'system', content: '你是小学教研老师。把用户输入提炼成一个简短、通顺、规范的考点名称：4-12 个字，动宾或名词短语，不带标点、序号和“的题/题目”等冗余词。只输出考点名称本身，不要任何解释。' },
+            { role: 'user', content: raw }
+          ]
+        })
+      });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const j = await resp.json();
+      const out = String((j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '')
+        .trim().replace(/^["'“”]+|["'“”。]+$/g, '');
+      return out || local();
+    } catch (e) {
+      console.warn('[AI] 考点润色失败，本地兜底：', e.message);
+      return local();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** 设置页里的连通性自测 */
   async function testConnect() {
     const cfg = CONFIG.llm;
@@ -250,5 +292,5 @@ const AI = (function () {
     return (j.choices && j.choices[0].message.content) || '连通';
   }
 
-  return { classify, similar, enabled, testConnect, localClassify };
+  return { classify, similar, polish, enabled, testConnect, localClassify };
 })();

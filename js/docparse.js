@@ -79,13 +79,70 @@ const DocParse = (function () {
    * @returns {Promise<string>}
    */
   async function extract(file, onProgress) {
+    const r = await extractDoc(file, onProgress);
+    return r.text;
+  }
+
+  /**
+   * 提取文字 + 图形（Word 里的插图转为 dataURI，正文用【图N】占位）
+   * @returns {Promise<{text:string, images:string[]}>}
+   */
+  async function extractDoc(file, onProgress) {
     const e = ext(file && file.name);
-    if (e === 'docx') return fromDocx(file);
+    if (e === 'docx') {
+      const mammoth = await loadMammoth();
+      const buf = await file.arrayBuffer();
+      // 默认图片处理器会把内嵌图片转成 <img src="data:image/...;base64,...">
+      const res = await mammoth.convertToHtml({ arrayBuffer: buf });
+      return htmlToDoc(res && res.value ? res.value : '');
+    }
     if (e === 'doc') throw new Error('旧版 .doc 请先用 Word/WPS 另存为 .docx 再导入');
-    if (e === 'pdf') return fromPdf(file, onProgress);
-    if (e === 'txt') return file.text();
+    if (e === 'pdf') {
+      const text = await fromPdf(file, onProgress);
+      return { text: text, images: [] };
+    }
+    if (e === 'txt') return { text: await file.text(), images: [] };
     throw new Error('暂不支持 .' + (e || '?') + ' 文件，请用 PDF / Word(.docx) / TXT');
   }
 
-  return { extract };
+  /** 把 mammoth 输出的 HTML 还原为"一行文字/一图一行"的纯文本 + 图片列表 */
+  function htmlToDoc(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const lines = [];
+    const images = [];
+
+    function pushText(t) {
+      String(t || '').split(/\r?\n/).forEach(function (seg) {
+        if (seg.trim()) lines.push(seg.trim());
+      });
+    }
+
+    function walk(node) {
+      Array.from(node.childNodes).forEach(function (ch) {
+        if (ch.nodeType === 3) { pushText(ch.nodeValue); return; }
+        if (ch.nodeType !== 1) return;
+        const tag = ch.tagName.toLowerCase();
+        if (tag === 'img') {
+          const src = ch.getAttribute('src') || '';
+          if (src.indexOf('data:image') === 0) {
+            images.push(src);
+            lines.push('【图' + images.length + '】');
+          }
+        } else if (tag === 'br') {
+          lines.push('');
+        } else if (tag === 'p' || tag === 'li' || tag === 'tr' || /^h[1-6]$/.test(tag)) {
+          walk(ch);
+          lines.push('');
+        } else {
+          walk(ch);
+        }
+      });
+    }
+
+    walk(doc.body);
+    const text = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { text: text, images: images };
+  }
+
+  return { extract, extractDoc };
 })();

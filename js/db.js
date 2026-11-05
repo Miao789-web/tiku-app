@@ -159,6 +159,7 @@ const Store = (function () {
         rawText: '',
         answer: '',
         solution: '',
+        images: [],               // 文档导入的题目图形（dataURI 数组）
         batchName: '',            // 来源练习名，如“数学练习册P23”
         batchDate: '',            // 作业时间（YYYY-MM-DD），同类题关联展示用
         status: 'todo',           // todo | mastered
