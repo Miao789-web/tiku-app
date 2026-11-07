@@ -363,6 +363,53 @@ body[data-tab="off"] .view { padding-bottom: calc(92px + var(--safe-b)); }
 .qops button:active { background: #eceffa; }
 .qops button.del { color: var(--danger); margin-left: auto; }
 
+/* 确认页 · 配图管理 */
+.dimg-list { margin: 8px 12px 0; }
+.dimg-item {
+  position: relative;
+  border: 1px solid var(--line); border-radius: 10px;
+  overflow: hidden; background: #fff; margin-top: 6px;
+}
+.dimg-item img { width: 100%; display: block; }
+.dimg-item .dimg-x {
+  position: absolute; right: 6px; top: 6px;
+  width: 28px; height: 28px; border-radius: 50%;
+  background: rgba(17, 24, 39, .62); color: #fff;
+  font-size: 14px; display: grid; place-items: center;
+}
+.dimg-item .dimg-x:active { background: var(--danger); }
+
+.pool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pool-tile {
+  position: relative;
+  border: 1px solid var(--line); border-radius: 12px;
+  overflow: hidden; background: #fff;
+}
+.pool-tile.picked { border-color: var(--brand); box-shadow: 0 0 0 2px var(--brand-soft); }
+.pool-tile img {
+  width: 100%; height: 110px; object-fit: contain;
+  background: var(--panel-2); display: block;
+}
+.pool-tile .pool-tag {
+  position: absolute; left: 6px; top: 6px;
+  background: rgba(17, 24, 39, .62); color: #fff;
+  font-size: 11px; font-weight: 700;
+  padding: 2px 8px; border-radius: 999px;
+}
+.pool-tile.picked .pool-tag { background: rgba(18, 183, 106, .88); }
+.pool-tile .pool-ops { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--line); }
+.pool-tile .pool-ops button {
+  height: 34px; font-size: 12px; font-weight: 600; color: var(--brand);
+  border-right: 1px solid var(--line);
+}
+.pool-tile .pool-ops button:last-child { border-right: none; color: var(--danger); }
+.pool-tile .pool-ops button:active { background: var(--panel-2); }
+
+/* 考点新建输入 · 联想列表 */
+.pp-sug { border: 1px solid var(--line); border-radius: 11px; overflow: hidden; background: #fff; margin-top: 8px; }
+.pp-sug .list-item { padding: 9px 12px; }
+.pp-sug .list-item:active { background: var(--panel-2); }
+
 .solution-box {
   margin: 0 12px 12px;
   background: var(--panel-2);

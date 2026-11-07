@@ -44,6 +44,108 @@
   }
 
   /* =========================================================
+   * 导入草稿（确认页未入库时的自动保存 / 恢复）
+   * ======================================================= */
+  const DRAFT_KEY = 'tiku.draft';
+
+  function readDraftStore() {
+    try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null'); }
+    catch (e) { return null; }
+  }
+
+  function clearDraftStore() {
+    try { localStorage.removeItem(DRAFT_KEY); } catch (e) {}
+  }
+
+  function storeDraft() {
+    if (!S.session || !S.drafts.length) return;
+    const s = S.session;
+    const plain = S.drafts.map(function (d) {
+      return {
+        no: d.no, text: d.text, subs: d.subs || [], options: d.options || [],
+        answer: d.answer || '', solution: d.solution || '',
+        type: d.type, difficulty: d.difficulty,
+        images: d.images || [], point: d.point || '', pointId: d.pointId || '',
+        confidence: d.confidence || 0, needsConfirm: !!d.needsConfirm
+      };
+    });
+    const data = {
+      subject: s.subject, grade: s.grade, unit: s.unit || '',
+      batchName: s.batchName || '', batchDate: s.batchDate || '',
+      savedAt: Date.now(), drafts: plain
+    };
+    try {
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
+    } catch (e) {
+      // 图形太多存不下：去掉图形再存一次（文字和考点不丢）
+      try {
+        data.drafts.forEach(function (d) { d.images = []; });
+        localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
+        if (!S._draftImgWarn) {
+          S._draftImgWarn = true;
+          UI.toast('草稿过大，题目图形未存入草稿', 2600);
+        }
+      } catch (e2) { /* 存不下就算了 */ }
+    }
+  }
+
+  /** 离开确认页前询问：保存草稿 / 不保存 / 取消 */
+  function askDraftChoice() {
+    return new Promise(function (resolve) {
+      UI._resolve = resolve;
+      UI.sheet({
+        title: '还没入库',
+        body: '<p style="font-size:14px;line-height:1.7;color:var(--ink-2);margin-bottom:14px">' +
+          '当前编辑的 ' + S.drafts.length + ' 道题还没入库，要保存成草稿吗？保存后可在首页恢复继续入库。</p>' +
+          '<button class="btn primary block" data-act="draft:keep">保存草稿并返回</button>' +
+          '<button class="btn ghost block mt8" data-act="draft:drop">不保存，直接返回</button>' +
+          '<button class="btn soft block mt8" data-act="draft:stay">取消，继续编辑</button>'
+      });
+    });
+  }
+
+  /* =========================================================
+   * 考点 × 单元：给考点名自动带上「·第N单元」后缀
+   * ======================================================= */
+  function unitSuffixOf(unit, subject, grade) {
+    if (!unit) return '';
+    const cat = Catalog.get(subject, grade, S.defaults.term, S.defaults.version);
+    const i = cat.indexOf(unit);
+    return i >= 0 ? '·第' + (i + 1) + '单元' : '';
+  }
+
+  /**
+   * 按单元解析考点：
+   *  - 有章节时考点名带「·第N单元」后缀，同单元同考点自动归到一起；
+   *  - 已带后缀的先按精确匹配复用，避免被模糊规则并回无后缀考点。
+   */
+  async function resolveUnitPoint(rawName, unit, subject, grade) {
+    const base = Normalize.pretty(rawName || '') || '未分类';
+    const suf = unitSuffixOf(unit, subject, grade);
+    const suffixed = (base !== '未分类' && suf && !/第\d+单元$/.test(base)) ? base + suf : base;
+    if (suffixed === base) return Normalize.resolve(base, { subject: subject, grade: grade });
+
+    const fixed = Normalize.canonicalOf(base) || base;      // 先走同义词表
+    const target = Normalize.pretty(fixed) + suf;
+    const n = Normalize.norm(target);
+    const pts = (await DB.all('points')).filter(function (p) {
+      return p.subject === subject && p.grade === grade;
+    });
+    const hit = pts.find(function (p) { return p.norm === n; });
+    if (hit) return { point: hit, isNew: false, matched: 'exact', score: 1 };
+
+    // 新建带后缀的考点（别名记下无后缀叫法，方便下次联想）
+    const point = {
+      id: Util.uid('p'), name: target, norm: n,
+      subject: subject, grade: grade,
+      aliases: Array.from(new Set([base].concat(fixed !== base ? [fixed] : []))),
+      count: 0, createdAt: Date.now()
+    };
+    await DB.put('points', point);
+    return { point: point, isNew: true, matched: 'unit-new', score: 1 };
+  }
+
+  /* =========================================================
    * UI 基础组件：toast / sheet / 对话框
    * ======================================================= */
   const UI = {
@@ -111,6 +213,13 @@
   const MAIN_PAGES = ['home', 'bank', 'review', 'settings'];
 
   async function navigate(page, params, replace) {
+    // 确认页未入库就离开：先问要不要存草稿
+    if (S.page === 'confirm' && page !== 'confirm' && S.session && S.drafts.length) {
+      const choice = await askDraftChoice();
+      if (choice === null) return;              // 留在本页
+      if (choice === 'save') storeDraft();
+      else clearDraftStore();
+    }
     if (!replace) {
       if (MAIN_PAGES.indexOf(page) >= 0) S.stack = [];
       else if (S.page !== page) S.stack.push({ page: S.page, params: S.params });
@@ -122,6 +231,12 @@
   }
 
   async function back() {
+    if (S.page === 'confirm' && S.session && S.drafts.length) {
+      const choice = await askDraftChoice();
+      if (choice === null) return;
+      if (choice === 'save') storeDraft();
+      else clearDraftStore();
+    }
     const prev = S.stack.pop();
     if (prev) {
       S.page = prev.page;
@@ -141,6 +256,8 @@
     topbar.classList.toggle('hidden', !page.topbar);
     view.innerHTML = page.html(S.params);
     if (page.after) page.after(S.params);
+    // 确认页内容有变化时自动存草稿（编辑中随时可恢复）
+    if (S.page === 'confirm' && S.session && S.drafts.length) storeDraft();
     document.querySelectorAll('.tab').forEach(function (b) {
       const to = b.dataset.to || (b.dataset.act === 'cap:start' ? 'capture' : '');
       const activeMap = { home: 'home', bank: 'bank', point: 'bank', review: 'review', settings: 'settings' };
@@ -247,6 +364,9 @@
       const units = {};
       unitQs.forEach(function (q) { const u = q.unit || '未归类'; units[u] = (units[u] || 0) + 1; });
       S.cache.home = { stats: stats, recent: recent.slice(0, 4), total: recent.length, units: units };
+      // 未完成的导入草稿（确认页没入库就退出的）
+      const dr = readDraftStore();
+      S.cache.homeDraft = (dr && dr.drafts && dr.drafts.length) ? dr : null;
     },
     html() {
       const d = S.cache.home || { stats: {}, recent: [], total: 0, units: {} };
@@ -282,6 +402,20 @@
           '<div class="h2">拍一张练习册，自动按解题思路归类</div>' +
           heroStats(s) +
         '</section>' +
+
+        (S.cache.homeDraft
+          ? '<section class="card" style="border-left:3px solid var(--brand)">' +
+              '<div class="row between"><div>' +
+                '<div style="font-weight:700;font-size:14.5px">有未完成的导入草稿 · ' + S.cache.homeDraft.drafts.length + ' 题</div>' +
+                '<p class="muted" style="margin-top:2px">保存于 ' + draftTimeStr(S.cache.homeDraft.savedAt) +
+                  (S.cache.homeDraft.unit ? ' · ' + esc(S.cache.homeDraft.unit) : '') + '</p>' +
+              '</div></div>' +
+              '<div class="row mt12" style="gap:8px">' +
+                '<button class="btn primary grow sm" data-act="draft:restore">恢复继续入库</button>' +
+                '<button class="btn danger-soft grow sm" data-act="draft:discard">丢弃</button>' +
+              '</div>' +
+            '</section>'
+          : '') +
 
         '<div class="quick">' +
           '<button data-act="cap:start">' +
@@ -554,15 +688,19 @@
           '</div>' +
           '<p class="qtext">' + esc(body) + '</p>' +
           (d.images && d.images.length
-            ? '<div class="mt8">' + d.images.map(function (src) {
-                return '<img src="' + src + '" style="width:100%;display:block;border:1px solid var(--line);border-radius:10px;margin-top:6px;background:#fff">';
-              }).join('') + '<p class="muted" style="font-size:12px;margin-top:4px">↑ 题目图形（来自文档，随题保存）</p></div>'
+            ? '<div class="dimg-list">' + d.images.map(function (src, k) {
+                return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
+                  '<button class="dimg-x" data-act="draft:rimg" data-i="' + i + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
+              }).join('') +
+              '<p class="muted" style="font-size:12px;margin-top:4px">↑ 题目图形（点 ✕ 移除，点「配图」可换图）</p></div>'
             : '') +
           (d.solution
             ? '<div class="solution-box"><b>解题思路</b>' + esc(d.solution) + '</div>'
             : '') +
           '<div class="qops">' +
             '<button data-act="draft:edit" data-i="' + i + '">编辑</button>' +
+            ((S.session.imgPool && S.session.imgPool.length)
+              ? '<button data-act="draft:imgs" data-i="' + i + '">配图</button>' : '') +
             '<button data-act="draft:split" data-i="' + i + '">拆分</button>' +
             (i > 0 ? '<button data-act="draft:merge" data-i="' + i + '">合并到上一题</button>' : '') +
             '<button class="del" data-act="draft:del" data-i="' + i + '">删除</button>' +
@@ -1236,6 +1374,13 @@
     return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
   }
 
+  /** 草稿保存时间："11月7日 15:42" */
+  function draftTimeStr(ts) {
+    const d = new Date(ts || Date.now());
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' +
+      String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+
   /** "2026-11-05" → "11月5日"；空值回退到时间戳格式 */
   function batchDateStr(q) {
     if (q && q.batchDate) {
@@ -1300,6 +1445,14 @@
   function buildDrafts() {
     const s = S.session;
     const drafts = [];
+    // 文档识别出的所有图形汇总成"图形池"，供确认页手动配图 / 删除
+    const pool = [];
+    s.images.forEach(function (im) {
+      (im.docImages || []).forEach(function (src) {
+        if (pool.indexOf(src) < 0) pool.push(src);
+      });
+    });
+    s.imgPool = pool;
     s.images.forEach(function (im, idx) {
       if (!im.text) return;
       // 手动粘贴路径没有经过 OCR.tidy，这里统一清洗（幂等，重复调用无副作用）
@@ -1413,10 +1566,10 @@
     const dateInput = document.getElementById('batchDate');
     if (dateInput && dateInput.value) s.batchDate = dateInput.value;
     for (const d of S.drafts) {
-      const name = (d.point || '未分类').trim() || '未分类';
+      // 考点名带上「·第N单元」后缀：同单元同考点自动归到同一组
       let res;
       try {
-        res = await Normalize.resolve(name, { subject: s.subject, grade: s.grade });
+        res = await resolveUnitPoint(d.point || '未分类', s.unit, s.subject, s.grade);
       } catch (e) {
         res = null;
       }
@@ -1428,7 +1581,7 @@
         batchName: s.batchName || '',
         batchDate: s.batchDate || todayStr(),
         pointId: point ? point.id : '',
-        pointName: point ? point.name : name,
+        pointName: point ? point.name : (Normalize.pretty(d.point || '') || '未分类'),
         type: d.type,
         difficulty: d.difficulty,
         text: d.text,
@@ -1447,6 +1600,8 @@
     await Store.Points.recount();
     S.defaults.subject = s.subject; S.defaults.grade = s.grade; saveDefaults();
     clearSession();
+    clearDraftStore();                       // 已入库，草稿作废
+    S.cache.homeDraft = null;
     UI.toast('已入库 ' + n + ' 道题');
     await navigate('bank');
   }
@@ -1465,9 +1620,10 @@
         '<div id="ppList">' + ppListHtml(points) + '</div>' +
         '<div class="field mt12"><label>新建考点</label>' +
           '<div class="row" style="gap:8px;align-items:center">' +
-            '<input class="input" id="ppNew" placeholder="如：三角形面积求高" style="flex:1">' +
+            '<input class="input" id="ppNew" placeholder="如：三角形面积求高" style="flex:1" autocomplete="off">' +
             '<button class="btn soft" data-act="pp:polish" style="white-space:nowrap;padding:10px 12px">AI 简短</button>' +
           '</div>' +
+          '<div id="ppSug"></div>' +
           '<p class="muted" style="font-size:12px;margin-top:4px">输入随手记的说法，点「AI 简短」自动提炼成简短通顺的考点名</p>' +
         '</div>' +
         '<div class="row" style="gap:8px">' +
@@ -1481,12 +1637,32 @@
         body: body,
         onMount: function (root) {
           const input = root.querySelector('#ppSearch');
+          input.focus();
           input.addEventListener('input', function () {
             const kw = input.value.trim().toLowerCase();
             const filtered = !kw ? points : points.filter(function (p) {
               return (p.name + ' ' + (p.aliases || []).join(' ')).toLowerCase().indexOf(kw) >= 0;
             });
             root.querySelector('#ppList').innerHTML = ppListHtml(filtered, kw);
+          });
+          // 新建考点输入联想：输入几个字就弹出已有的类似考点，点一下直接选用
+          const newInput = root.querySelector('#ppNew');
+          const sugBox = root.querySelector('#ppSug');
+          newInput.addEventListener('input', function () {
+            const kw = newInput.value.trim().toLowerCase();
+            if (!kw) { sugBox.innerHTML = ''; return; }
+            const hits = points.filter(function (p) {
+              const n = p.name.toLowerCase();
+              return n !== kw && n.indexOf(kw) >= 0;
+            }).slice(0, 8);
+            sugBox.innerHTML = hits.length
+              ? '<p class="muted" style="margin:8px 2px 4px">已有类似考点，点一下直接选用：</p>' +
+                '<div class="pp-sug">' + hits.map(function (p) {
+                  return '<div class="list-item" data-act="pp:pick" data-name="' + esc(p.name) + '" data-id="' + p.id + '">' +
+                    '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
+                    '<div class="li-s">' + (p.count || 0) + ' 题</div></div>' + ARROW + '</div>';
+                }).join('') + '</div>'
+              : '';
           });
         }
       });
@@ -1827,6 +2003,113 @@
       S.drafts.splice(+d.i, 1);
       await render();
     },
+
+    /* ---- 配图管理（确认页） ---- */
+    'draft:imgs': function (d) {
+      const i = +d.i;
+      const s = S.session;
+      if (!s || !s.imgPool || !s.imgPool.length) return;
+      const tiles = s.imgPool.map(function (src, pi) {
+        let owner = -1;
+        S.drafts.forEach(function (dd, di) {
+          if ((dd.images || []).indexOf(src) >= 0) owner = di;
+        });
+        const onThis = owner === i;
+        return '<div class="pool-tile' + (onThis ? ' picked' : '') + '">' +
+          '<img src="' + src + '" alt="图形' + (pi + 1) + '">' +
+          '<span class="pool-tag">' + (onThis ? '✓ 本题' : owner >= 0 ? '第' + (owner + 1) + '题' : '未配置') + '</span>' +
+          '<div class="pool-ops">' +
+            '<button data-act="draft:imgToggle" data-i="' + i + '" data-pi="' + pi + '">' + (onThis ? '取消配图' : '配到本题') + '</button>' +
+            '<button class="del" data-act="draft:imgDel" data-pi="' + pi + '">删除图形</button>' +
+          '</div></div>';
+      }).join('');
+      UI.sheet({
+        title: '为第 ' + (i + 1) + ' 题配图',
+        body: '<p class="muted" style="margin-bottom:10px">点「配到本题」把图形插到这道题旁；图形同时只会配给一道题。「删除图形」把识别出的图形从本次导入中删掉。</p>' +
+          '<div class="pool-grid">' + tiles + '</div>'
+      });
+    },
+    'draft:imgToggle': async function (d) {
+      const i = +d.i, pi = +d.pi;
+      const s = S.session;
+      const src = s && s.imgPool ? s.imgPool[pi] : null;
+      if (!src || !S.drafts[i]) return;
+      const draft = S.drafts[i];
+      draft.images = draft.images || [];
+      const k = draft.images.indexOf(src);
+      if (k >= 0) {
+        draft.images.splice(k, 1);             // 取消配图
+      } else {
+        // 一个图形只属于一道题：先从其他题上摘下来
+        S.drafts.forEach(function (dd) {
+          const x = (dd.images || []).indexOf(src);
+          if (x >= 0) dd.images.splice(x, 1);
+        });
+        draft.images.push(src);
+      }
+      UI.close();
+      await render();
+    },
+    'draft:imgDel': async function (d) {
+      const pi = +d.pi;
+      const s = S.session;
+      const src = s && s.imgPool ? s.imgPool[pi] : null;
+      if (!src) return;
+      const ok = await UI.confirm('删除这个识别出的图形？它会从所有题和图形列表中移除。');
+      if (!ok) return;
+      s.imgPool.splice(pi, 1);
+      S.drafts.forEach(function (dd) {
+        const x = (dd.images || []).indexOf(src);
+        if (x >= 0) dd.images.splice(x, 1);
+      });
+      UI.close();
+      await render();
+    },
+    'draft:rimg': async function (d) {
+      const draft = S.drafts[+d.i];
+      if (!draft) return;
+      (draft.images || []).splice(+d.k, 1);
+      await render();
+    },
+
+    /* ---- 草稿：离开确认页的三选 / 首页恢复 ---- */
+    'draft:keep': function () { UI.close(); if (UI._resolve) { UI._resolve('save'); UI._resolve = null; } },
+    'draft:drop': function () { UI.close(); if (UI._resolve) { UI._resolve('discard'); UI._resolve = null; } },
+    'draft:stay': function () { UI.close(); if (UI._resolve) { UI._resolve(null); UI._resolve = null; } },
+    'draft:restore': async function () {
+      const d = S.cache.homeDraft;
+      if (!d || !d.drafts || !d.drafts.length) return;
+      S.session = {
+        images: [], subject: d.subject || S.defaults.subject, grade: d.grade || S.defaults.grade,
+        unit: d.unit || '', batchName: d.batchName || '', batchDate: d.batchDate || '',
+        stage: 'confirm', mode: 'photo', imgPool: []
+      };
+      // 从草稿图形反推图形池
+      d.drafts.forEach(function (x) {
+        (x.images || []).forEach(function (src) {
+          if (S.session.imgPool.indexOf(src) < 0) S.session.imgPool.push(src);
+        });
+      });
+      S.drafts = d.drafts.map(function (x) {
+        return Object.assign({
+          key: Util.uid('d'), imgIndex: 0, subs: [], options: [],
+          images: [], aiPending: false
+        }, x);
+      });
+      S.aiFallback = '';
+      S.cache.homeDraft = null;
+      await navigate('confirm');
+      await classifyDrafts();
+      UI.toast('已恢复草稿（' + S.drafts.length + ' 题）');
+    },
+    'draft:discard': async function () {
+      const ok = await UI.confirm('丢弃这份草稿？丢弃后无法恢复。');
+      if (!ok) return;
+      clearDraftStore();
+      S.cache.homeDraft = null;
+      UI.toast('草稿已丢弃');
+      await render();
+    },
     'draft:point': async function (d) {
       const i = +d.i;
       const s = S.session;
@@ -2067,7 +2350,8 @@
       if (!q) return;
       const picked = await pickPoint(q.pointName, q.subject, q.grade);
       if (!picked) return;
-      const res = await Normalize.resolve(picked.name, { subject: q.subject, grade: q.grade });
+      // 按题目所在章节给考点带上「·第N单元」后缀
+      const res = await resolveUnitPoint(picked.name, q.unit, q.subject, q.grade);
       await Store.Questions.update(d.id, {
         pointId: res.point.id, pointName: res.point.name, needsConfirm: false
       });
@@ -2530,7 +2814,7 @@
   /* 调试钩子（控制台可用：__tiku.S、__tiku.navigate(...) 等） */
   window.__tiku = { S: S, navigate: navigate, UI: UI, ACTIONS: ACTIONS,
     ensureSession: ensureSession, buildDrafts: buildDrafts, classifyDrafts: classifyDrafts,
-    seedDemo: seedDemo, Store: Store };
+    seedDemo: seedDemo, Store: Store, resolveUnitPoint: resolveUnitPoint, unitSuffixOf: unitSuffixOf };
 
   /* =========================================================
    * 启动
