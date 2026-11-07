@@ -23,8 +23,9 @@
     defaults: { subject: '数学', grade: '五年级', term: '上册', version: '苏教版' },
     imgUrls: {},          // assetId -> objectURL
     open: {},             // questionId -> 是否展开
-    cache: {},
+    cache: { same: {} },  // same: questionId -> 同考点历史题缓存
     bank: { subject: '全部', grade: '全部', keyword: '', status: '全部', type: '全部', difficulty: '', unit: '' },
+    batch: { on: false, set: {} },   // 题库批量选择模式：set 为题目 id 集合
     reviewCfg: { subject: '全部', scope: 'due', limit: 10 },
     review: null
   };
@@ -292,9 +293,12 @@
     opts = opts || {};
     const open = !!S.open[q.id];
     const url = S.imgUrls[q.id];
-    return '<article class="card" data-id="' + q.id + '">' +
+    const batch = !!opts.batch;
+    const sel = batch && !!S.batch.set[q.id];
+    return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="batch:sel"' : '') + '>' +
       '<div class="row between wrap" style="gap:6px;margin-bottom:8px">' +
         '<div class="row wrap" style="gap:6px">' +
+          (batch ? '<span class="bcheck' + (sel ? ' on' : '') + '"></span>' : '') +
           (opts.hidePoint ? '' : '<span class="chip brand">' + esc(q.pointName || '未分类') + '</span>') +
           '<span class="chip gray">' + esc(q.type) + '</span>' +
           '<span class="chip gray">难度 ' + q.difficulty + '</span>' +
@@ -313,19 +317,23 @@
                      : '<div class="empty small" style="padding:18px">原图加载中…</div>') + '</div>'
             : '<p class="muted mt8">（没有保存原图）</p>') +
           ((q.images && q.images.length)
-            ? '<div class="mt8">' + q.images.map(function (src) {
-                return '<img src="' + src + '" style="width:100%;display:block;border:1px solid var(--line);border-radius:10px;background:#fff;margin-top:6px">';
-              }).join('') + '</div>'
+            ? '<div class="dimg-list">' + q.images.map(function (src, k) {
+                return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
+                  '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
+              }).join('') + '<p class="muted" style="font-size:12px;margin-top:4px">↑ 题目图形（点 ✕ 移除，点「配图」可增删）</p></div>'
             : '')
         : '') +
       (open ? sameBox(q) : '') +
+      (batch ? '' :
       '<div class="qops" style="padding:10px 0 0">' +
         '<button data-act="q:toggle" data-id="' + q.id + '">' + (open ? '收起' : '展开思路/原图') + '</button>' +
+        '<button data-act="q:edit" data-id="' + q.id + '">编辑</button>' +
+        '<button data-act="q:imgs" data-id="' + q.id + '">配图</button>' +
         '<button data-act="q:gen" data-id="' + q.id + '">举一反三</button>' +
         '<button data-act="q:basket" data-id="' + q.id + '">' + (Paper.has(q.id) ? '✓ 已入卷' : '加入组卷') + '</button>' +
         '<button data-act="q:point" data-id="' + q.id + '">改考点</button>' +
         '<button class="del" data-act="q:del" data-id="' + q.id + '">删除</button>' +
-      '</div>' +
+      '</div>') +
     '</article>';
   }
 
@@ -834,6 +842,7 @@
       return '<div class="tb-title">题库' +
         '<div class="tb-sub">章节 → 考点</div></div>' +
         '<button class="tb-btn text" data-act="goto" data-to="paper">组卷' + (n ? '·' + n : '') + '</button>' +
+        '<button class="tb-btn text" data-act="bank:batch">' + (S.batch.on ? '退出' : '批量') + '</button>' +
         '<button class="tb-btn" data-act="cap:start" aria-label="录题">' +
         '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>';
     },
@@ -875,7 +884,8 @@
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="bank:unit" data-v="">查看全部章节</button>' +
             '</div>'
           : '') +
-        '<div id="bankList">' + bankContentHtml() + '</div>';
+        '<div id="bankList">' + bankContentHtml() + '</div>' +
+        (S.batch.on ? batchBarHtml() : '');
     },
     after() {
       const input = document.getElementById('bankSearch');
@@ -903,9 +913,12 @@
     // 1) 搜索 / 筛选 → 题目列表
     if (!browsing) {
       const list = b.unit ? qs.filter(q => (q.unit || '未归类') === b.unit) : qs;
+      S.cache.bankListIds = list.slice(0, 100).map(q => q.id);
       if (!list.length) return '<div class="empty"><b>没有匹配的题目</b>换个条件试试</div>';
-      return '<div class="row between" style="margin:0 4px 8px"><span class="muted">共 ' + list.length + ' 道</span></div>' +
-        list.slice(0, 100).map(function (q) { return questionCard(q); }).join('');
+      const countHtml = '<div class="row between" style="margin:0 4px 8px"><span class="muted">共 ' + list.length + ' 道</span>' +
+        (S.batch.on ? '<span class="chip brand">批量模式 · 已选 ' + Object.keys(S.batch.set).length + ' 题</span>' : '') + '</div>';
+      return countHtml +
+        list.slice(0, 100).map(function (q) { return questionCard(q, S.batch.on ? { batch: true } : {}); }).join('');
     }
 
     // 2) 浏览模式：章节 → 考点（章节顺序按教材目录）
@@ -945,6 +958,29 @@
         rows +
       '</section>';
     }).join('');
+  }
+
+  /** 批量模式底部操作条 */
+  function batchBarHtml() {
+    const n = Object.keys(S.batch.set).length;
+    return '<div class="bottombar">' +
+      '<div class="bb-info">已选<br>' + n + ' 题</div>' +
+      '<button class="btn ghost sm" data-act="batch:all">全选</button>' +
+      '<button class="btn soft sm" data-act="batch:point"' + (n ? '' : ' disabled') + '>改考点</button>' +
+      '<button class="btn soft sm" data-act="batch:basket"' + (n ? '' : ' disabled') + '>入组卷</button>' +
+      '<button class="btn danger-soft sm" data-act="batch:del"' + (n ? '' : ' disabled') + '>删除</button>' +
+      '<button class="btn primary sm" data-act="batch:done">完成</button>' +
+    '</div>';
+  }
+
+  /** Blob → dataURI（配图添加用） */
+  function blobToDataURL(blob) {
+    return new Promise(function (resolve, reject) {
+      const r = new FileReader();
+      r.onload = function () { resolve(r.result); };
+      r.onerror = function () { reject(r.error || new Error('读取图片失败')); };
+      r.readAsDataURL(blob);
+    });
   }
 
   /* =========================================================
@@ -1685,6 +1721,20 @@
     return html;
   }
 
+  /** 已入库题目的配图弹层：✕ 移除 + 文件选图添加 */
+  function qImgsSheet(q) {
+    const list = (q.images || []).map(function (src, k) {
+      return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
+        '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
+    }).join('') || '<div class="empty small" style="padding:14px">这道题还没有图形，点下面按钮添加</div>';
+    UI.sheet({
+      title: '配图 · ' + (q.pointName || '未分类'),
+      body: '<p class="muted" style="margin-bottom:10px">点 ✕ 移除图形；「添加图形」从相册 / 文件选图（自动压缩后随题保存）。</p>' +
+        '<div>' + list + '</div>' +
+        '<button class="btn ghost block mt12" data-act="q:imgAdd" data-id="' + q.id + '">＋ 添加图形</button>'
+    });
+  }
+
   /* =========================================================
    * 举一反三
    * ======================================================= */
@@ -2281,6 +2331,68 @@
     'bank:setDiff': function (d) { S.bank.difficulty = d.v; UI.close(); render(); },
     'bank:resetFilter': function () { S.bank.type = '全部'; S.bank.difficulty = ''; UI.close(); render(); },
 
+    /* ---- 题库批量选择 ---- */
+    'bank:batch': function () {
+      const b = S.bank;
+      const browsing = !b.keyword.trim() && b.status === '全部' && b.type === '全部' && !b.difficulty && !b.unit;
+      if (!S.batch.on && browsing) { UI.toast('先搜索或筛选出题目列表，再批量操作'); return; }
+      S.batch.on = !S.batch.on;
+      S.batch.set = {};
+      render();
+    },
+    'batch:sel': function (d) {
+      if (S.batch.set[d.id]) delete S.batch.set[d.id];
+      else S.batch.set[d.id] = 1;
+      render();
+    },
+    'batch:all': function () {
+      const ids = S.cache.bankListIds || [];
+      const all = ids.length && ids.every(id => S.batch.set[id]);
+      if (all) ids.forEach(id => { delete S.batch.set[id]; });
+      else ids.forEach(id => { S.batch.set[id] = 1; });
+      render();
+    },
+    'batch:done': function () { S.batch.on = false; S.batch.set = {}; render(); },
+    'batch:basket': async function () {
+      const ids = Object.keys(S.batch.set);
+      if (!ids.length) { UI.toast('先勾选题目'); return; }
+      ids.forEach(id => { if (!Paper.has(id)) Paper.toggle(id); });
+      UI.toast('已加入组卷篮（' + Paper.count() + ' 题）');
+      S.batch.on = false; S.batch.set = {};
+      render();
+    },
+    'batch:del': async function () {
+      const ids = Object.keys(S.batch.set);
+      if (!ids.length) { UI.toast('先勾选题目'); return; }
+      const ok = await UI.confirm('删除选中的 ' + ids.length + ' 道题？删除后无法恢复，建议先导出备份。');
+      if (!ok) return;
+      for (const id of ids) await Store.Questions.remove(id);
+      UI.toast('已删除 ' + ids.length + ' 道题');
+      S.batch.on = false; S.batch.set = {};
+      render();
+    },
+    'batch:point': async function () {
+      const ids = Object.keys(S.batch.set);
+      if (!ids.length) { UI.toast('先勾选题目'); return; }
+      const first = await DB.get('questions', ids[0]);
+      if (!first) return;
+      const picked = await pickPoint(first.pointName, first.subject, first.grade);
+      if (!picked) return;
+      let n = 0;
+      for (const id of ids) {
+        const q = await DB.get('questions', id);
+        if (!q) continue;
+        // 按每道题自己的章节带上「·第N单元」后缀
+        const res = await resolveUnitPoint(picked.name, q.unit, q.subject, q.grade);
+        await Store.Questions.update(id, { pointId: res.point.id, pointName: res.point.name, needsConfirm: false });
+        n++;
+      }
+      await Store.Points.recount();
+      UI.toast('已把 ' + n + ' 道题改为「' + picked.name + '」');
+      S.batch.on = false; S.batch.set = {};
+      render();
+    },
+
     /* ---- 题目 ---- */
     'q:toggle': async function (d) {
       const id = d.id;
@@ -2345,6 +2457,88 @@
       }
       await render();
     },
+    /* ---- 题目编辑 / 配图（已入库） ---- */
+    'q:edit': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q) return;
+      const typeOpts = CONFIG.questionTypes.map(function (t) {
+        return '<option' + (q.type === t ? ' selected' : '') + '>' + t + '</option>';
+      }).join('');
+      UI.sheet({
+        title: '编辑题目',
+        body: '<div class="field"><label>题干</label>' +
+            '<textarea class="textarea" id="qeText" style="min-height:120px">' + esc(q.text) + '</textarea></div>' +
+          '<div class="field"><label>答案</label>' +
+            '<input class="input" id="qeAns" value="' + esc(q.answer || '') + '"></div>' +
+          '<div class="field"><label>解题思路</label>' +
+            '<textarea class="textarea" id="qeSol" style="min-height:90px">' + esc(q.solution || '') + '</textarea></div>' +
+          '<div class="row" style="gap:8px">' +
+            '<select class="select" id="qeType" style="flex:1">' + typeOpts + '</select>' +
+            '<select class="select" id="qeDiff" style="flex:1">' +
+              [1, 2, 3].map(function (n) {
+                return '<option value="' + n + '"' + (Number(q.difficulty) === n ? ' selected' : '') + '>难度 ' + n + '</option>';
+              }).join('') +
+            '</select>' +
+          '</div>' +
+          '<button class="btn primary block mt12" data-act="q:editSave" data-id="' + q.id + '">保存修改</button>'
+      });
+    },
+    'q:editSave': async function (d) {
+      const text = document.getElementById('qeText').value.trim();
+      if (!text) { UI.toast('题干不能为空'); return; }
+      await Store.Questions.update(d.id, {
+        text: text,
+        answer: document.getElementById('qeAns').value.trim(),
+        solution: document.getElementById('qeSol').value.trim(),
+        type: document.getElementById('qeType').value,
+        difficulty: Number(document.getElementById('qeDiff').value)
+      });
+      UI.close();
+      UI.toast('已保存修改');
+      await render();
+    },
+    'q:imgs': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q) return;
+      qImgsSheet(q);
+    },
+    'q:imgDel': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q || !q.images) return;
+      q.images.splice(+d.k, 1);
+      await Store.Questions.update(d.id, { images: q.images });
+      UI.close();
+      UI.toast('已移除图形');
+      await render();
+    },
+    'q:imgAdd': function (d) {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.multiple = true;
+      input.onchange = async function () {
+        const files = Array.from(input.files || []);
+        if (!files.length) return;
+        const q = await DB.get('questions', d.id);
+        if (!q) return;
+        const imgs = q.images || [];
+        for (const f of files) {
+          try {
+            const r = await ImageTool.compress(f);
+            imgs.push(await blobToDataURL(r.blob));
+          } catch (e) {
+            UI.toast('有图片处理失败：' + (e.message || e));
+          }
+        }
+        await Store.Questions.update(d.id, { images: imgs });
+        UI.toast('已添加 ' + files.length + ' 张图形');
+        const fresh = await DB.get('questions', d.id);
+        if (fresh && sheetRoot.classList.contains('show')) qImgsSheet(fresh);
+        await render();
+      };
+      input.click();
+    },
+
     'q:point': async function (d) {
       const q = await DB.get('questions', d.id);
       if (!q) return;
@@ -2631,6 +2825,8 @@
       UI.toast('已导出');
     },
     'data:syncUp': async function () {
+      const ok = await UI.confirm('把本机全部数据备份到电脑？（会覆盖电脑上的上次备份）');
+      if (!ok) return;
       try {
         const data = await Store.exportAll();
         const r = await fetch('/api/sync', {
