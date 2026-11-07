@@ -24,6 +24,9 @@
     imgUrls: {},          // assetId -> objectURL
     open: {},             // questionId -> 是否展开
     cache: { same: {} },  // same: questionId -> 同考点历史题缓存
+    dcalc: { showAns: false, t0: null, acc: 0, tick: null, base: '00:00' },  // 每日计算 UI 状态
+    dcalcPick: '',        // 每日计算设置里临时选的年级
+    dcalcDirty: false,
     bank: { subject: '全部', grade: '全部', keyword: '', status: '全部', type: '全部', difficulty: '', unit: '', point: '' },
     batch: { on: false, set: {} },   // 题库批量选择模式：set 为题目 id 集合
     reviewCfg: { subject: '全部', scope: 'due', limit: 10 },
@@ -112,6 +115,810 @@
       });
     });
   }
+
+  /* =========================================================
+   * 每日计算（首页）：按学期设置的年级 + 教材进度（周次）+ 工作日自动刷新 5 道计算题
+   * ======================================================= */
+  const DCALC_KEY = 'tiku.dcalcCfg';
+
+  function readDcalcCfg() {
+    try { return JSON.parse(localStorage.getItem(DCALC_KEY) || 'null'); } catch (e) { return null; }
+  }
+  function saveDcalcCfg(cfg) {
+    try { localStorage.setItem(DCALC_KEY, JSON.stringify(cfg)); } catch (e) {}
+  }
+  /** 学期标识：8 月起算秋季学期，2–7 月算春季学期 */
+  function semKeyOf(dt) {
+    const y = dt.getFullYear();
+    return dt.getMonth() >= 7 ? y + '秋' : y + '春';
+  }
+  function defaultStartOf(semKey) {
+    const m = String(semKey || '').match(/^(\d{4})(秋|春)$/);
+    if (!m) return '';
+    return m[2] === '秋' ? m[1] + '-09-01' : m[1] + '-02-16';
+  }
+  function dcDateKey(d) {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  }
+  /** 周末自动回退到周五：每个工作日刷新一组，双休日沿用周五的 */
+  function dcalcWorkday(now) {
+    const d = new Date(now);
+    const wd = d.getDay();
+    if (wd === 0) d.setDate(d.getDate() - 2);
+    else if (wd === 6) d.setDate(d.getDate() - 1);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  /** 按学期周次推算当前教学单元（教材日历） */
+  function dcalcUnit(cfg, day) {
+    const startStr = cfg.startDate || defaultStartOf(cfg.semKey) || defaultStartOf(semKeyOf(new Date()));
+    const start = startStr ? new Date(startStr + 'T00:00:00') : new Date(day);
+    if (isNaN(start)) return { week: 1, unit: '' };
+    let week = Math.floor((day - start) / 6048e5) + 1;
+    if (!(week >= 1)) week = 1;
+    const cat = Catalog.get('数学', cfg.grade, S.defaults.term, S.defaults.version);
+    if (week > cat.length) week = cat.length;
+    return { week: week, unit: cat[week - 1] || '' };
+  }
+
+  /* ---- 种子随机：同一天同年级同单元 → 同一组题（换工作日自动换题） ---- */
+  function dcHash(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function dcRi(rnd, a, b) { return a + Math.floor(rnd() * (b - a + 1)); }
+  function dcPick(rnd, arr) { return arr[Math.floor(rnd() * arr.length)]; }
+  function dcGcd(a, b) { return b ? dcGcd(b, a % b) : a; }
+  function dcFrac(n, d) {
+    if (d < 0) { n = -n; d = -d; }
+    const g = dcGcd(Math.abs(n), d) || 1;
+    n /= g; d /= g;
+    return d === 1 ? String(n) : n + '/' + d;
+  }
+  function dcRound(v) { return Math.round(v * 100) / 100; }
+  function dcFmt(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+  function dcFmtSec(totalSec) {
+    const s = Math.max(0, totalSec | 0);
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  /* ---- 计算题型目录（div=true 的题型出现频次自动加倍，默认除法题更多） ---- */
+  const DCALC_KINDS = [
+    { k: 'addSub20',  l: '20以内加减法',   div: false },
+    { k: 'addSub100', l: '100以内加减法',  div: false },
+    { k: 'addSub3',   l: '三位数加减法',   div: false },
+    { k: 'tableMul',  l: '表内乘法',       div: false },
+    { k: 'tableDiv',  l: '表内除法',       div: true },
+    { k: 'mul1',      l: '多位数乘一位数', div: false },
+    { k: 'div1',      l: '除数是一位数',   div: true },
+    { k: 'mul2',      l: '两位数乘两位数', div: false },
+    { k: 'div2',      l: '除数是两位数',   div: true },
+    { k: 'decAddSub', l: '小数加减法',     div: false },
+    { k: 'decMulInt', l: '小数乘整数',     div: false },
+    { k: 'decMulDec', l: '小数乘小数',     div: false },
+    { k: 'decDivInt', l: '小数除以整数',   div: true },
+    { k: 'fracAddSub', l: '分数加减法',    div: false },
+    { k: 'fracMul',   l: '分数乘法',       div: false },
+    { k: 'fracDiv',   l: '分数除法',       div: true },
+    { k: 'equation',  l: '解方程',         div: false },
+    { k: 'jianBian',  l: '简便运算',       div: false },
+    { k: 'areaCalc',  l: '面积公式计算',   div: false }
+  ];
+
+  /* ---- 计算题生成器（kind → f(rnd, lv)；lv: 1 简单 / 2 中等 / 3 挑战，默认 2） ---- */
+  const DCALC_GEN = {
+    addSub20: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) {
+        const a = dcRi(r, 2, 8);
+        if (r() < 0.5) { const b = dcRi(r, 1, 10 - a); return { q: a + ' + ' + b + ' =', a: String(a + b) }; }
+        const b = dcRi(r, 1, a - 1); return { q: a + ' − ' + b + ' =', a: String(a - b) };
+      }
+      if (lv === 3) {
+        const a = dcRi(r, 2, 12), b = dcRi(r, 2, 9);
+        if (r() < 0.5) { const c = dcRi(r, 1, 9); return { q: a + ' + ' + b + ' + ' + c + ' =', a: String(a + b + c) }; }
+        const t = a + b, c = dcRi(r, 1, t - 1); return { q: a + ' + ' + b + ' − ' + c + ' =', a: String(t - c) };
+      }
+      const plus = r() < 0.5, a = dcRi(r, 2, 18);
+      if (plus) { const b = dcRi(r, 1, 20 - a); return { q: a + ' + ' + b + ' =', a: String(a + b) }; }
+      const b = dcRi(r, 1, a - 1); return { q: a + ' − ' + b + ' =', a: String(a - b) };
+    },
+    addSub100: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) {
+        const plus = r() < 0.5, a = dcRi(r, 11, 45);
+        if (plus) { const b = dcRi(r, 3, 50 - a); return { q: a + ' + ' + b + ' =', a: String(a + b) }; }
+        const b = dcRi(r, 4, a - 3); return { q: a + ' − ' + b + ' =', a: String(a - b) };
+      }
+      if (lv === 3) {
+        const a = dcRi(r, 23, 78), b = dcRi(r, 6, 21), t = a + b;
+        const c = dcRi(r, 4, t - 5); return { q: a + ' + ' + b + ' − ' + c + ' =', a: String(t - c) };
+      }
+      const plus = r() < 0.5, a = dcRi(r, 12, 95);
+      if (plus) { const b = dcRi(r, 5, 99 - a); return { q: a + ' + ' + b + ' =', a: String(a + b) }; }
+      const b = dcRi(r, 6, a - 5); return { q: a + ' − ' + b + ' =', a: String(a - b) };
+    },
+    addSub3: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) {
+        const plus = r() < 0.5, a = dcRi(r, 60, 400);
+        if (plus) { const b = dcRi(r, 20, 500 - a); return { q: a + ' + ' + b + ' =', a: String(a + b) }; }
+        const b = dcRi(r, 30, a - 25); return { q: a + ' − ' + b + ' =', a: String(a - b) };
+      }
+      if (lv === 3) {
+        const plus = r() < 0.5, a = dcRi(r, 650, 1850);
+        if (plus) { const b = dcRi(r, 60, 1950 - a); return { q: a + ' + ' + b + ' =', a: String(a + b) }; }
+        const b = dcRi(r, 80, a - 60); return { q: a + ' − ' + b + ' =', a: String(a - b) };
+      }
+      const plus = r() < 0.5, a = dcRi(r, 150, 950);
+      if (plus) { const b = dcRi(r, 15, 999 - a); return { q: a + ' + ' + b + ' =', a: String(a + b) }; }
+      const b = dcRi(r, 25, a - 20); return { q: a + ' − ' + b + ' =', a: String(a - b) };
+    },
+    tableMul: function (r, lv) {
+      lv = lv || 2;
+      const hi = lv === 1 ? 5 : 9, lo = lv === 3 ? 3 : 2;
+      const a = dcRi(r, lo, hi), b = dcRi(r, lv === 3 ? 4 : lo, hi);
+      return { q: a + ' × ' + b + ' =', a: String(a * b) };
+    },
+    tableDiv: function (r, lv) {
+      lv = lv || 2;
+      const hi = lv === 1 ? 5 : 9, lo = lv === 3 ? 3 : 2;
+      const b = dcRi(r, lo, hi), c = dcRi(r, lv === 3 ? 4 : lo, hi);
+      return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) };
+    },
+    mul1: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const a = dcRi(r, 12, 98), b = dcRi(r, 2, 6); return { q: a + ' × ' + b + ' =', a: String(a * b) }; }
+      if (lv === 3) { const a = dcRi(r, 1002, 2998), b = dcRi(r, 3, 9); return { q: a + ' × ' + b + ' =', a: String(a * b) }; }
+      const a = dcRi(r, 102, 498), b = dcRi(r, 3, 9); return { q: a + ' × ' + b + ' =', a: String(a * b) };
+    },
+    div1: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const b = dcRi(r, 2, 5), c = dcRi(r, 6, 29); return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) }; }
+      if (lv === 3) { const b = dcRi(r, 3, 9), c = dcRi(r, 25, 198); return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) }; }
+      const b = dcRi(r, 3, 9), c = dcRi(r, 12, 98); return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) };
+    },
+    mul2: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const a = dcRi(r, 11, 29), b = dcRi(r, 11, 19); return { q: a + ' × ' + b + ' =', a: String(a * b) }; }
+      if (lv === 3) { const a = dcRi(r, 13, 79), b = dcRi(r, 12, 39); return { q: a + ' × ' + b + ' =', a: String(a * b) }; }
+      const a = dcRi(r, 12, 49), b = dcRi(r, 11, 29); return { q: a + ' × ' + b + ' =', a: String(a * b) };
+    },
+    div2: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const b = dcRi(r, 11, 19), c = dcRi(r, 3, 9); return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) }; }
+      if (lv === 3) { const b = dcRi(r, 12, 49), c = dcRi(r, 12, 48); return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) }; }
+      const b = dcRi(r, 11, 32), c = dcRi(r, 6, 24); return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) };
+    },
+    decAddSub: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) {
+        const a = dcRi(r, 12, 45) / 10;
+        if (r() < 0.5) { const b = dcRi(r, 12, Math.max(13, 48 - a * 10)) / 10; return { q: a + ' + ' + b + ' =', a: String(dcRound(a + b)) }; }
+        const b = dcRi(r, 8, Math.max(9, a * 10 - 4)) / 10; return { q: a + ' − ' + b + ' =', a: String(dcRound(a - b)) };
+      }
+      if (lv === 3) {
+        const a = dcRi(r, 115, 985) / 100;
+        if (r() < 0.5) { const b = dcRi(r, 105, Math.max(115, 995 - a * 100)) / 100; return { q: a + ' + ' + b + ' =', a: String(dcRound(a + b)) }; }
+        const b = dcRi(r, 60, Math.max(65, a * 100 - 50)) / 100; return { q: a + ' − ' + b + ' =', a: String(dcRound(a - b)) };
+      }
+      const plus = r() < 0.5, a = dcRi(r, 15, 96) / 10;
+      if (plus) { const b = dcRi(r, 12, 90) / 10; return { q: a + ' + ' + b + ' =', a: String(dcRound(a + b)) }; }
+      const b = dcRi(r, 8, Math.max(9, a * 10 - 6)) / 10; return { q: a + ' − ' + b + ' =', a: String(dcRound(a - b)) };
+    },
+    decMulInt: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const a = dcRi(r, 12, 45) / 10, b = dcRi(r, 2, 6); return { q: a + ' × ' + b + ' =', a: String(dcRound(a * b)) }; }
+      if (lv === 3) { const a = dcRi(r, 105, 985) / 100, b = dcRi(r, 3, 29); return { q: a + ' × ' + b + ' =', a: String(dcRound(a * b)) }; }
+      const a = dcRi(r, 12, 98) / 10, b = dcRi(r, 3, 24); return { q: a + ' × ' + b + ' =', a: String(dcRound(a * b)) };
+    },
+    decMulDec: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const a = dcRi(r, 12, 45) / 10, b = dcRi(r, 12, 45) / 10; return { q: a + ' × ' + b + ' =', a: String(dcRound(a * b)) }; }
+      if (lv === 3) { const a = dcRi(r, 105, 985) / 100, b = dcRi(r, 105, 985) / 100; return { q: a + ' × ' + b + ' =', a: String(dcRound(a * b)) }; }
+      const a = dcRi(r, 12, 98) / 10, b = dcRi(r, 12, 98) / 10; return { q: a + ' × ' + b + ' =', a: String(dcRound(a * b)) };
+    },
+    decDivInt: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const c = dcRi(r, 12, 45) / 10, b = dcRi(r, 2, 5); return { q: (dcRound(c * b)) + ' ÷ ' + b + ' =', a: String(c) }; }
+      if (lv === 3) { const c = dcRi(r, 105, 985) / 100, b = dcRi(r, 3, 9); return { q: (dcRound(c * b)) + ' ÷ ' + b + ' =', a: String(c) }; }
+      const c = dcRi(r, 12, 98) / 10, b = dcRi(r, 2, 8); return { q: (dcRound(c * b)) + ' ÷ ' + b + ' =', a: String(c) };
+    },
+    fracAdd: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) {
+        const d = dcPick(r, [2, 3, 4, 5, 6, 8, 10]);
+        const a = dcRi(r, 1, d - 1), b = dcRi(r, 1, d - a);
+        return { q: a + '/' + d + ' + ' + b + '/' + d + ' =', a: dcFrac(a + b, d) };
+      }
+      const pool = lv === 3 ? [4, 6, 8, 9, 10, 12, 15] : [2, 3, 4, 5, 6, 8, 10, 12];
+      const d1 = dcPick(r, pool), d2 = dcPick(r, pool);
+      const L = (d1 * d2) / dcGcd(d1, d2);
+      const a = dcRi(r, 1, d1 - 1), b = dcRi(r, 1, d2 - 1);
+      const n = a * (L / d1) + b * (L / d2);
+      return { q: a + '/' + d1 + ' + ' + b + '/' + d2 + ' =', a: dcFrac(n, L) };
+    },
+    fracSub: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) {
+        const d = dcPick(r, [2, 3, 4, 5, 6, 8, 10]);
+        const a = dcRi(r, 2, d - 1), b = dcRi(r, 1, a - 1);
+        return { q: a + '/' + d + ' − ' + b + '/' + d + ' =', a: dcFrac(a - b, d) };
+      }
+      const pool = lv === 3 ? [4, 6, 8, 9, 10, 12, 15] : [2, 3, 4, 5, 6, 8, 10];
+      const d1 = dcPick(r, pool), d2 = dcPick(r, pool);
+      const L = (d1 * d2) / dcGcd(d1, d2);
+      let a = dcRi(r, 1, d1 - 1), b = dcRi(r, 1, d2 - 1);
+      if (a * (L / d1) < b * (L / d2)) { const t = a; a = b; b = t; const td = d1; d1 = d2; d2 = td; }
+      if (a * (L / d1) < b * (L / d2)) return DCALC_GEN.fracAdd(r, lv);
+      return { q: a + '/' + d1 + ' − ' + b + '/' + d2 + ' =', a: dcFrac(a * (L / d1) - b * (L / d2), L) };
+    },
+    fracMul: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const a = dcRi(r, 1, 9), b = dcRi(r, 2, 12), c = dcRi(r, 2, 5); return { q: a + '/' + b + ' × ' + c + ' =', a: dcFrac(a * c, b) }; }
+      const hi = lv === 3 ? 14 : 12;
+      const a = dcRi(r, lv === 3 ? 2 : 1, lv === 3 ? 11 : 9), b = dcRi(r, 2, hi), c = dcRi(r, lv === 3 ? 2 : 1, lv === 3 ? 11 : 9), d = dcRi(r, 2, hi);
+      return { q: a + '/' + b + ' × ' + c + '/' + d + ' =', a: dcFrac(a * c, b * d) };
+    },
+    fracDiv: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) { const a = dcRi(r, 1, 9), b = dcRi(r, 2, 12), c = dcRi(r, 2, 5); return { q: a + '/' + b + ' ÷ ' + c + ' =', a: dcFrac(a, b * c) }; }
+      const hi = lv === 3 ? 14 : 12;
+      const a = dcRi(r, lv === 3 ? 2 : 1, lv === 3 ? 11 : 9), b = dcRi(r, 2, hi), c = dcRi(r, lv === 3 ? 2 : 1, lv === 3 ? 11 : 9), d = dcRi(r, 2, hi);
+      return { q: a + '/' + b + ' ÷ ' + c + '/' + d + ' =', a: dcFrac(a * d, b * c) };
+    },
+    equation: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1) {
+        const x = dcRi(r, 2, 20), a = dcRi(r, 1, 9);
+        if (r() < 0.5) return { q: '解方程：x + ' + a + ' = ' + (x + a) + '，x =', a: String(x) };
+        const b = x - a >= 1 ? x - a : x + a;
+        return { q: x - a >= 1 ? ('解方程：x − ' + a + ' = ' + b + '，x =') : ('解方程：x + ' + a + ' = ' + b + '，x ='), a: String(x) };
+      }
+      if (lv === 3) {
+        const a = dcRi(r, 3, 9), bb = dcRi(r, 2, a - 1), x = dcRi(r, 2, 12);
+        const c = (a - bb) * x;
+        return { q: '解方程：' + a + 'x − ' + bb + 'x = ' + c + '，x =', a: String(x) };
+      }
+      const x = dcRi(r, 2, 12), a = dcRi(r, 2, 9), b = dcRi(r, 1, 20);
+      const plus = r() < 0.5, y = plus ? a * x + b : a * x - b;
+      return { q: '解方程：' + a + 'x ' + (plus ? '+' : '−') + ' ' + b + ' = ' + y + '，x =', a: String(x) };
+    },
+    jianBian: function (r, lv) {
+      lv = lv || 2;
+      if (lv === 1 || (lv === 2 && r() < 0.5)) { const a = dcRi(r, 3, 30); return { q: '25 × ' + a + ' × 4 =', a: String(100 * a) }; }
+      const b = dcRi(r, 12, 60), a = dcRi(r, 3, 19), c = dcRi(r, 2, 20);
+      if (lv === 3 && r() < 0.5) { const mx = Math.max(a, c), mn = Math.min(a, c); return { q: b + ' × ' + mx + ' − ' + b + ' × ' + mn + ' =', a: String(b * (mx - mn)) }; }
+      return { q: b + ' × ' + a + ' + ' + b + ' × ' + c + ' =', a: String(b * (a + c)) };
+    },
+    areaCalc: function (r, lv) {
+      lv = lv || 2;
+      const lu = dcPick(r, ['厘米', '分米', '米']);
+      if (lv === 1) {
+        if (r() < 0.5) { const w = dcRi(r, 3, 12), h = dcRi(r, 2, 9); return { q: '长方形长 ' + w + lu + '、宽 ' + h + lu + '，面积 =（　）平方' + lu, a: String(w * h) }; }
+        const a = dcRi(r, 3, 12); return { q: '正方形边长 ' + a + lu + '，面积 =（　）平方' + lu, a: String(a * a) };
+      }
+      if (lv === 3) {
+        const kind = dcPick(r, ['p', 't', 'tr']);
+        if (kind === 'p') { const a = dcRi(r, 12, 48) / 10, h = dcRi(r, 12, 35) / 10; return { q: '平行四边形底 ' + a + lu + '、高 ' + h + lu + '，面积 =（　）平方' + lu, a: String(dcRound(a * h)) }; }
+        if (kind === 't') { const a = dcRi(r, 12, 40) / 10, h = dcRi(r, 12, 30) / 10; return { q: '三角形底 ' + a + lu + '、高 ' + h + lu + '，面积 =（　）平方' + lu, a: String(dcRound(a * h / 2)) }; }
+        const a = dcRi(r, 8, 30) / 10, b = dcRi(r, 12, 40) / 10, h = dcRi(r, 8, 24) / 10;
+        return { q: '梯形上底 ' + a + lu + '、下底 ' + b + lu + '、高 ' + h + lu + '，面积 =（　）平方' + lu, a: String(dcRound((a + b) * h / 2)) };
+      }
+      const kind = dcPick(r, ['p', 't', 'c']);
+      if (kind === 'p') { const a = dcRi(r, 6, 24), h = dcRi(r, 3, 15); return { q: '平行四边形底 ' + a + lu + '、高 ' + h + lu + '，面积 =（　）平方' + lu, a: String(a * h) }; }
+      if (kind === 't') { let a, h; do { a = dcRi(r, 3, 20); h = dcRi(r, 3, 20); } while ((a * h) % 2); return { q: '三角形底 ' + a + lu + '、高 ' + h + lu + '，面积 =（　）平方' + lu, a: String(a * h / 2) }; }
+      const w = dcRi(r, 4, 18), h = dcRi(r, 3, 15); return { q: '长方形长 ' + w + lu + '、宽 ' + h + lu + '，面积 =（　）平方' + lu, a: String(w * h) };
+    }
+  };
+  DCALC_GEN.fracAddSub = function (r, lv) { return r() < 0.5 ? DCALC_GEN.fracAdd(r, lv) : DCALC_GEN.fracSub(r, lv); };
+
+  /* ---- 难度档位 ---- */
+  const DCALC_DIFFS = [{ v: 1, l: '简单' }, { v: 2, l: '中等' }, { v: 3, l: '挑战' }];
+  function dcDiffLabel(v) { return (DCALC_DIFFS.find(function (x) { return x.v === (v || 2); }) || DCALC_DIFFS[1]).l; }
+
+  /* ---- 自定义题型备注 → 自动出题规则（如「商中间有0的除法」） ---- */
+  /** 按备注文本生成一道匹配题；暂无规则的备注返回 null */
+  function dcNoteGen(text, rnd) {
+    const t = String(text || '');
+    // 生成一道的工厂：三位商 ÷ 一位除数，商满足 pred
+    const gen = function (pred) {
+      for (let k = 0; k < 40; k++) {
+        const b = dcRi(rnd, 2, 9), c = dcRi(rnd, 100, 998), s = String(c);
+        if (!pred(s)) continue;
+        return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) };
+      }
+      return null;
+    };
+    if (/商?.{0,3}中(间|间有).{0,3}0|中间有0/.test(t)) {
+      return gen(function (s) { return s.length === 3 && s[1] === '0'; });
+    }
+    if (/末尾.{0,3}0|最后.{0,3}0/.test(t)) {
+      return gen(function (s) { return s.length === 3 && s[2] === '0' && s[1] !== '0'; });
+    }
+    if (/0/.test(t) && /除|÷/.test(t)) {
+      return gen(function (s) { return s.indexOf('0') >= 0 && s[0] !== '0'; });
+    }
+    if (/除|÷/.test(t)) {
+      const b = dcRi(rnd, 2, 9), c = dcRi(rnd, 12, 98);
+      return { q: (b * c) + ' ÷ ' + b + ' =', a: String(c) };
+    }
+    return null;
+  }
+  /** 汇总某天所有备注题（每条备注 n 道/天），返回 { qs, skipped } */
+  function dcNoteQs(notes, rnd, per) {
+    const qs = []; const skipped = [];
+    (notes || []).forEach(function (nt) {
+      if (!nt || !nt.t) return;
+      const n = Math.max(1, Math.min(5, nt.n || 1));
+      let made = 0;
+      for (let i = 0; i < n * 6 && made < n; i++) {
+        const g = dcNoteGen(nt.t, rnd);
+        if (g && !qs.some(function (x) { return x.q === g.q; })) { qs.push(g); made++; }
+      }
+      if (made < n) skipped.push(nt.t);
+    });
+    return { qs: qs.slice(0, Math.max(0, per - 1)), skipped: skipped };
+  }
+
+  /** 各年级默认题型（除法占比更高） */
+  function dcDefaultKinds(grade) {
+    const g = grade || '';
+    if (/一/.test(g)) return ['addSub20'];
+    if (/二/.test(g)) return ['addSub100', 'tableMul', 'tableDiv', 'div1'];
+    if (/三/.test(g)) return ['addSub3', 'mul1', 'div1', 'tableDiv', 'div2'];
+    if (/四/.test(g)) return ['mul2', 'div2', 'mul1', 'div1', 'addSub3'];
+    if (/五/.test(g)) return ['decDivInt', 'decDivInt', 'decMulInt', 'decAddSub', 'div2'];
+    return ['fracDiv', 'fracDiv', 'fracAddSub', 'decDivInt', 'jianBian'];
+  }
+
+  /** 按选中题型生成加权题池：除法类出现 2 次 → 默认除法题数更多 */
+  function dcWeightedPool(kinds, grade) {
+    const valid = (kinds || []).filter(function (k) { return !!DCALC_GEN[k]; });
+    const base = valid.length ? valid : dcDefaultKinds(grade);
+    return base.concat(base.filter(function (k) {
+      const def = DCALC_KINDS.find(function (x) { return x.k === k; });
+      return def && def.div;
+    }));
+  }
+
+  /** 从题库题目中提取「学生常错的计算」（wrongCount>0 且题干首行是纯式题），最多 12 条 */
+  function dcExtractWeak(questions) {
+    const out = []; const seen = {};
+    (questions || []).forEach(function (q) {
+      if (!q || !(q.wrongCount > 0)) return;
+      const t = String(q.text || q.rawText || '').split('\n')[0] || '';
+      if (t.indexOf('/') >= 0) return; // 分数题不参与（避免 1/2 误判成除法）
+      const m = t.match(/^\s*(\d+(?:\.\d+)?)\s*([+\-−×xX*÷])\s*(\d+(?:\.\d+)?)\s*[=＝]?/);
+      if (!m) return;
+      const op = ({ 'x': '×', 'X': '×', '*': '×', '−': '−' })[m[2]] || m[2];
+      const key = m[1] + op + m[3];
+      if (seen[key]) return;
+      seen[key] = 1;
+      out.push({ a: parseFloat(m[1]), op: op, b: parseFloat(m[3]) });
+    });
+    return out.slice(0, 12);
+  }
+
+  /** 常错计算所属的题型（用于限制：只有选中的题型才会出现） */
+  function dcWeakKind(w) {
+    const decA = String(w.a).indexOf('.') >= 0, decB = String(w.b).indexOf('.') >= 0;
+    if (w.op === '+' || w.op === '−') {
+      if (decA || decB) return 'decAddSub';
+      const mx = Math.max(w.a, w.b);
+      return mx <= 20 ? 'addSub20' : mx <= 100 ? 'addSub100' : 'addSub3';
+    }
+    if (w.op === '×') {
+      if (decA || decB) return decB ? 'decMulDec' : 'decMulInt';
+      const mx = Math.max(w.a, w.b);
+      return mx <= 9 ? 'tableMul' : mx <= 99 ? 'mul1' : 'mul2';
+    }
+    if (decA) return 'decDivInt';
+    if (w.b <= 9 && w.a <= 81) return 'tableDiv';
+    return w.b <= 9 ? 'div1' : 'div2';
+  }
+
+  /** 参考一道常错计算改数据出同类题（题型不在 kinds 内则返回 null） */
+  function dcWeakVaried(w, rnd, kinds) {
+    const kind = dcWeakKind(w);
+    if (!kind || kinds.indexOf(kind) < 0) return null;
+    const jitter = function (v, step) {
+      const d = (1 + Math.floor(rnd() * step)) * (rnd() < 0.5 ? -1 : 1);
+      return Math.max(step >= 2 ? 1 : 0.1, dcRound(v + d));
+    };
+    if (w.op === '+') {
+      const a = jitter(w.a, Math.max(2, Math.round(w.a * 0.2))), b = jitter(w.b, Math.max(2, Math.round(w.b * 0.2)));
+      return { q: a + ' + ' + b + ' =', a: String(dcRound(a + b)), k: kind };
+    }
+    if (w.op === '−') {
+      let a = jitter(w.a, Math.max(2, Math.round(w.a * 0.2))), b = jitter(w.b, Math.max(2, Math.round(w.b * 0.2)));
+      if (a < b) { const t = a; a = b; b = t; }
+      if (a === b) a = dcRound(a + 2);
+      return { q: a + ' − ' + b + ' =', a: String(dcRound(a - b)), k: kind };
+    }
+    if (w.op === '×') {
+      const a = jitter(w.a, 2), b = jitter(w.b, 2);
+      return { q: a + ' × ' + b + ' =', a: String(dcRound(a * b)), k: kind };
+    }
+    // ÷ 保整除：除数不变，换商
+    const q0 = Math.max(2, Math.round(w.a / Math.max(1, w.b)));
+    const c = Math.max(2, q0 + (rnd() < 0.5 ? -1 : 1) * dcRi(rnd, 1, 3));
+    return { q: dcRound(w.b * c) + ' ÷ ' + w.b + ' =', a: String(c), k: kind };
+  }
+
+  /** 采集题库里的常错计算（ IndexedDB ，预览时调用一次） */
+  async function dcCollectWeak() {
+    try {
+      const all = await Store.Questions.all();
+      return dcExtractWeak(all);
+    } catch (e) { return []; }
+  }
+
+  /* ---- 我的计算题库（localStorage，导入文件生成） ---- */
+  const CALC_BANK_KEY = 'tiku.calcBank';
+  function readCalcBank() {
+    try { const v = JSON.parse(localStorage.getItem(CALC_BANK_KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+  }
+  function saveCalcBank(items) {
+    try { localStorage.setItem(CALC_BANK_KEY, JSON.stringify(items.slice(0, 300))); } catch (e) {}
+  }
+  /** 「出题时优先用题库」当前是否开启（表单临时态优先，其次已存配置，默认开） */
+  function dcalcUseBankNow() {
+    if (S.dcalcUseBank === true || S.dcalcUseBank === false) return S.dcalcUseBank;
+    return (readDcalcCfg() || {}).useBank !== false;
+  }
+  /** 计算一道式题的答案（整数/小数一步运算、分数一步运算），算不出返回 '' */
+  function dcCalcAnswer(expr) {
+    let s = String(expr || '').trim().replace(/[=＝？?。]+$/, '').replace(/\s/g, '');
+    let m = s.match(/^(\d+)\/(\d+)([+\-−×xX*÷/])(\d+)\/(\d+)$/);
+    if (m) {
+      const n1 = +m[1], d1 = +m[2], n2 = +m[4], d2 = +m[5];
+      let op = m[3];
+      if (op === '−') op = '-';
+      if (op === '×' || op === 'x' || op === 'X' || op === '*') op = '*';
+      if (op === '÷') op = '/';
+      if (!d1 || !d2 || (op === '/' && !n2)) return '';
+      if (op === '+') return dcFrac(n1 * d2 + n2 * d1, d1 * d2);
+      if (op === '-') return dcFrac(n1 * d2 - n2 * d1, d1 * d2);
+      if (op === '*') return dcFrac(n1 * n2, d1 * d2);
+      return dcFrac(n1 * d2, d1 * n2);
+    }
+    m = s.match(/^(\d+(?:\.\d+)?)([+\-−×xX*÷/])(\d+(?:\.\d+)?)$/);
+    if (!m) return '';
+    const a = parseFloat(m[1]), b = parseFloat(m[3]);
+    let op = m[2];
+    if (op === '−') op = '-';
+    if (op === '×' || op === 'x' || op === 'X' || op === '*') op = '*';
+    if (op === '÷' || op === '/') op = '/';
+    if (op === '+') return String(dcRound(a + b));
+    if (op === '-') return String(dcRound(a - b));
+    if (op === '*') return String(dcRound(a * b));
+    if (!b) return '';
+    return String(dcRound(a / b));
+  }
+  /** 判断一条式题属于哪种题型（与所选题型过滤配套），不认识返回 '' */
+  function calcKindOf(q) {
+    const s = String(q || '');
+    let m = s.match(/^\s*(\d+)\/(\d+)\s*([+\-−×xX*÷/])\s*(\d+)\/(\d+)/);
+    if (m) {
+      const op = m[3] === 'x' || m[3] === 'X' || m[3] === '*' ? '×' : m[3];
+      if (op === '+' || op === '-' || op === '−') return 'fracAddSub';
+      if (op === '×') return 'fracMul';
+      if (op === '÷' || op === '/') return 'fracDiv';
+    }
+    m = s.match(/^\s*(\d+(?:\.\d+)?)\s*([+\-−×xX*÷/])\s*(\d+(?:\.\d+)?)/);
+    if (!m) return '';
+    const a = parseFloat(m[1]), b = parseFloat(m[3]);
+    const op = m[2] === 'x' || m[2] === 'X' || m[2] === '*' ? '×' : (m[2] === '/' ? '÷' : (m[2] === '−' ? '-' : m[2]));
+    const decA = m[1].indexOf('.') >= 0, decB = m[3].indexOf('.') >= 0;
+    if (op === '+' || op === '-') {
+      if (decA || decB) return 'decAddSub';
+      const mx = Math.max(a, b);
+      return mx <= 20 ? 'addSub20' : mx <= 100 ? 'addSub100' : 'addSub3';
+    }
+    if (op === '×') {
+      if (decA || decB) return decB ? 'decMulDec' : 'decMulInt';
+      const mx = Math.max(a, b);
+      return mx <= 9 ? 'tableMul' : mx <= 99 ? 'mul1' : 'mul2';
+    }
+    if (op === '÷') {
+      if (decA) return 'decDivInt';
+      if (b <= 9 && a <= 81) return 'tableDiv';
+      return b <= 9 ? 'div1' : 'div2';
+    }
+    return '';
+  }
+  /** 从导入文本提取计算式题：逐行扫描，一行里有多道式题也能全部提取；
+   *  文字题/方程行自动跳过（x 不当乘号），分数式优先匹配。返回 { items, total } */
+  function dcParseCalcText(text) {
+    const lines = String(text || '').split(/\r?\n/);
+    const items = []; const seen = {}; let total = 0;
+    const normOp = function (o) {
+      if (o === 'x' || o === 'X' || o === '*') return '×';
+      if (o === '/') return '÷';
+      if (o === '-') return '−';
+      return o;
+    };
+    const FRE = /(\d+)\s*\/\s*(\d+)\s*([+\-−×*÷])\s*(\d+)\s*\/\s*(\d+)\s*[=＝]?/g;
+    const RE = /(\d+(?:\.\d+)?)\s*([+\-−×*÷])\s*(\d+(?:\.\d+)?)\s*[=＝]?/g;
+    lines.forEach(function (raw) {
+      let s = String(raw).trim();
+      if (!s) return;
+      total++;
+      // 先提取分数式（a/b op c/d），再把已占用部分从行里去掉
+      FRE.lastIndex = 0;
+      let fm;
+      while ((fm = FRE.exec(s))) {
+        const q = fm[1] + '/' + fm[2] + ' ' + normOp(fm[3]) + ' ' + fm[4] + '/' + fm[5];
+        const ans = dcCalcAnswer(q);
+        if (ans !== '' && !seen[q]) { seen[q] = 1; items.push({ q: q + ' =', a: ans, at: Date.now() }); }
+      }
+      const s2 = s.replace(FRE, ' ');
+      RE.lastIndex = 0;
+      let m;
+      while ((m = RE.exec(s2))) {
+        const q = m[1] + ' ' + normOp(m[2]) + ' ' + m[3];
+        const ans = dcCalcAnswer(q);
+        if (ans !== '' && !seen[q]) { seen[q] = 1; items.push({ q: q + ' =', a: ans, at: Date.now() }); }
+      }
+    });
+    return { items: items, total: total };
+  }
+
+  /** 下一个周一（周一同日算下周一；周日则明天） */
+  function dcNextMonday(now) {
+    const d = new Date(now);
+    d.setHours(0, 0, 0, 0);
+    const wd = d.getDay();
+    d.setDate(d.getDate() + (wd === 1 ? 7 : (8 - wd) % 7 || 7));
+    return d;
+  }
+
+  /** 某日期是计划开始（周一）后的第几个工作日（0 起） */
+  function dcWorkdayIndex(planStart, day) {
+    let n = 0;
+    const d = new Date(planStart);
+    for (let i = 0; i < 400; i++) {
+      if (dcDateKey(d) === dcDateKey(day)) return n;
+      const w = d.getDay();
+      if (w >= 1 && w <= 5) n++;
+      d.setDate(d.getDate() + 1);
+    }
+    return n;
+  }
+
+  /** 生成某一天的题组（种子 = planSeed + 序号，同一天同组；题型只来自所选 kinds） */
+  function dcDaySet(cfg, index, day) {
+    const info = dcalcUnit(cfg, day);
+    const rnd = mulberry32(dcHash(String(cfg.planSeed || 's') + '|' + index + '|' + (cfg.grade || '') + '|' + cfg.perDay));
+    const pool = dcWeightedPool(cfg.kinds, cfg.grade);
+    const kinds = (cfg.kinds && cfg.kinds.length) ? cfg.kinds : dcDefaultKinds(cfg.grade);
+    const lv = cfg.diff || 2;
+    const per = Math.max(1, Math.min(30, cfg.perDay || 5));
+    const weak = cfg.weak || [];
+    const bank = (cfg.useBank === false) ? [] : readCalcBank().filter(function (it) {
+      if (it.g && cfg.grade && it.g !== cfg.grade) return false; // 只补充当前学段
+      const k = calcKindOf(it.q);
+      return k && kinds.indexOf(k) >= 0; // 题库题也必须属于所选题型
+    });
+    const qs = []; const seen = {};
+    // 自定义备注题型优先占最前面的题位（如「商中间有0的除法」每天 N 道）
+    const noteR = dcNoteQs(cfg.notes, rnd, per);
+    noteR.qs.forEach(function (g) { seen[g.q] = 1; qs.push(g); });
+    for (let i = qs.length; i < per; i++) {
+      let g = null;
+      // 每 5 题的第 3 题优先用「学生常错计算」改数据出同类题
+      if (weak.length && i % 5 === 2) {
+        for (let t = 0; t < 6 && !g; t++) {
+          g = dcWeakVaried(weak[Math.floor(rnd() * weak.length)], rnd, kinds);
+          if (g && seen[g.q]) g = null;
+        }
+      }
+      // 开启「我的计算题库」后隔题插入导入的式题
+      if (!g && bank.length && i % 2 === 0) {
+        for (let t = 0; t < 4 && !g; t++) {
+          const it = bank[Math.floor(rnd() * bank.length)];
+          if (it && !seen[it.q]) g = { q: it.q, a: it.a, k: 'bank' };
+        }
+      }
+      for (let t = 0; t < 12 && !g; t++) {
+        g = DCALC_GEN[pool[i % pool.length]](rnd, lv);
+        if (g && seen[g.q]) g = null;
+      }
+      if (g) { seen[g.q] = 1; qs.push(g); }
+    }
+    return { qs: qs, week: info.week, unit: info.unit };
+  }
+
+  /** 排出下周一～周五的一周计划 */
+  function dcBuildPlan(fields) {
+    const monday = dcNextMonday(new Date());
+    const days = [];
+    for (let i = 0; i < 5; i++) {
+      const d = new Date(monday);
+      d.setDate(d.getDate() + i);
+      const set = dcDaySet(fields, i, d);
+      days.push({
+        dateKey: dcDateKey(d), wd: '周' + '一二三四五'[i],
+        md: (d.getMonth() + 1) + '月' + d.getDate() + '日',
+        qs: set.qs, week: set.week, unit: set.unit
+      });
+    }
+    return { monday: dcDateKey(monday), mondayMd: (monday.getMonth() + 1) + '月' + monday.getDate() + '日', days: days };
+  }
+
+  /** 组装当前每日计算状态：setup / pending（已确认未开始）/ active / weekDone */
+  function dcalcBuild() {
+    const cfg = readDcalcCfg();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (!cfg || !cfg.grade || cfg.semKey !== semKeyOf(today) || !cfg.confirmed || !cfg.planStart) {
+      return { state: 'setup', semNew: !!(cfg && cfg.grade && cfg.confirmed && cfg.semKey && cfg.semKey !== semKeyOf(today)) };
+    }
+    const planStart = new Date(cfg.planStart + 'T00:00:00');
+    const planEnd = new Date(planStart);
+    planEnd.setDate(planEnd.getDate() + 4);
+    if (today < planStart) return { state: 'pending', grade: cfg.grade, planStart: cfg.planStart, perDay: cfg.perDay || 5, kindsN: (cfg.kinds || []).length, diffL: dcDiffLabel(cfg.diff) };
+    if (today > planEnd) return { state: 'weekDone', grade: cfg.grade };
+    const idx = dcWorkdayIndex(planStart, today);
+    const set = dcDaySet(cfg, idx, today);
+    return {
+      state: 'active', grade: cfg.grade, perDay: cfg.perDay || 5, timerMin: cfg.timerMin || 5, diffL: dcDiffLabel(cfg.diff),
+      dateKey: dcDateKey(today), wd: '周' + '日一二三四五六'[today.getDay()],
+      week: set.week, unit: set.unit, qs: set.qs
+    };
+  }
+
+  /** 每日计算设置表单（首页设置卡与弹层共用） */
+  function dcalcSetupBody() {
+    const cfg = readDcalcCfg() || {};
+    const pick = S.dcalcPick || cfg.grade || S.defaults.grade || '五年级';
+    if (!S.dcalcKinds) S.dcalcKinds = (cfg.kinds && cfg.kinds.length ? cfg.kinds.slice() : dcDefaultKinds(pick));
+    if (S.dcalcDiff === undefined || S.dcalcDiff === null) S.dcalcDiff = cfg.diff || 2;
+    if (S.dcalcUseBank !== true && S.dcalcUseBank !== false) S.dcalcUseBank = cfg.useBank !== false;
+    const gradeChips = CONFIG.grades.map(function (g) {
+      return '<button class="tag' + (g === pick ? ' active' : '') + '" data-act="dcalc:g" data-v="' + esc(g) + '">' + esc(g) + '</button>';
+    }).join('');
+    const kindChips = DCALC_KINDS.map(function (x) {
+      return '<button class="tag' + (S.dcalcKinds.indexOf(x.k) >= 0 ? ' active' : '') + '" data-act="dcalc:k" data-k="' + x.k + '">' + esc(x.l) + '</button>';
+    }).join('');
+    const diffChips = DCALC_DIFFS.map(function (x) {
+      return '<button class="tag' + (S.dcalcDiff === x.v ? ' active' : '') + '" data-act="dcalc:diff" data-v="' + x.v + '">' + x.l + '</button>';
+    }).join('');
+    const bank = readCalcBank();
+    const grade = pick;
+    const bankG = bank.filter(function (it) { return !it.g || it.g === grade; });
+    const bankHtml = bankG.length
+      ? '<div class="row between mt8" style="align-items:center;margin-bottom:6px">' +
+        '<label style="font-weight:600;font-size:13px">我的计算题库 · ' + bankG.length + ' 道（' + esc(grade) + '）</label>' +
+        '<span><button class="small" data-act="dcalc:useBank" style="color:' + (S.dcalcUseBank ? 'var(--brand)' : 'var(--ink-3)') + ';font-weight:600">' + (S.dcalcUseBank ? '✓ 出题时优先用题库' : '已停用，点这里启用') + '</button>　' +
+        '<button class="small" data-act="dcalc:clearBank" style="color:var(--danger)">清空</button></span></div>'
+      : '';
+    if (!S.dcalcNotes) S.dcalcNotes = (cfg.notes || []).slice();
+    const notesHtml = '<div id="dcNoteList"' + (S.dcalcNotes.length ? ' class="mt8"' : '') + '>' + (S.dcalcNotes.length ? S.dcalcNotes.map(function (nt, i) {
+      return '<div class="row between" style="align-items:center;padding:6px 2px;border-bottom:1px dashed var(--line)">' +
+        '<span style="font-size:13.5px">📌 ' + esc(nt.t) + ' · <b>每天 ' + nt.n + ' 道</b></span>' +
+        '<button class="small" data-act="dcalc:delNote" data-i="' + i + '" style="color:var(--danger)">删除</button></div>';
+    }).join('') : '') + '</div>';
+    const start = cfg.startDate || defaultStartOf(semKeyOf(new Date()));
+    return '<p class="muted" style="margin-bottom:8px">选好题型、难度、题数并预览一周，确认后<b>下周一</b>开始按顺序每天发布一组。出题只出<b>所选题型</b>。</p>' +
+      '<div class="chips" style="flex-wrap:wrap;overflow:visible">' + gradeChips + '</div>' +
+      '<div class="field mt8"><label>学期开始日期（用来算教学周）</label>' +
+        '<input class="input" type="date" id="dcStart" value="' + start + '"></div>' +
+      '<div class="row mt8" style="gap:8px">' +
+        '<div class="field" style="flex:1"><label>每日题数</label>' +
+          '<input class="input" type="number" id="dcPerDay" min="1" max="30" value="' + (cfg.perDay || 5) + '"></div>' +
+        '<div class="field" style="flex:1"><label>倒计时（分钟）</label>' +
+          '<input class="input" type="number" id="dcTimerMin" min="1" max="60" value="' + (cfg.timerMin || 5) + '"></div>' +
+      '</div>' +
+      '<div class="row between mt8" style="align-items:center;margin-bottom:6px">' +
+        '<label style="font-weight:600;font-size:13px">难度</label>' +
+        '<div class="chips" style="overflow:visible">' + diffChips + '</div>' +
+      '</div>' +
+      '<div class="row between mt8" style="align-items:center;margin-bottom:6px">' +
+        '<label style="font-weight:600;font-size:13px">计算题型（点选，默认除法题更多）</label>' +
+        '<span><button class="small" data-act="dcalc:allK" style="color:var(--brand);font-weight:600">全选</button>　' +
+        '<button class="small" data-act="dcalc:noneK" style="color:var(--ink-3)">清空</button></span>' +
+      '</div>' +
+      '<div class="chips" style="flex-wrap:wrap;overflow:visible">' + kindChips + '</div>' +
+      '<div class="row between mt12" style="align-items:center;margin-bottom:6px">' +
+        '<label style="font-weight:600;font-size:13px">题型备注（每天多练，自动出同类题）</label>' +
+      '</div>' +
+      '<div class="row" style="gap:8px;align-items:flex-end">' +
+        '<div class="field" style="flex:1">' +
+          '<input class="input" id="dcNoteText" placeholder="例：商中间有0的除法"></div>' +
+        '<div class="field" style="width:78px">' +
+          '<input class="input" type="number" id="dcNoteN" min="1" max="5" value="1" title="每天几道"></div>' +
+        '<button class="btn soft" data-act="dcalc:addNote" style="white-space:nowrap">＋添加</button>' +
+      '</div>' +
+      notesHtml +
+      bankHtml +
+      '<input type="file" id="dcCalcFile" accept=".txt,.pdf,.docx,.doc" style="display:none">' +
+      '<button class="btn soft block mt8" data-act="dcalc:impCalc">📄 导入文件生成计算题库（txt / Word / PDF，一行一道式题）</button>' +
+      '<button class="btn primary block mt12" data-act="dcalc:preview">生成一周预览（下周一～周五）</button>';
+  }
+
+  /** 一周计划预览 / 查看内容（mode='preview' 时带确认按钮；notes 为附加说明） */
+  function dcalcPlanBody(plan, mode, notes) {
+    const n = plan.days[0] ? plan.days[0].qs.length : 0;
+    const head = '<p class="muted" style="margin-bottom:8px">' + plan.mondayMd + '（周一）开始按顺序发布，每天 ' + n + ' 题；点开每天可浏览题目' + (mode === 'preview' ? '，<b>右侧为参考答案（仅预览时显示，发布后默认隐藏）</b>' : '') + '。' + (notes || '') + '</p>';
+    const days = plan.days.map(function (day) {
+      const rows = day.qs.map(function (g, i) {
+        const ansHtml = mode === 'preview'
+          ? '<span class="dc-ans">答案：' + esc(g.a) + '</span>'
+          : '<span class="dc-ans" style="display:none">答案：' + esc(g.a) + '</span>';
+        return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span>' + ansHtml + '</div>';
+      }).join('');
+      return '<details class="dc-day"' + (mode === 'preview' && day === plan.days[0] ? ' open' : '') + '>' +
+        '<summary>' + day.md + ' ' + day.wd + ' · 第 ' + day.week + ' 周' + (day.unit ? ' · ' + esc(day.unit) : '') + '（' + day.qs.length + ' 题）</summary>' + rows + '</details>';
+    }).join('');
+    let ops = '';
+    if (mode === 'preview') {
+      ops = '<div class="row mt12" style="gap:8px">' +
+        '<button class="btn ghost grow" data-act="dcalc:preview">↻ 换一批</button>' +
+        '<button class="btn primary grow" data-act="dcalc:confirmPlan">✓ 确认，下周一按此开始</button></div>';
+    } else {
+      ops = '<button class="btn soft block mt12" data-act="dcalc:setup">修改设置</button>';
+    }
+    return head + days + ops;
+  }
+
+  /** 首页每日计算卡片：setup（未设置/新学期/未确认）/ pending（已确认未开始）/ active / weekDone */
+  function dcalcCardHtml() {
+    const dc = S.cache.dcalc;
+    if (!dc || dc.state === 'setup') {
+      return '<section class="card" style="border-left:3px solid var(--brand)">' +
+        '<div class="card-h"><h3>每日计算 · ' + (dc && dc.semNew ? '新学期开始啦' : '先设置一下') + '</h3></div>' +
+        dcalcSetupBody() +
+      '</section>';
+    }
+    if (dc.state === 'pending') {
+      const d = new Date(dc.planStart + 'T00:00:00');
+      return '<section class="card" style="border-left:3px solid var(--ok,#12b76a)">' +
+        '<div class="card-h"><h3>每日计算 · 已确认 ✓</h3>' +
+          '<button class="small" style="color:var(--brand);font-weight:600" data-act="dcalc:setup">设置 ✎</button></div>' +
+        '<p class="muted" style="margin-bottom:8px">' + (d.getMonth() + 1) + '月' + d.getDate() + '日（周一）开始按顺序发布，每天 ' + dc.perDay + ' 题（' + esc(dc.grade) + ' · ' + dc.kindsN + ' 种题型 · 难度：' + (dc.diffL || '中等') + '）。</p>' +
+        '<button class="btn soft block" data-act="dcalc:planView">先看一周计划</button>' +
+      '</section>';
+    }
+    if (dc.state === 'weekDone') {
+      return '<section class="card" style="border-left:3px solid var(--ok,#12b76a)">' +
+        '<div class="card-h"><h3>每日计算 · 本周计划已完成</h3></div>' +
+        '<p class="muted" style="margin-bottom:8px">' + esc(dc.grade) + ' · 本周一到周五的题已发布完，预览并确认下一周后继续。</p>' +
+        '<button class="btn primary block" data-act="dcalc:setup">预览并确认下一周</button>' +
+      '</section>';
+    }
+    // active
+    const d = new Date(dc.dateKey + 'T00:00:00');
+    const timerTxt = dc.timerMin + ':00';
+    const rows = dc.qs.map(function (g, i) {
+      return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span>' +
+        '<span class="dc-ans" style="display:none">答案：' + esc(g.a) + '</span></div>';
+    }).join('');
+    return '<section class="card">' +
+      '<div class="card-h"><h3>每日计算 · ' + dc.wd + '（' + (d.getMonth() + 1) + '月' + d.getDate() + '日）</h3>' +
+        '<button class="small" style="color:var(--brand);font-weight:600" data-act="dcalc:setup">设置 ✎</button></div>' +
+      '<p class="muted" style="margin-bottom:6px">' + esc(dc.grade) + ' · 第 ' + dc.week + ' 周' + (dc.unit ? ' · ' + esc(dc.unit) : '') + ' · 难度：' + (dc.diffL || '中等') + ' · 共 ' + dc.qs.length + ' 题，答案已隐藏</p>' +
+      rows +
+      '<div class="row mt12" style="gap:8px">' +
+        '<button class="btn soft grow" data-act="dcalc:timer"><span id="dcTime" class="dc-time">' + timerTxt + '</span> · 倒计时开始</button>' +
+        '<button class="btn primary grow" data-act="dcalc:ans">对答案</button>' +
+      '</div>' +
+    '</section>';
+  }
+
 
   /* =========================================================
    * 考点 × 单元：给考点名自动带上「·第N单元」后缀
@@ -383,6 +1190,11 @@
       // 未完成的导入草稿（确认页没入库就退出的）
       const dr = readDraftStore();
       S.cache.homeDraft = (dr && dr.drafts && dr.drafts.length) ? dr : null;
+      // 每日计算（状态由配置 + 今天日期决定，每次进首页重建，代价极小）
+      S.cache.dcalc = dcalcBuild();
+      if (S.dcalc.tick && !document.getElementById('dcTime')) {
+        clearInterval(S.dcalc.tick); S.dcalc.tick = null;
+      }
     },
     html() {
       const d = S.cache.home || { stats: {}, recent: [], total: 0, units: {} };
@@ -447,6 +1259,8 @@
             '<span class="q-ico"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M13 9h5M13 12h5M5 16l4-4 3 3 3-3 4 4"/></svg></span>' +
             '<span class="q-t">图转文字</span><span class="q-d">先解析后入库·保留图形</span></button>' +
         '</div>' +
+
+        dcalcCardHtml() +
 
         '<section class="card">' +
           '<div class="card-h"><h3>教材目录</h3>' +
@@ -1493,7 +2307,41 @@
     it.text = clean(it.text).replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     it.subs = (it.subs || []).map(clean);
     it.options = (it.options || []).map(clean);
+    // 答案 / 思路里也可能残留占位符（图形印在答案附近时），同样清洗归属
+    if (it.answer && it.answer.indexOf('【图') >= 0) it.answer = clean(it.answer).trim();
+    if (it.solution && it.solution.indexOf('【图') >= 0) it.solution = clean(it.solution).trim();
     return found;
+  }
+
+  /** 兜底：没被任何占位符标注的图形，按原文位置配到相邻的题目（防止配图漏掉） */
+  function sweepLostImages(rawText, docImgs, drafts) {
+    if (!drafts.length) return 0;
+    let swept = 0;
+    docImgs.forEach(function (src, gi) {
+      const taken = drafts.some(function (d) { return (d.images || []).indexOf(src) >= 0; });
+      if (taken) return;
+      const marker = '【图' + (gi + 1) + '】';
+      const pos = String(rawText || '').indexOf(marker);
+      let target = null;
+      if (pos >= 0) {
+        // 找占位符前面最近的题号
+        const before = String(rawText).slice(0, pos);
+        let m, last = null;
+        const re = /(?:^|\n)\s*(\d{1,3})\s*[.、．，,]/g;
+        while ((m = re.exec(before)) !== null) last = parseInt(m[1], 10);
+        if (last != null) target = drafts.find(d => d.no === last) || null;
+        if (!target) {
+          // 前面没有题号 → 找占位符后面最近的题号
+          const after = String(rawText).slice(pos);
+          const m2 = after.match(/(?:^|\n)\s*(\d{1,3})\s*[.、．，,]/);
+          if (m2) target = drafts.find(d => d.no === parseInt(m2[1], 10)) || null;
+        }
+      }
+      if (!target) target = drafts[0];
+      target.images = target.images || [];
+      if (target.images.indexOf(src) < 0) { target.images.push(src); swept++; }
+    });
+    return swept;
   }
 
   function buildDrafts() {
@@ -1523,7 +2371,27 @@
           point: '', pointId: '', confidence: 0, needsConfirm: true, aiPending: true
         });
       });
+      // 兜底：被切题流程漏掉的图形按原文位置配到相邻题，确保不漏图
+      if (docImgs.length && drafts.length) {
+        const swept = sweepLostImages(OCR.tidy ? OCR.tidy(im.text) : im.text, docImgs, drafts);
+        if (swept) UI.toast(swept + ' 张图形没标到具体题号，已自动配到相邻题目，可在「配图」里调整', 3200);
+      }
     });
+    // 清理：只有图形没有文字的"空题"，把图形并入相邻题，避免多出空白题
+    for (let i = drafts.length - 1; i >= 0; i--) {
+      const d = drafts[i];
+      const hasText = (d.text || '').trim() || (d.subs || []).join('').trim() ||
+        (d.options || []).join('').trim() || (d.answer || '').trim();
+      if (!hasText && (d.images || []).length) {
+        const to = drafts[i + 1] || drafts[i - 1];
+        if (to) {
+          d.images.forEach(function (src) {
+            if ((to.images || []).indexOf(src) < 0) { to.images = to.images || []; to.images.push(src); }
+          });
+          drafts.splice(i, 1);
+        }
+      }
+    }
     S.drafts = drafts;
   }
 
@@ -1765,6 +2633,45 @@
         '<div class="li-s">会按同义规则自动归并到已有考点</div></div>' + ARROW + '</div>' + html;
     }
     return html;
+  }
+
+  /** 确认页图形池弹层：多选批量删除 + 本地图片 + 单图配到本题 */
+  function openPoolSheet(i) {
+    const s = S.session;
+    if (!s || !s.imgPool || !s.imgPool.length) {
+      // 池空也能打开，方便直接加本地图片
+      if (!s) return;
+      s.imgPool = s.imgPool || [];
+    }
+    S.poolSel = S.poolSel || {};
+    const n = s.imgPool.length;
+    const selCount = Object.keys(S.poolSel).filter(function (k) { return S.poolSel[k]; }).length;
+    const tiles = s.imgPool.map(function (src, pi) {
+      let owner = -1;
+      S.drafts.forEach(function (dd, di) {
+        if ((dd.images || []).indexOf(src) >= 0) owner = di;
+      });
+      const onThis = owner === i;
+      const sel = !!S.poolSel[pi];
+      return '<div class="pool-tile' + (onThis ? ' picked' : '') + '">' +
+        '<div class="pool-sel' + (sel ? ' on' : '') + '" data-act="dpi:sel" data-i="' + i + '" data-pi="' + pi + '">' + (sel ? '✓' : '') + '</div>' +
+        '<img src="' + src + '" alt="图形' + (pi + 1) + '">' +
+        '<span class="pool-tag">' + (onThis ? '✓ 本题' : owner >= 0 ? '第' + (owner + 1) + '题' : '未配置') + '</span>' +
+        '<div class="pool-ops">' +
+          '<button data-act="draft:imgToggle" data-i="' + i + '" data-pi="' + pi + '">' + (onThis ? '取消配图' : '配到本题') + '</button>' +
+          '<button class="del" data-act="draft:imgDel" data-pi="' + pi + '">删除</button>' +
+        '</div></div>';
+    }).join('');
+    UI.sheet({
+      title: '为第 ' + (i + 1) + ' 题配图',
+      body: '<p class="muted" style="margin-bottom:10px">点图形右上角圆圈选中（可多选）→「删除所选」批量删除；「配到本题」把图形插到这道题旁，图形同时只会配给一道题。</p>' +
+        '<div class="row between" style="margin-bottom:8px">' +
+          '<button class="small" style="color:var(--brand);font-weight:600" data-act="dpi:all" data-i="' + i + '">' + (n && selCount === n ? '取消全选' : '全选') + '</button>' +
+          '<button class="small" style="color:var(--danger);font-weight:600" data-act="dpi:delSel" data-i="' + i + '"' + (selCount ? '' : ' disabled') + '>删除所选（' + selCount + '）</button>' +
+        '</div>' +
+        '<div class="pool-grid">' + (tiles || '<div class="empty small" style="padding:14px">图形池是空的，点下面添加本地图片</div>') + '</div>' +
+        '<button class="btn ghost block mt12" data-act="dpi:addLocal" data-i="' + i + '">＋ 添加本地图片</button>'
+    });
   }
 
   /** 已入库题目的配图弹层：✕ 移除 + 文件选图添加 */
@@ -2067,11 +2974,11 @@
       const body = [draft.text].concat(draft.subs || [], draft.options || []).join('\n');
       const v = await UI.prompt({
         title: '拆分题目', value: body, rows: 8,
-        hint: '在需要断开的位置单独输入一行 --- ，保存后按此拆成多题'
+        hint: '在需要断开的位置单独输入一行 cf ，保存后按此拆成多题'
       });
       if (!v) return;
       const parts = Splitter.splitByMarker(v);
-      if (parts.length < 2) { UI.toast('没有找到 --- 分隔符，未拆分'); return; }
+      if (parts.length < 2) { UI.toast('没有找到 cf 分隔符，未拆分'); return; }
       const merged = parts.map(function (p) {
         return Object.assign({}, draft, {
           key: Util.uid('d'), no: p.no, text: p.text, subs: p.subs, options: p.options,
@@ -2102,28 +3009,78 @@
 
     /* ---- 配图管理（确认页） ---- */
     'draft:imgs': function (d) {
+      openPoolSheet(+d.i);
+    },
+    'dpi:sel': function (d) {
+      const pi = +d.pi;
+      S.poolSel = S.poolSel || {};
+      if (S.poolSel[pi]) delete S.poolSel[pi];
+      else S.poolSel[pi] = 1;
+      openPoolSheet(+d.i);
+    },
+    'dpi:all': function (d) {
       const i = +d.i;
       const s = S.session;
-      if (!s || !s.imgPool || !s.imgPool.length) return;
-      const tiles = s.imgPool.map(function (src, pi) {
-        let owner = -1;
-        S.drafts.forEach(function (dd, di) {
-          if ((dd.images || []).indexOf(src) >= 0) owner = di;
-        });
-        const onThis = owner === i;
-        return '<div class="pool-tile' + (onThis ? ' picked' : '') + '">' +
-          '<img src="' + src + '" alt="图形' + (pi + 1) + '">' +
-          '<span class="pool-tag">' + (onThis ? '✓ 本题' : owner >= 0 ? '第' + (owner + 1) + '题' : '未配置') + '</span>' +
-          '<div class="pool-ops">' +
-            '<button data-act="draft:imgToggle" data-i="' + i + '" data-pi="' + pi + '">' + (onThis ? '取消配图' : '配到本题') + '</button>' +
-            '<button class="del" data-act="draft:imgDel" data-pi="' + pi + '">删除图形</button>' +
-          '</div></div>';
-      }).join('');
-      UI.sheet({
-        title: '为第 ' + (i + 1) + ' 题配图',
-        body: '<p class="muted" style="margin-bottom:10px">点「配到本题」把图形插到这道题旁；图形同时只会配给一道题。「删除图形」把识别出的图形从本次导入中删掉。</p>' +
-          '<div class="pool-grid">' + tiles + '</div>'
+      S.poolSel = S.poolSel || {};
+      const all = s.imgPool.every(function (src, pi) { return S.poolSel[pi]; });
+      s.imgPool.forEach(function (src, pi) {
+        if (all) delete S.poolSel[pi]; else S.poolSel[pi] = 1;
       });
+      openPoolSheet(i);
+    },
+    'dpi:delSel': async function (d) {
+      const i = +d.i;
+      const s = S.session;
+      const sel = Object.keys(S.poolSel || {}).map(Number);
+      if (!sel.length) { UI.toast('先点图形选中要删除的'); return; }
+      const srcs = sel.map(function (pi) { return s.imgPool[pi]; }).filter(Boolean);
+      const ok = await UI.confirm('删除选中的 ' + srcs.length + ' 张图形？它们会从所有题和图形列表中移除。');
+      if (!ok) return;
+      s.imgPool = s.imgPool.filter(function (src) { return srcs.indexOf(src) < 0; });
+      S.drafts.forEach(function (dd) {
+        dd.images = (dd.images || []).filter(function (src) { return srcs.indexOf(src) < 0; });
+      });
+      S.poolSel = {};
+      if (!s.imgPool.length) { UI.close(); UI.toast('已删除所选图形'); }
+      else openPoolSheet(i);
+      await render();
+    },
+    'dpi:addLocal': function (d) {
+      const i = +d.i;
+      const s = S.session;
+      if (!s) return;
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.multiple = true;
+      input.onchange = async function () {
+        const files = Array.from(input.files || []);
+        if (!files.length) return;
+        s.imgPool = s.imgPool || [];
+        for (const f of files) {
+          try {
+            const r = await ImageTool.compress(f);
+            const src = await blobToDataURL(r.blob);
+            if (s.imgPool.indexOf(src) < 0) s.imgPool.push(src);
+            // 新加的图直接配到当前题（可在弹层里取消配图）
+            const draft = S.drafts[i];
+            if (draft) {
+              S.drafts.forEach(function (dd) {
+                const x = (dd.images || []).indexOf(src);
+                if (x >= 0 && dd !== draft) dd.images.splice(x, 1);
+              });
+              draft.images = draft.images || [];
+              if (draft.images.indexOf(src) < 0) draft.images.push(src);
+            }
+          } catch (e) {
+            UI.toast('有图片处理失败：' + (e.message || e));
+          }
+        }
+        UI.toast('已添加 ' + files.length + ' 张本地图片');
+        if (s.imgPool.length) openPoolSheet(i);
+        await render();
+      };
+      input.click();
     },
     'draft:imgToggle': async function (d) {
       const i = +d.i, pi = +d.pi;
@@ -2143,7 +3100,7 @@
         });
         draft.images.push(src);
       }
-      UI.close();
+      openPoolSheet(i);
       await render();
     },
     'draft:imgDel': async function (d) {
@@ -2158,7 +3115,8 @@
         const x = (dd.images || []).indexOf(src);
         if (x >= 0) dd.images.splice(x, 1);
       });
-      UI.close();
+      if (!s.imgPool.length) UI.close();
+      else openPoolSheet(+d.i);
       await render();
     },
     'draft:rimg': async function (d) {
@@ -2166,6 +3124,184 @@
       if (!draft) return;
       (draft.images || []).splice(+d.k, 1);
       await render();
+    },
+
+    /* ---- 每日计算（首页） ---- */
+    'dcalc:g': function (d) {
+      S.dcalcPick = d.v;
+      navigate('home');
+    },
+    'dcalc:g': function (d) {
+      S.dcalcPick = d.v;
+      document.querySelectorAll('[data-act="dcalc:g"]').forEach(function (b) {
+        b.classList.toggle('active', b.dataset.v === S.dcalcPick);
+      });
+    },
+    'dcalc:k': function (d) {
+      const k = d.k;
+      const i = S.dcalcKinds.indexOf(k);
+      if (i >= 0) S.dcalcKinds.splice(i, 1); else S.dcalcKinds.push(k);
+      document.querySelectorAll('[data-act="dcalc:k"]').forEach(function (b) {
+        b.classList.toggle('active', S.dcalcKinds.indexOf(b.dataset.k) >= 0);
+      });
+    },
+    'dcalc:allK': function () {
+      S.dcalcKinds = DCALC_KINDS.map(function (x) { return x.k; });
+      document.querySelectorAll('[data-act="dcalc:k"]').forEach(function (b) { b.classList.add('active'); });
+    },
+    'dcalc:noneK': function () {
+      S.dcalcKinds = [];
+      document.querySelectorAll('[data-act="dcalc:k"]').forEach(function (b) { b.classList.remove('active'); });
+    },
+    'dcalc:diff': function (d) {
+      S.dcalcDiff = +d.v || 2;
+      document.querySelectorAll('[data-act="dcalc:diff"]').forEach(function (b) {
+        b.classList.toggle('active', +b.dataset.v === S.dcalcDiff);
+      });
+    },
+    'dcalc:useBank': function () {
+      S.dcalcUseBank = !dcalcUseBankNow();
+      navigate('home');
+    },
+    'dcalc:impCalc': function () {
+      const el = document.getElementById('dcCalcFile');
+      if (el) el.click(); else UI.toast('请在每日计算设置卡里使用导入按钮');
+    },
+    'dcalc:clearBank': async function () {
+      const n = readCalcBank().length;
+      if (!n) return;
+      const ok = await UI.confirm('清空计算题库', '确定删除已导入的 ' + n + ' 道计算题？此操作不可恢复。');
+      if (!ok) return;
+      saveCalcBank([]);
+      UI.toast('已清空计算题库');
+      navigate('home');
+    },
+    'dcalc:addNote': function () {
+      const tEl = document.getElementById('dcNoteText');
+      const nEl = document.getElementById('dcNoteN');
+      const t = (tEl && tEl.value || '').trim();
+      if (!t) { UI.toast('先填写题型备注，再点添加'); return; }
+      const n = Math.max(1, Math.min(5, parseInt(nEl && nEl.value, 10) || 1));
+      if (!S.dcalcNotes) S.dcalcNotes = [];
+      if (S.dcalcNotes.some(function (nt) { return nt.t === t; })) { UI.toast('该备注已存在'); return; }
+      S.dcalcNotes.push({ t: t, n: n });
+      if (tEl) tEl.value = '';
+      const list = document.getElementById('dcNoteList');
+      if (list) list.innerHTML = S.dcalcNotes.map(function (nt, i) {
+        return '<div class="row between" style="align-items:center;padding:6px 2px;border-bottom:1px dashed var(--line)">' +
+          '<span style="font-size:13.5px">📌 ' + esc(nt.t) + ' · <b>每天 ' + nt.n + ' 道</b></span>' +
+          '<button class="small" data-act="dcalc:delNote" data-i="' + i + '" style="color:var(--danger)">删除</button></div>';
+      }).join('');
+    },
+    'dcalc:delNote': function (d) {
+      if (S.dcalcNotes) S.dcalcNotes.splice(+d.i, 1);
+      const list = document.getElementById('dcNoteList');
+      if (list) list.innerHTML = S.dcalcNotes.map(function (nt, i) {
+        return '<div class="row between" style="align-items:center;padding:6px 2px;border-bottom:1px dashed var(--line)">' +
+          '<span style="font-size:13.5px">📌 ' + esc(nt.t) + ' · <b>每天 ' + nt.n + ' 道</b></span>' +
+          '<button class="small" data-act="dcalc:delNote" data-i="' + i + '" style="color:var(--danger)">删除</button></div>';
+      }).join('');
+    },
+    'dcalc:preview': async function () {
+      // 读当前设置表单 → 采集题库常错计算 → 排出下周一～周五五天 → 预览确认
+      const startEl = document.getElementById('dcStart');
+      const perEl = document.getElementById('dcPerDay');
+      const timerEl = document.getElementById('dcTimerMin');
+      const perDay = Math.max(1, Math.min(30, parseInt(perEl && perEl.value, 10) || 5));
+      const timerMin = Math.max(1, Math.min(60, parseInt(timerEl && timerEl.value, 10) || 5));
+      const kinds = (S.dcalcKinds && S.dcalcKinds.length) ? S.dcalcKinds.slice() : dcDefaultKinds(S.dcalcPick || S.defaults.grade);
+      if (!S.dcalcWeak) S.dcalcWeak = await dcCollectWeak();
+      S.dcalcDraft = {
+        grade: S.dcalcPick || S.defaults.grade,
+        startDate: startEl && startEl.value ? startEl.value : '',
+        perDay: perDay, timerMin: timerMin, kinds: kinds,
+        diff: S.dcalcDiff || 2,
+        useBank: dcalcUseBankNow(),
+        weak: S.dcalcWeak,
+        notes: (S.dcalcNotes || []).slice(),
+        planSeed: Date.now()
+      };
+      S.dcalcPlan = dcBuildPlan(S.dcalcDraft);
+      const notes = (S.dcalcWeak.length ? '其中每天第 3 题参考题库<b>常错计算</b>改编。' : '') +
+        (dcalcUseBankNow() && readCalcBank().length ? '开启了「我的计算题库」，隔题插入导入的式题。' : '') +
+        ((S.dcalcNotes || []).length ? '备注题型<b>' + S.dcalcNotes.map(function (nt) { return esc(nt.t) + '（每天 ' + nt.n + ' 道）'; }).join('、') + '</b>已排在每天最前面。' : '');
+      UI.sheet({ title: '一周预览 · 下周一～周五', body: dcalcPlanBody(S.dcalcPlan, 'preview', notes) });
+    },
+    'dcalc:confirmPlan': async function () {
+      const draft = S.dcalcDraft, plan = S.dcalcPlan;
+      if (!draft || !plan) return;
+      saveDcalcCfg({
+        grade: draft.grade, startDate: draft.startDate, semKey: semKeyOf(new Date()),
+        kinds: draft.kinds, perDay: draft.perDay, timerMin: draft.timerMin,
+        diff: draft.diff || 2, useBank: draft.useBank !== false, weak: draft.weak || [],
+        notes: draft.notes || [],
+        confirmed: true, planStart: plan.monday, planSeed: draft.planSeed
+      });
+      S.dcalcDraft = null; S.dcalcPlan = null;
+      S.dcalcKinds = null; S.dcalcWeak = null; S.dcalcDiff = null; S.dcalcUseBank = null; S.dcalcNotes = null;
+      S.dcalc.showAns = false;
+      if (S.dcalc.tick) { clearInterval(S.dcalc.tick); S.dcalc.tick = null; }
+      UI.close();
+      UI.toast('已确认！' + plan.mondayMd + '（周一）开始按顺序发布');
+      await navigate('home');
+    },
+    'dcalc:planView': function () {
+      const cfg = readDcalcCfg();
+      if (!cfg || !cfg.planStart) return;
+      const base = new Date(cfg.planStart + 'T00:00:00');
+      const days = [];
+      for (let i = 0; i < 5; i++) {
+        const d = new Date(base);
+        d.setDate(d.getDate() + i);
+        const set = dcDaySet(cfg, i, d);
+        days.push({
+          dateKey: dcDateKey(d), wd: '周' + '一二三四五'[i],
+          md: (d.getMonth() + 1) + '月' + d.getDate() + '日',
+          qs: set.qs, week: set.week, unit: set.unit
+        });
+      }
+      UI.sheet({ title: '本周计划 · ' + cfg.grade, body: dcalcPlanBody({ mondayMd: (base.getMonth() + 1) + '月' + base.getDate() + '日', days: days }, 'view') });
+    },
+    'dcalc:setup': function () {
+      S.dcalcKinds = null; S.dcalcWeak = null; S.dcalcDiff = null; S.dcalcUseBank = null; S.dcalcNotes = null;   // 重新打开设置时按已存配置初始化题型
+      UI.sheet({ title: '每日计算 · 设置', body: dcalcSetupBody() });
+    },
+    'dcalc:ans': function () {
+      S.dcalc.showAns = !S.dcalc.showAns;
+      document.querySelectorAll('.dc-ans').forEach(function (el) {
+        el.style.display = S.dcalc.showAns ? '' : 'none';
+      });
+      const btn = document.querySelector('[data-act="dcalc:ans"]');
+      if (btn) btn.textContent = S.dcalc.showAns ? '隐藏答案' : '对答案';
+    },
+    'dcalc:timer': function () {
+      const st = S.dcalc;
+      const btn = document.querySelector('[data-act="dcalc:timer"]');
+      if (st.tick) {   // 倒计时中 → 停止
+        clearInterval(st.tick);
+        st.tick = null;
+        st.left = Math.max(0, Math.round((st.end - Date.now()) / 1000));
+        if (btn) btn.innerHTML = '<span id="dcTime" class="dc-time">' + dcFmtSec(st.left) + '</span> · 倒计时开始';
+        UI.toast('已停止，还剩 ' + dcFmtSec(st.left));
+        return;
+      }
+      const cfg = readDcalcCfg() || {};
+      st.total = Math.max(1, Math.min(60, cfg.timerMin || 5)) * 60;
+      st.end = Date.now() + st.total * 1000;
+      st.tick = setInterval(function () {
+        const el = document.getElementById('dcTime');
+        const left = Math.round((st.end - Date.now()) / 1000);
+        if (left <= 0) {
+          clearInterval(st.tick); st.tick = null;
+          if (el) el.textContent = '00:00';
+          UI.toast('⏰ 倒计时结束！');
+          const b2 = document.querySelector('[data-act="dcalc:timer"]');
+          if (b2) b2.innerHTML = '<span id="dcTime" class="dc-time">' + dcFmtSec(st.total) + '</span> · 倒计时开始';
+          return;
+        }
+        if (el) el.textContent = dcFmtSec(left);
+      }, 300);
+      if (btn) btn.innerHTML = '<span id="dcTime" class="dc-time">' + dcFmtSec(st.total) + '</span> · 停止';
     },
 
     /* ---- 草稿：离开确认页的三选 / 首页恢复 ---- */
@@ -3120,13 +4256,52 @@
     }
   });
 
+  /* 每日计算 · 导入文件生成计算题库（#dcCalcFile 是动态渲染的，用委托监听） */
+  document.addEventListener('change', async function (e) {
+    if (!e.target || e.target.id !== 'dcCalcFile') return;
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    UI.toast('正在解析 ' + file.name + ' …', 4000);
+    try {
+      const res = DocParse.extractDoc
+        ? await DocParse.extractDoc(file)
+        : { text: await DocParse.extract(file), images: [] };
+      const text = OCR.tidy ? OCR.tidy(res.text) : res.text;
+      const r = dcParseCalcText(text);
+      if (!r.items.length) {
+        UI.toast('没有识别到计算式题（找形如 3.6 + 2.7 =、1/2 + 1/4 = 的式题，文字应用题会自动跳过）', 4000);
+        return;
+      }
+      const grade = S.dcalcPick || (readDcalcCfg() || {}).grade || '';
+      r.items.forEach(function (it) { if (grade) it.g = grade; });
+      const bank = readCalcBank();
+      const seen = {};
+      bank.forEach(function (it) { seen[it.q] = 1; });
+      let add = 0;
+      r.items.forEach(function (it) { if (!seen[it.q]) { bank.push(it); add++; } });
+      saveCalcBank(bank);
+      S.dcalcUseBank = true;
+      UI.toast('已提取 ' + add + ' 道计算题补充' + (grade || '本') + '学段练习（题库共 ' + bank.length + ' 道）', 3600);
+      navigate('home');
+    } catch (err) {
+      UI.toast(err && err.message ? err.message : '解析失败', 3200);
+    }
+  });
+
   /* 离开页面时尽量不要丢 OCR worker */
   window.addEventListener('beforeunload', function () { OCR.destroy(); });
 
   /* 调试钩子（控制台可用：__tiku.S、__tiku.navigate(...) 等） */
   window.__tiku = { S: S, navigate: navigate, UI: UI, ACTIONS: ACTIONS,
     ensureSession: ensureSession, buildDrafts: buildDrafts, classifyDrafts: classifyDrafts,
-    seedDemo: seedDemo, Store: Store, resolveUnitPoint: resolveUnitPoint, unitSuffixOf: unitSuffixOf };
+    seedDemo: seedDemo, Store: Store, resolveUnitPoint: resolveUnitPoint, unitSuffixOf: unitSuffixOf,
+    dcDaySet: dcDaySet, dcWeightedPool: dcWeightedPool, dcNextMonday: dcNextMonday,
+    dcWorkdayIndex: dcWorkdayIndex, dcDateKey: dcDateKey,
+    dcCalcAnswer: dcCalcAnswer, dcParseCalcText: dcParseCalcText, calcKindOf: calcKindOf,
+    dcExtractWeak: dcExtractWeak, dcWeakVaried: dcWeakVaried, dcWeakKind: dcWeakKind,
+    dcCollectWeak: dcCollectWeak, readCalcBank: readCalcBank, saveCalcBank: saveCalcBank,
+    dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs };
 
   /* =========================================================
    * 启动

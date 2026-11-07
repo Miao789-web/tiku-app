@@ -173,10 +173,10 @@ const Splitter = (function () {
     return q;
   }
 
-  /* ---------- 手动拆分：按 --- 分隔 ---------- */
+  /* ---------- 手动拆分：按 cf（或 ---）分隔 ---------- */
   function splitByMarker(text) {
     return String(text || '')
-      .split(/\n\s*-{3,}\s*\n/)
+      .split(/\n[ \t]*(?:-{3,}|cf)[ \t]*\n/i)
       .map(function (s) { return s.trim(); })
       .filter(Boolean)
       .map(function (s, i) {
