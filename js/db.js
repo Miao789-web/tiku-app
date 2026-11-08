@@ -203,7 +203,9 @@ const Store = (function () {
       let list = await DB.all('questions');
       if (filter.subject && filter.subject !== '全部') list = list.filter(q => q.subject === filter.subject);
       if (filter.grade && filter.grade !== '全部') list = list.filter(q => q.grade === filter.grade);
-      if (filter.pointId) list = list.filter(q => q.pointId === filter.pointId);
+      // 一题可挂多个考点（q.points 数组），任一命中即算
+      if (filter.pointId) list = list.filter(q =>
+        q.pointId === filter.pointId || (q.points || []).some(p => p.id === filter.pointId));
       if (filter.type && filter.type !== '全部') list = list.filter(q => q.type === filter.type);
       if (filter.difficulty) list = list.filter(q => Number(q.difficulty) === Number(filter.difficulty));
       if (filter.status && filter.status !== '全部') list = list.filter(q => q.status === filter.status);
@@ -279,7 +281,11 @@ const Store = (function () {
     async recount() {
       const [points, questions] = await Promise.all([DB.all('points'), DB.all('questions')]);
       const counts = {};
-      questions.forEach(q => { counts[q.pointId] = (counts[q.pointId] || 0) + 1; });
+      questions.forEach(q => {
+        // 一题挂多个考点：主考点与 q.points 里每个都计数
+        if (q.pointId) counts[q.pointId] = (counts[q.pointId] || 0) + 1;
+        (q.points || []).forEach(p => { if (p && p.id) counts[p.id] = (counts[p.id] || 0) + 1; });
+      });
       const changed = [];
       points.forEach(function (p) {
         const n = counts[p.id] || 0;
@@ -288,14 +294,26 @@ const Store = (function () {
       if (changed.length) await DB.bulkPut('points', changed);
     },
 
-    /** 合并两个考点（解决同义标签分裂） */
+    /** 合并两个考点（解决同义标签分裂）；一题多考点时同步替换 q.points 里的条目 */
     async merge(fromId, toId) {
-      const qs = (await DB.all('questions')).filter(q => q.pointId === fromId);
+      const qs = (await DB.all('questions')).filter(q =>
+        q.pointId === fromId || (q.points || []).some(p => p.id === fromId));
       const to = await DB.get('points', toId);
       const from = await DB.get('points', fromId);
       if (!to || !from) throw new Error('考点不存在');
       const aliases = Array.from(new Set([].concat(to.aliases || [], from.aliases || [], [from.name])));
-      await DB.bulkPut('questions', qs.map(q => Object.assign(q, { pointId: toId, pointName: to.name })));
+      await DB.bulkPut('questions', qs.map(function (q) {
+        if (q.pointId === fromId) { q.pointId = toId; q.pointName = to.name; }
+        if (q.points && q.points.length) {
+          const merged = [];
+          q.points.forEach(function (p) {
+            const np = p.id === fromId ? { id: toId, name: to.name } : p;
+            if (!merged.some(x => x.id === np.id)) merged.push(np);
+          });
+          q.points = merged;
+        }
+        return q;
+      }));
       to.aliases = aliases;
       await DB.put('points', to);
       await DB.del('points', fromId);
@@ -305,7 +323,11 @@ const Store = (function () {
 
     async removeEmpty() {
       const [points, questions] = await Promise.all([DB.all('points'), DB.all('questions')]);
-      const used = new Set(questions.map(q => q.pointId));
+      const used = new Set();
+      questions.forEach(q => {
+        if (q.pointId) used.add(q.pointId);
+        (q.points || []).forEach(p => { if (p && p.id) used.add(p.id); });
+      });
       const dead = points.filter(p => !used.has(p.id));
       for (const p of dead) await DB.del('points', p.id);
       return dead.length;

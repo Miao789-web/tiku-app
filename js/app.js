@@ -22,12 +22,13 @@
     aiFallback: '',
     defaults: { subject: '数学', grade: '五年级', term: '上册', version: '苏教版' },
     imgUrls: {},          // assetId -> objectURL
-    open: {},             // questionId -> 是否展开
+    open: {},             // questionId -> 思路/原图是否展开
+    openImg: {},          // questionId -> 配图区是否展开（undefined 时有配图的题默认展开）
     cache: { same: {} },  // same: questionId -> 同考点历史题缓存
     dcalc: { showAns: false, t0: null, acc: 0, tick: null, base: '00:00' },  // 每日计算 UI 状态
     dcalcPick: '',        // 每日计算设置里临时选的年级
     dcalcDirty: false,
-    bank: { subject: '全部', grade: '全部', keyword: '', status: '全部', type: '全部', difficulty: '', unit: '', point: '' },
+    bank: { subject: '全部', grade: '全部', keyword: '', status: '全部', type: '全部', difficulty: '', unit: '', point: '', multiUnit: [], multiPoint: [] },
     batch: { on: false, set: {} },   // 题库批量选择模式：set 为题目 id 集合
     reviewCfg: { subject: '全部', scope: 'due', limit: 10 },
     review: null
@@ -70,7 +71,7 @@
         answer: d.answer || '', solution: d.solution || '',
         type: d.type, difficulty: d.difficulty,
         images: d.images || [], point: d.point || '', pointId: d.pointId || '',
-        pointUnit: d.pointUnit || '',
+        pointUnit: d.pointUnit || '', points: d.points || [],
         confidence: d.confidence || 0, needsConfirm: !!d.needsConfirm
       };
     });
@@ -608,6 +609,121 @@
     if (!b) return '';
     return String(dcRound(a / b));
   }
+
+  /* ---- 编辑答案 · 反推式子 ----
+   * 老师填了答案 X、原式 a op b：选保留哪个数，系统改另一个数，使学生算出的答案恰好等于 X。
+   * 全程用分数精确运算，只有能「精确算对」的方案才会提供——绝不出现式子不变、答案却是错的。 */
+  function dcFr(n, d) {
+    if (!d) return null;
+    if (n === 0) d = 1;
+    const g = dcGcd(Math.abs(n), Math.abs(d)) || 1;
+    n /= g; d /= g;
+    if (d < 0) { n = -n; d = -d; }
+    return { n: n, d: d };
+  }
+  function dcFrAdd(x, y) { return dcFr(x.n * y.d + y.n * x.d, x.d * y.d); }
+  function dcFrSub(x, y) { return dcFr(x.n * y.d - y.n * x.d, x.d * y.d); }
+  function dcFrMul(x, y) { return dcFr(x.n * y.n, x.d * y.d); }
+  function dcFrDiv(x, y) { if (!y || y.n === 0) return null; return dcFr(x.n * y.d, x.d * y.n); }
+  /** 分数式里用的写法：整数也写成 n/1（保证 a/b op c/d 的解析格式成立） */
+  function dcFrStr(fr) { return fr ? (fr.d === 1 ? fr.n + '/1' : fr.n + '/' + fr.d) : ''; }
+  /** 分母只含 2/5 因子 → 有限小数 */
+  function dcFrIsDec(fr) {
+    let d = fr.d;
+    while (d % 2 === 0) d /= 2;
+    while (d % 5 === 0) d /= 5;
+    return d === 1;
+  }
+  function dcFrDecStr(fr) {
+    let d = fr.d, tw = 0, fv = 0;
+    while (d % 2 === 0) { d /= 2; tw++; }
+    while (d % 5 === 0) { d /= 5; fv++; }
+    const max = Math.max(tw, fv);
+    const scaled = fr.n * Math.pow(2, max - tw) * Math.pow(5, max - fv);
+    let s = (scaled / Math.pow(10, max)).toFixed(max);
+    // 只去小数部分的尾零（不能动整数位：'20'、'0' 都不能被削掉）
+    if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+    return (s === '-0' || s === '' || s === '-') ? '0' : s;
+  }
+  /** '3/4' | '3.6' | '50' → {n,d}（精确分数），解析失败返回 null */
+  function dcFrVal(s) {
+    s = String(s || '').trim().replace(/＝/g, '=').replace(/=+$/, '').replace(/−/g, '-');
+    let m = s.match(/^(-?\d+)\/(-?\d+)$/);
+    if (m) return +m[2] ? dcFr(+m[1], +m[2]) : null;
+    m = s.match(/^(-?\d+)(?:\.(\d+))?$/);
+    if (!m) return null;
+    if (m[2] === undefined) return { n: +m[1], d: 1 };
+    const dec = m[2], p = Math.pow(10, dec.length);
+    return dcFr((+m[1]) * p + (m[1].charAt(0) === '-' ? -parseInt(dec, 10) : parseInt(dec, 10)), p);
+  }
+  /** 两个数字串是否数值相等（兼容 '3/4' vs '0.75'） */
+  function dcSameNum(x, y) {
+    const a = dcFrVal(x), b = dcFrVal(y);
+    return !!(a && b && a.n * b.d === b.n * a.d);
+  }
+  /**
+   * 反推方案：原式 a op b，老师填的答案 X。
+   * 返回 [{ key:'first'|'second', newQ, desc }]——保留第一个/第二个数、另一个数改成多少。
+   * 每个方案都会先用 dcCalcAnswer 复核，算不出 X 的一律不给。
+   */
+  function dcSolveFixes(expr, ansStr) {
+    const s = String(expr || '').trim().replace(/[=＝？?。]+$/, '').replace(/\s/g, '');
+    const X = dcFrVal(ansStr);
+    if (!X) return [];
+    const fixes = [];
+    const dispOp = function (op) { return op === '-' ? '−' : op; };
+    const hadEq = /[=＝]\s*$/.test(String(expr || ''));
+    const tail = hadEq ? ' =' : '';
+    const tryFix = function (A, B, op, keepFirst, fmtA, fmtB) {
+      let nb = null;
+      if (keepFirst) {          // A op ? = X
+        if (op === '+') nb = dcFrSub(X, A);
+        else if (op === '-') nb = dcFrSub(A, X);
+        else if (op === '×') nb = A.n === 0 ? null : dcFrDiv(X, A);
+        else nb = X.n === 0 ? null : dcFrDiv(A, X);        // A ÷ ? = X → ? = A ÷ X
+      } else {                   // ? op B = X
+        if (op === '+') nb = dcFrSub(X, B);
+        else if (op === '-') nb = dcFrAdd(X, B);
+        else if (op === '×') nb = B.n === 0 ? null : dcFrDiv(X, B);
+        else nb = dcFrMul(B, X);                           // ? ÷ B = X → ? = B × X
+      }
+      if (!nb) return null;
+      const newQ = fmtA(keepFirst ? A : nb) + ' ' + dispOp(op) + ' ' + fmtB(keepFirst ? nb : B) + tail;
+      // 硬校验：改完的式子必须精确算出老师填的答案
+      if (!dcSameNum(dcCalcAnswer(newQ), ansStr)) return null;
+      const oldV = keepFirst ? fmtB(B) : fmtA(A);
+      const newV = keepFirst ? fmtB(nb) : fmtA(nb);
+      return {
+        key: keepFirst ? 'first' : 'second', newQ: newQ,
+        desc: '保留' + (keepFirst ? '第一个数 ' + fmtA(A) : '第二个数 ' + fmtB(B)) +
+          (oldV === newV ? '' : '，把' + (keepFirst ? '第二个数 ' + oldV : '第一个数 ' + oldV) + ' 改成 ' + newV)
+      };
+    };
+    // 分数式 a/b op c/d
+    let m = s.match(/^(\d+)\/(\d+)([+\-−×xX*÷/])(\d+)\/(\d+)$/);
+    if (m) {
+      const A = { n: +m[1], d: +m[2] }, B = { n: +m[4], d: +m[5] };
+      let op = m[3];
+      if (op === '−') op = '-'; if (op === '/') op = '÷'; if (op === 'x' || op === 'X' || op === '*') op = '×';
+      const fs = function (fr) { return dcFrStr(dcFr(fr.n, fr.d)); };
+      const f1 = tryFix(A, B, op, true, fs, fs); if (f1) fixes.push(f1);
+      const f2 = tryFix(A, B, op, false, fs, fs); if (f2) fixes.push(f2);
+      return fixes;
+    }
+    // 整数/小数式 a op b（另一个数必须还是有限小数，否则不给这个选项）
+    m = s.match(/^(\d+(?:\.\d+)?)([+\-−×xX*÷/])(\d+(?:\.\d+)?)$/);
+    if (!m) return [];
+    const aS = m[1], bS = m[3];
+    let op = m[2];
+    if (op === '−') op = '-'; if (op === '/') op = '÷'; if (op === 'x' || op === 'X' || op === '*') op = '×';
+    const A = dcFrVal(aS), B = dcFrVal(bS);
+    if (!A || !B) return [];
+    const dec = function (fr) { return dcFrIsDec(fr) ? dcFrDecStr(fr) : null; };
+    const fa = function (fr) { return dec(fr); };
+    const f1 = tryFix(A, B, op, true, fa, fa); if (f1) fixes.push(f1);
+    const f2 = tryFix(A, B, op, false, fa, fa); if (f2) fixes.push(f2);
+    return fixes;
+  }
   /** 判断一条式题属于哪种题型（与所选题型过滤配套），不认识返回 '' */
   function calcKindOf(q) {
     const s = String(q || '');
@@ -710,7 +826,7 @@
     const weak = cfg.weak || [];
     const bank = (cfg.useBank === false) ? [] : readCalcBank().filter(function (it) {
       if (it.g && cfg.grade && it.g !== cfg.grade) return false; // 只补充当前学段
-      const k = calcKindOf(it.q);
+      const k = it.mk || calcKindOf(it.q); // 手动改过的题型优先，以老师编辑为准
       return k && kinds.indexOf(k) >= 0; // 题库题也必须属于所选题型
     });
     const qs = []; const seen = {};
@@ -739,6 +855,14 @@
       }
       if (g) { seen[g.q] = 1; qs.push(g); }
     }
+    // 应用预览时的手动编辑（预览确认后按天+题号覆盖）
+    const edits = cfg.planEdits || {};
+    Object.keys(edits).forEach(function (key) {
+      const parts = key.split(':');
+      if (+parts[0] === index && qs[+parts[1]]) {
+        qs[+parts[1]] = Object.assign({}, qs[+parts[1]], edits[key]);
+      }
+    });
     return { qs: qs, week: info.week, unit: info.unit };
   }
 
@@ -847,21 +971,141 @@
       bankHtml +
       '<input type="file" id="dcCalcFile" accept=".txt,.pdf,.docx,.doc" style="display:none">' +
       '<button class="btn soft block mt8" data-act="dcalc:impCalc">📄 导入文件生成计算题库（txt / Word / PDF，一行一道式题）</button>' +
+      '<button class="btn soft block mt8" data-act="dcalc:ocrCalc">📷 拍照识别计算题入库（一步式题，自动算答案）</button>' +
       '<button class="btn primary block mt12" data-act="dcalc:preview">生成一周预览（下周一～周五）</button>';
+  }
+
+  /** 拍照识别计算题 · 确认层：核对识别结果（可逐条移除）后加入题库 */
+  function dcOcrSheet() {
+    const st = S._dcOcr;
+    if (!st) return;
+    const rows = st.items.map(function (it, i) {
+      return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(it.q) + '</span>' +
+        '<span class="dc-ans">答案：' + esc(it.a) + '</span>' +
+        '<button class="small del" style="padding:2px 6px" data-act="dcoc:rm" data-i="' + i + '">✕</button></div>';
+    }).join('');
+    UI.sheet({
+      title: '识别到 ' + st.items.length + ' 道计算题',
+      body: '<p class="muted" style="margin-bottom:8px">答案已自动算好，点 ✕ 可删掉识别错误的行，确认无误后加入「我的计算题库」（上限 300 道）。</p>' +
+        rows +
+        '<div class="row mt12" style="gap:8px">' +
+          '<button class="btn ghost grow" data-act="sheet:close">取消</button>' +
+          '<button class="btn primary grow" data-act="dcoc:save">✓ 加入计算题库（' + st.items.length + ' 道）</button>' +
+        '</div>'
+    });
+  }
+
+  /** 每日计算 · 编辑一题：式子 / 答案 / 题型 / 难度都可改，改了就以编辑为准。
+   *  答案与式子算出的不一致时（opts.warn 非空）：有方案（opts.fixes）列出「保留哪个数、
+   *  系统改另一个数」的按钮；没有方案则只能改回系统答案——绝不出现式子不变、答案错误。 */
+  function dcEditSheet(plan, di, i, opts) {
+    const day = plan.days[di];
+    const g = day && day.qs[i];
+    if (!g) return;
+    opts = opts || {};
+    const warn = opts.warn;
+    const vals = opts.vals || {};
+    const fixes = opts.fixes || [];
+    const qNow = vals.q !== undefined ? vals.q : g.q;
+    const aNow = vals.a !== undefined ? vals.a : g.a;
+    const kindNow = vals.kindIn !== undefined ? vals.kindIn : (g.mk || calcKindOf(g.q) || '');
+    const diffNow = vals.diffIn !== undefined ? vals.diffIn : (g.diff !== undefined && g.diff !== null ? String(g.diff) : '');
+    const kindOpts = '<option value="">自动识别</option>' + DCALC_KINDS.map(function (k) {
+      return '<option value="' + k.k + '"' + (kindNow === k.k ? ' selected' : '') + '>' + k.l + '</option>';
+    }).join('');
+    const diffOpts = '<option value="">跟随整体难度</option>' + DCALC_DIFFS.map(function (x) {
+      return '<option value="' + x.v + '"' + (diffNow === String(x.v) ? ' selected' : '') + '>' + x.l + '</option>';
+    }).join('');
+    const fromBank = g.k === 'bank' || (g.src === 'bank');
+    let footer;
+    if (fixes && fixes.length) {
+      // 答案与式子不一致 → 列出「保留哪个数、另一个数改成多少」的精确方案
+      footer = '<div class="mt12">' +
+        '<p style="font-weight:600;font-size:13.5px;margin:0 0 6px">要让答案等于「' + esc(aNow) + '」，选一个不变的数，系统改另一个数：</p>' +
+        fixes.map(function (f) {
+          return '<button class="btn primary block" style="text-align:left;margin-bottom:8px" data-act="dcalc:editFix" data-d="' + di + '" data-i="' + i + '" data-q="' + esc(f.newQ) + '">' +
+            esc(f.desc) + '<br><span style="font-weight:400;font-size:12px">式子改为：' + esc(f.newQ) + ' = ' + esc(aNow) + '</span></button>';
+        }).join('') +
+        '<button class="btn soft block" data-act="dcalc:editSys" data-d="' + di + '" data-i="' + i + '">不改式子，答案用系统算的 ' + esc(vals.computed || '') + '</button>' +
+        '<button class="btn ghost block mt8" data-act="sheet:close">取消</button></div>';
+    } else if (warn) {
+      // 不一致且没有可改的方案（改出来除不尽/太怪）→ 只能改回系统答案
+      footer = '<div class="row mt12" style="gap:8px">' +
+        '<button class="btn ghost grow" data-act="sheet:close">取消</button>' +
+        '<button class="btn soft grow" data-act="dcalc:editSys" data-d="' + di + '" data-i="' + i + '">用系统答案 ' + esc(vals.computed || '') + '</button>' +
+      '</div>';
+    } else {
+      footer = '<div class="row mt12" style="gap:8px">' +
+        '<button class="btn ghost grow" data-act="sheet:close">取消</button>' +
+        '<button class="btn primary grow" data-act="dcalc:editSave" data-d="' + di + '" data-i="' + i + '">保存修改</button>' +
+      '</div>';
+    }
+    UI.sheet({
+      title: '编辑 ' + day.md + ' 第 ' + (i + 1) + ' 题',
+      body: (warn ? '<div class="card flat" style="background:var(--warn-soft,#fff7e6);border-color:#ffe3b8;margin-bottom:10px">' +
+          '<p class="small" style="color:#8a5300">' + esc(warn) + '</p></div>' : '') +
+        '<div class="field"><label>式子</label>' +
+          '<textarea class="textarea" id="dcEq" rows="2">' + esc(qNow) + '</textarea></div>' +
+        '<div class="field"><label>答案</label>' +
+          '<input class="input" id="dcAnsv" value="' + esc(aNow) + '"></div>' +
+        '<div class="row mt8" style="gap:8px">' +
+          '<select class="select" id="dcKind" style="flex:1.4">' + kindOpts + '</select>' +
+          '<select class="select" id="dcDiff" style="flex:1">' + diffOpts + '</select>' +
+        '</div>' +
+        (fromBank
+          ? '<p class="muted mt8" style="font-size:12px">这题来自「我的计算题库」，修改会同步更新题库里的这道题；题型 / 难度改动也会被记住，之后出题筛选按你改的算。</p>'
+          : '<p class="muted mt8" style="font-size:12px">改式子后答案会自动重算；你填的答案和算出来的不一样时，会让你选保留式子里的哪个数，系统改另一个数来配你的答案，保证答案和式子一定对得上。</p>') +
+        footer
+    });
+  }
+
+  /** 应用一次编辑（save / 以我填的为准 / 用系统答案 三条路径共用）。
+   *  题型覆盖记在 mk、难度记在 diff（不占用 bank 标记位），存进 planEdits —— 改了就以编辑为准。 */
+  function dcEditApply(plan, di, i, q, ansIn, kindIn, diffIn) {
+    const g = plan.days[di].qs[i];
+    const computed = dcCalcAnswer(q);
+    const a = (ansIn && ansIn.trim()) ? ansIn.trim() : computed;
+    const oldKey = String(g.q || '').replace(/\s/g, '');
+    const wasBank = g.src === 'bank' || g.k === 'bank';
+    g.q = q; g.a = a;
+    if (kindIn) g.mk = kindIn; else delete g.mk;
+    if (diffIn) g.diff = +diffIn; else delete g.diff;
+    plan.edits = plan.edits || {};
+    const entry = { q: q, a: a };
+    if (kindIn) entry.mk = kindIn;
+    if (diffIn) entry.diff = +diffIn;
+    plan.edits[di + ':' + i] = entry;
+    // 来自计算题库的题：同步更新题库本身（题型/难度覆盖记在 mk/md，之后出题筛选以它为准）
+    if (wasBank) {
+      const bank = readCalcBank();
+      const it = bank.find(function (x) { return String(x.q || '').replace(/\s/g, '') === oldKey; });
+      if (it) {
+        it.q = q; it.a = a;
+        if (kindIn) it.mk = kindIn; else delete it.mk;
+        if (diffIn) it.md = +diffIn; else delete it.md;
+        saveCalcBank(bank);
+      }
+    }
+    UI.sheet({ title: '一周预览 · 下周一～周五', body: dcalcPlanBody(plan, 'preview') });
+    const kLabel = kindIn ? (function () { const x = DCALC_KINDS.find(function (k) { return k.k === kindIn; }); return ' · 题型：' + (x ? x.l : kindIn); })() : '';
+    UI.toast('已更新，答案：' + a + kLabel, 2600);
   }
 
   /** 一周计划预览 / 查看内容（mode='preview' 时带确认按钮；notes 为附加说明） */
   function dcalcPlanBody(plan, mode, notes) {
     const n = plan.days[0] ? plan.days[0].qs.length : 0;
-    const head = '<p class="muted" style="margin-bottom:8px">' + plan.mondayMd + '（周一）开始按顺序发布，每天 ' + n + ' 题；点开每天可浏览题目' + (mode === 'preview' ? '，<b>右侧为参考答案（仅预览时显示，发布后默认隐藏）</b>' : '') + '。' + (notes || '') + '</p>';
-    const days = plan.days.map(function (day) {
+    const head = '<p class="muted" style="margin-bottom:8px">' + plan.mondayMd + '（周一）开始按顺序发布，每天 ' + n + ' 题；点开每天可浏览题目' + (mode === 'preview' ? '，<b>右侧为参考答案（仅预览时显示，发布后默认隐藏）</b>，每题可点 ✎ 编辑（式子、答案、题型、难度都能改）' : '') + '。' + (notes || '') + '</p>';
+    const days = plan.days.map(function (day, dayIdx) {
       const rows = day.qs.map(function (g, i) {
         const ansHtml = mode === 'preview'
           ? '<span class="dc-ans">答案：' + esc(g.a) + '</span>'
           : '<span class="dc-ans" style="display:none">答案：' + esc(g.a) + '</span>';
-        return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span>' + ansHtml + '</div>';
+        const editBtn = (mode === 'preview')
+          ? '<button class="small" style="color:var(--brand);padding:2px 6px" data-act="dcalc:editQ" data-d="' + dayIdx + '" data-i="' + i + '" aria-label="编辑">✎</button>'
+          : '';
+        return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span>' + ansHtml + editBtn + '</div>';
       }).join('');
-      return '<details class="dc-day"' + (mode === 'preview' && day === plan.days[0] ? ' open' : '') + '>' +
+      return '<details class="dc-day"' + (mode === 'preview' && dayIdx === 0 ? ' open' : '') + '>' +
         '<summary>' + day.md + ' ' + day.wd + ' · 第 ' + day.week + ' 周' + (day.unit ? ' · ' + esc(day.unit) : '') + '（' + day.qs.length + ' 题）</summary>' + rows + '</details>';
     }).join('');
     let ops = '';
@@ -959,6 +1203,66 @@
     };
     await DB.put('points', point);
     return { point: point, isNew: true, matched: 'unit-new', score: 1 };
+  }
+
+  /* ---- 一题挂多个考点 / 多个单元 ----
+   * q.points = [{id, name}]，q.units = ['单元名']；
+   * 老数据没有数组字段时回退到单值字段 pointId/pointName/unit。 */
+  function qUnitsOf(q) {
+    if (!q) return [];
+    const arr = (q.units && q.units.length) ? q.units.filter(Boolean) : (q.unit ? [q.unit] : []);
+    return arr.length ? arr : ['未归类'];
+  }
+  function qPointsOf(q) {
+    if (!q) return [];
+    const arr = (q.points && q.points.length) ? q.points.filter(p => p && p.name).map(p => ({ id: p.id || '', name: p.name })) : [];
+    if (q.pointId || q.pointName) {
+      const first = arr[0];
+      if (!first || first.id !== q.pointId) arr.unshift({ id: q.pointId || '', name: q.pointName || '未分类' });
+    }
+    if (!arr.length) arr.push({ id: '', name: '未分类' });
+    return arr;
+  }
+  /* ---- 课时（单元下的再分类）----
+   * q.lessons 与 q.units 按下标一一对应（第 i 个单元的课时 = lessons[i]，空串表示没分课时）；
+   * 老数据没有数组字段时回退 q.lesson（主单元的课时）。 */
+  function qLessonOf(q, unit) {
+    if (!q) return '';
+    const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
+    const i = us.indexOf(unit);
+    if (i >= 0 && q.lessons && q.lessons[i]) return q.lessons[i];
+    return (i === 0 && q.lesson) ? q.lesson : '';
+  }
+  function qLessonsOf(q) {
+    if (!q) return [];
+    const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
+    return us.map(function (u, i) {
+      return (q.lessons && q.lessons[i]) || (i === 0 && q.lesson) || '';
+    });
+  }
+  /** 题库某单元下出现过的课时名（去重） */
+  function knownLessonsOf(unit) {
+    const out = [];
+    (S.cache.bankQ || []).forEach(function (q) {
+      const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
+      us.forEach(function (u, i) {
+        if (unit && u !== unit) return;
+        const L = (q.lessons && q.lessons[i]) || (!unit && i === 0 && q.lesson) || '';
+        if (L && out.indexOf(L) < 0) out.push(L);
+      });
+    });
+    return out;
+  }
+  /** 写库时同步主字段（pointId/pointName/unit 取第一个），保证老逻辑不受影响 */
+  function syncPrimaryRef(q) {
+    const pts = qPointsOf(q);
+    q.points = pts;
+    q.pointId = pts[0].id;
+    q.pointName = pts[0].name;
+    const us = qUnitsOf(q);
+    q.units = us;
+    q.unit = us[0] === '未归类' ? '' : us[0];
+    return q;
   }
 
   /* =========================================================
@@ -1121,6 +1425,18 @@
       '</div>' +
       '<p class="qtext" style="padding:0">' + esc(q.text) + '</p>' +
       optionsHtml(q) +
+      /* 配图区：有配图的题默认打开（可收起），不随思路展开状态 */
+      ((q.images && q.images.length && S.openImg[q.id] !== false)
+        ? '<div class="dimg-list mt8">' + q.images.map(function (src, k) {
+            return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
+              '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
+          }).join('') +
+          '<div class="row between" style="margin-top:4px"><p class="muted" style="font-size:12px">↑ 题目图形（点 ✕ 移除，点「配图」可增删）</p>' +
+          '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">收起配图</button></div></div>'
+        : ((q.images && q.images.length)
+          ? '<div class="row between mt8"><span class="chip gray">📐 ' + q.images.length + ' 张配图</span>' +
+            '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">展开配图</button></div>'
+          : '')) +
       (open
         ? '<div class="solution-box" style="margin:10px 0 0">' +
             '<b>解题思路</b>' + esc(q.solution || '（暂无，可手动补充）') +
@@ -1131,20 +1447,14 @@
                 (url ? '<img src="' + url + '" style="width:100%;display:block">'
                      : '<div class="empty small" style="padding:18px">原图加载中…</div>') + '</div>'
             : '<p class="muted mt8">（没有保存原图）</p>') +
-          ((q.images && q.images.length)
-            ? '<div class="dimg-list">' + q.images.map(function (src, k) {
-                return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
-                  '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
-              }).join('') + '<p class="muted" style="font-size:12px;margin-top:4px">↑ 题目图形（点 ✕ 移除，点「配图」可增删）</p></div>'
-            : '')
+        '' +
+        sameBox(q)
         : '') +
-      (open ? sameBox(q) : '') +
       (batch ? '' :
       '<div class="qops" style="padding:10px 0 0">' +
         '<button data-act="q:toggle" data-id="' + q.id + '">' + (open ? '收起' : '展开思路/原图') + '</button>' +
         '<button data-act="q:edit" data-id="' + q.id + '">编辑</button>' +
         '<button data-act="q:imgs" data-id="' + q.id + '">配图</button>' +
-        '<button data-act="q:gen" data-id="' + q.id + '">举一反三</button>' +
         '<button data-act="q:basket" data-id="' + q.id + '">' + (Paper.has(q.id) ? '✓ 已入卷' : '加入组卷') + '</button>' +
         '<button data-act="q:point" data-id="' + q.id + '">改考点</button>' +
         '<button class="del" data-act="q:del" data-id="' + q.id + '">删除</button>' +
@@ -1185,7 +1495,7 @@
         Store.Questions.list({ subject: S.defaults.subject, grade: S.defaults.grade })
       ]);
       const units = {};
-      unitQs.forEach(function (q) { const u = q.unit || '未归类'; units[u] = (units[u] || 0) + 1; });
+      unitQs.forEach(function (q) { qUnitsOf(q).forEach(function (u) { units[u] = (units[u] || 0) + 1; }); });
       S.cache.home = { stats: stats, recent: recent.slice(0, 4), total: recent.length, units: units };
       // 未完成的导入草稿（确认页没入库就退出的）
       const dr = readDraftStore();
@@ -1503,6 +1813,28 @@
         '<button class="tag" data-act="confirm:addUnit">＋ 新增章节</button>' +
         '</div>';
 
+      // 课时（选填）：已选章节时给出该单元下用过的课时，方便点选
+      const knownLs = s.unit ? knownLessonsOf(s.unit) : knownLessonsOf('');
+      const lessonChips = knownLs.length
+        ? '<div class="chips mt8">' + knownLs.map(function (L) {
+            return '<button class="tag' + (s.lesson === L ? ' active' : '') + '" data-act="confirm:lesson" data-v="' + esc(L) + '">' + esc(L) + '</button>';
+          }).join('') + '</div>'
+        : '';
+
+      // 红笔答案检测：一般红笔标记的是答案，汇总提示（识别手写体仅供参考）
+      const redLines = [];
+      (s.images || []).forEach(function (im) {
+        if (im.redAns && im.redAns.found && im.redAns.text) redLines.push(im.redAns.text);
+      });
+      const redCard = redLines.length
+        ? '<section class="card" style="border-left:3px solid #e5484d;margin-bottom:10px">' +
+            '<div class="card-h"><h3>🔍 识别到红笔标记</h3>' +
+              '<button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:copyRed">复制</button></div>' +
+            '<p class="small muted">一般红笔写的是答案（手写识别仅供参考，请核对后填到各题的答案框）：</p>' +
+            '<p style="white-space:pre-wrap;font-size:14px;font-weight:600;color:#b3261e;margin-top:6px">' + esc(redLines.join('\n')) + '</p>' +
+          '</section>'
+        : '';
+
       let cards = S.drafts.map(function (d, i) {
         const chipPoint = d.aiPending
           ? '<span class="chip gray">AI 归类中…</span>'
@@ -1517,6 +1849,8 @@
             '<span class="chip gray">难度 ' + d.difficulty + '</span>' +
           '</div>' +
           '<p class="qtext">' + esc(body) + '</p>' +
+          '<div class="field mt8" style="margin-bottom:0"><label>答案（选填）</label>' +
+            '<input class="input" data-draft-ans="' + i + '" value="' + esc(d.answer || '') + '" placeholder="可留空，入库后随时补"></div>' +
           (d.images && d.images.length
             ? '<div class="dimg-list">' + d.images.map(function (src, k) {
                 return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
@@ -1547,6 +1881,7 @@
           '<select class="select" data-change="confirm:subject" style="flex:1">' + subjOpts + '</select>' +
           '<select class="select" data-change="confirm:grade" style="flex:1">' + gradeOpts + '</select>' +
         '</div>' +
+        redCard +
         '<section class="card">' +
           '<div class="card-h"><h3>归入章节</h3>' +
             '<span class="row" style="gap:10px">' +
@@ -1554,12 +1889,15 @@
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:unitMgr">删除章节</button>' +
             '</span></div>' +
           unitChips +
+          '<div class="field mt8"><label>课时（选填，该单元下会按课时归类考点）</label>' +
+            '<input class="input" id="batchLesson" placeholder="如：第3课时" value="' + esc(s.lesson || '') + '">' +
+          '</div>' +
+          lessonChips +
           '<div class="field mt8"><label>作业时间</label>' +
             '<input class="input" id="batchDate" type="date" value="' + esc(s.batchDate || todayStr()) + '">' +
           '</div>' +
           '<div class="field"><label>练习名称</label>' +
-            '<input class="input" id="batchName" placeholder="如：数学练习册P23" value="' + esc(s.batchName || '') + '" ' +
-              'onfocus="if(!this.value)this.value=\'' + defaultBatchName() + '\'">' +
+            '<input class="input" id="batchName" placeholder="如：数学练习册P23" value="' + esc(s.batchName || '') + '">' +
           '</div>' +
         '</section>' +
         (S.aiFallback
@@ -1572,6 +1910,41 @@
           '<div class="bb-info">' + S.drafts.length + ' 题<br>待确认 ' + S.drafts.filter(function (d) { return d.needsConfirm && !d.aiPending; }).length + '</div>' +
           '<button class="btn primary grow" data-act="confirm:save"' + (S.drafts.length ? '' : ' disabled') + '>确认入库</button>' +
         '</div>';
+    },
+    after() {
+      // 答案填写框（选填）：输入即写回草稿
+      document.querySelectorAll('[data-draft-ans]').forEach(function (el) {
+        el.addEventListener('input', function () {
+          const d = S.drafts[+el.dataset.draftAns];
+          if (d) d.answer = el.value;
+        });
+      });
+      // 练习名称 / 作业时间：输入即写回会话，避免弹层操作触发刷新后丢改动
+      const bn = document.getElementById('batchName');
+      if (bn) {
+        bn.addEventListener('focus', function () {
+          if (!bn.value && S.session) { bn.value = defaultBatchName(); S.session.batchName = bn.value; }
+        });
+        bn.addEventListener('input', function () {
+          if (S.session) S.session.batchName = bn.value;
+        });
+      }
+      const bd = document.getElementById('batchDate');
+      if (bd) {
+        bd.addEventListener('change', function () {
+          if (S.session) S.session.batchDate = bd.value;
+        });
+        bd.addEventListener('input', function () {
+          if (S.session) S.session.batchDate = bd.value;
+        });
+      }
+      // 课时（选填）：输入即写回会话，弹层操作刷新后不丢
+      const bl = document.getElementById('batchLesson');
+      if (bl) {
+        bl.addEventListener('input', function () {
+          if (S.session) S.session.lesson = bl.value.trim();
+        });
+      }
     }
   };
 
@@ -1733,17 +2106,23 @@
         return [q.text, q.pointName, q.solution, q.answer, q.type, q.unit].join(' ').toLowerCase().indexOf(kw) >= 0;
       });
     }
-    const browsing = !kw && b.status === '全部' && b.type === '全部' && !b.difficulty && !b.unit && !b.point;
+    const browsing = !kw && b.status === '全部' && b.type === '全部' && !b.difficulty &&
+      !b.unit && !b.point && !(b.multiUnit && b.multiUnit.length) && !(b.multiPoint && b.multiPoint.length);
 
-    // 1) 搜索 / 筛选 → 题目列表
+    // 1) 搜索 / 筛选 → 题目列表（一题挂多个考点/单元：任一命中即显示）
     if (!browsing) {
-      let list = b.unit ? qs.filter(q => (q.unit || '未归类') === b.unit) : qs;
-      if (b.point) list = list.filter(q => (q.pointName || '未分类') === b.point);
+      let list = qs;
+      if (b.multiUnit && b.multiUnit.length) list = list.filter(q => qUnitsOf(q).some(u => b.multiUnit.indexOf(u) >= 0));
+      else if (b.unit) list = list.filter(q => qUnitsOf(q).indexOf(b.unit) >= 0);
+      if (b.multiPoint && b.multiPoint.length) list = list.filter(q => qPointsOf(q).some(p => b.multiPoint.indexOf(p.name) >= 0));
+      else if (b.point) list = list.filter(q => qPointsOf(q).some(p => p.name === b.point));
       S.cache.bankListIds = list.slice(0, 100).map(q => q.id);
       if (!list.length) return '<div class="empty"><b>没有匹配的题目</b>换个条件试试</div>';
       const pickedChips =
-        (b.unit ? '<span class="chip brand">' + esc(b.unit) + '</span>' : '') +
-        (b.point ? '<span class="chip brand">' + esc(b.point) + '</span>' : '');
+        (b.multiUnit && b.multiUnit.length ? b.multiUnit.map(u => '<span class="chip brand">章节：' + esc(u) + '</span>').join('') : '') +
+        (b.unit ? '<span class="chip brand">章节：' + esc(b.unit) + '</span>' : '') +
+        (b.multiPoint && b.multiPoint.length ? b.multiPoint.map(pn => '<span class="chip brand">考点：' + esc(pn) + '</span>').join('') : '') +
+        (b.point ? '<span class="chip brand">考点：' + esc(b.point) + '</span>' : '');
       const countHtml = '<div class="row between" style="margin:0 4px 8px"><span class="muted">共 ' + list.length + ' 道</span>' +
         (S.batch.on ? '<span class="chip brand">批量模式 · 已选 ' + Object.keys(S.batch.set).length + ' 题</span>' : '') + '</div>' +
         (pickedChips ? '<div class="row wrap" style="gap:6px;margin:0 4px 8px">' + pickedChips + '</div>' : '');
@@ -1751,9 +2130,11 @@
         list.slice(0, 100).map(function (q) { return questionCard(q, S.batch.on ? { batch: true } : {}); }).join('');
     }
 
-    // 2) 浏览模式：章节 → 考点（章节顺序按教材目录）
+    // 2) 浏览模式：章节 → 考点（章节顺序按教材目录）；一题挂多个单元时在多个章节下都出现
     const byUnit = {};
-    qs.forEach(function (q) { const u = q.unit || '未归类'; (byUnit[u] = byUnit[u] || []).push(q); });
+    qs.forEach(function (q) {
+      qUnitsOf(q).forEach(function (u) { (byUnit[u] = byUnit[u] || []).push(q); });
+    });
     let units = Object.keys(byUnit);
     if (b.subject !== '全部') {
       const def = S.defaults;
@@ -1768,11 +2149,34 @@
 
     return units.map(function (u) {
       const list = byUnit[u];
-      const byPoint = {};
+      // 课时（单元下的再分类）：点了某课时只列该课时的考点，不点默认列全部考点
+      S.bank.lessonSel = S.bank.lessonSel || {};
+      const lessonSel = S.bank.lessonSel[u] || '';
+      const lessonOf = function (q) {
+        const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
+        const idx = us.indexOf(u);
+        if (idx < 0) return '';
+        return (q.lessons && q.lessons[idx]) || (idx === 0 && q.lesson) || '';
+      };
+      const lessonSet = [];
       list.forEach(function (q) {
-        const key = q.pointId || 'n:' + (q.pointName || '未分类');
-        const e = byPoint[key] || (byPoint[key] = { id: q.pointId, name: q.pointName || '未分类', count: 0 });
-        e.count++;
+        const L = lessonOf(q);
+        if (L && lessonSet.indexOf(L) < 0) lessonSet.push(L);
+      });
+      lessonSet.sort(function (a, b) {
+        const na = parseInt(String(a).replace(/\D/g, ''), 10), nb = parseInt(String(b).replace(/\D/g, ''), 10);
+        if (!isNaN(na) && !isNaN(nb) && na !== nb) return na - nb;
+        return a.localeCompare(b, 'zh');
+      });
+      const effList = lessonSel ? list.filter(function (q) { return lessonOf(q) === lessonSel; }) : list;
+      const byPoint = {};
+      effList.forEach(function (q) {
+        // 一题挂多个考点：在每个考点行下都出现
+        qPointsOf(q).forEach(function (p) {
+          const key = p.id || 'n:' + p.name;
+          const e = byPoint[key] || (byPoint[key] = { id: p.id, name: p.name, count: 0 });
+          e.count++;
+        });
       });
       const rows = Object.keys(byPoint).map(function (k) {
         const p = byPoint[k];
@@ -1780,12 +2184,23 @@
           '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div></div>' +
           '<span class="li-n">' + p.count + '</span>' + ARROW + '</div>';
       }).join('');
+      const lessonChips = lessonSet.length
+        ? '<div class="chips" style="margin:8px 0 2px">' +
+            '<button class="tag' + (!lessonSel ? ' active' : '') + '" data-act="bank:lesson" data-unit="' + esc(u) + '" data-v="">全部考点</button>' +
+            lessonSet.map(function (L) {
+              return '<button class="tag' + (lessonSel === L ? ' active' : '') + '" data-act="bank:lesson" data-unit="' + esc(u) + '" data-v="' + esc(L) + '">' + esc(L) + '</button>';
+            }).join('') + '</div>'
+        : '';
       return '<section class="card">' +
         '<div class="card-h"><h3>' + esc(u) + '</h3>' +
-          '<div class="row" style="gap:6px"><span class="muted">' + list.length + ' 题 · ' +
-            Object.keys(byPoint).length + ' 考点</span>' +
+          '<div class="row" style="gap:6px"><span class="muted">' + (lessonSel ? effList.length + ' / ' : '') + list.length + ' 题 · ' +
+            Object.keys(byPoint).length + ' 考点' + (lessonSet.length ? ' · ' + lessonSet.length + ' 课时' : '') + '</span>' +
+          '<button class="btn ghost sm" data-act="unit:mergePoints" data-unit="' + esc(u) + '">合并考点</button>' +
           '<button class="btn ghost sm" data-act="unit:paper" data-unit="' + esc(u) + '">组单元卷</button></div></div>' +
-        rows +
+        lessonChips +
+        (lessonSel && !effList.length
+          ? '<div class="empty" style="padding:14px 0">这个课时下还没有题目</div>'
+          : rows) +
       '</section>';
     }).join('');
   }
@@ -1927,6 +2342,11 @@
         '<div class="chips">' + limits + '</div>' +
         '<button class="btn primary lg block mt12" data-act="review:start">开始复习</button>' +
       '</section>' +
+      '<section class="card">' +
+        '<div class="card-h"><h3>组卷</h3><span class="muted">按考点 / 单元筛选 · 可锁题型</span></div>' +
+        '<button class="btn soft block" data-act="rv:pbuild">🎯 按考点 / 单元组卷</button>' +
+        '<p class="muted" style="margin:8px 2px 0">选好考点（或单元）并锁定题型，自动抽题成卷直接打印；也可以先筛出来手动勾题入卷。</p>' +
+      '</section>' +
       '<section class="card flat" style="background:#fff">' +
         '<p class="muted" style="line-height:1.7">标记“已掌握”后，按 1 / 2 / 4 / 7 / 15 / 30 天的间隔安排下次复习；标记“待复习”会回到错题本。</p>' +
       '</section>';
@@ -1969,9 +2389,9 @@
             ? '<div class="row" style="gap:10px">' +
                 '<button class="btn danger-soft grow lg" data-act="review:mark" data-v="again">还要复习</button>' +
                 '<button class="btn ok-soft grow lg" data-act="review:mark" data-v="ok">已掌握</button>' +
-              '</div>' +
-              '<button class="btn soft block mt8" data-act="review:gen">举一反三 · 再出几道同类题</button>'
+              '</div>'
             : '<button class="btn primary block lg" data-act="review:reveal">显示思路 / 答案</button>') +
+          '<button class="btn soft block mt8" data-act="review:gen">举一反三 · 再出几道同类题</button>' +
           '<button class="btn ghost block mt8" data-act="review:next">跳过这题</button>' +
         '</div>' +
       '</div></div>';
@@ -2074,6 +2494,7 @@
           '<button class="btn ghost block" data-act="data:syncUp">备份本机数据到电脑</button>' +
           '<button class="btn ghost block mt8" data-act="data:syncDown">从电脑恢复 / 合并到本机</button>' +
           '<p class="muted mt8">需与电脑连同一 Wi-Fi 且电脑上的服务在运行。恢复采用合并方式：相同题目覆盖为电脑版本，本机新增的题目保留。</p>' +
+          '<p class="muted mt8" id="syncSizeLine">数据体积估算中…</p>' +
         '</section>' +
         '<section class="card">' +
           '<button class="btn ghost block" data-act="data:export">导出全部数据（JSON）</button>' +
@@ -2088,6 +2509,19 @@
           '<div class="kv"><span class="k">当前识别方式</span><span class="v">' + esc(ocr.provider) + '</span></div>' +
           '<div class="kv"><span class="k">AI 归类</span><span class="v">' + (AI.enabled() ? esc(llm.model) : '本地规则') + '</span></div>' +
         '</section>';
+    },
+    after() {
+      // 同步数据体积预估：帮助判断备份文件大小（题干小，主要是配图 base64）
+      Store.exportAll().then(function (data) {
+        const el = document.getElementById('syncSizeLine');
+        if (!el) return;
+        let bytes = 0, imgs = 0;
+        try { bytes = JSON.stringify(data).length; } catch (e) { el.textContent = '数据体积估算失败'; return; }
+        (data.questions || []).forEach(function (q) { imgs += (q.images || []).length; });
+        const mb = bytes / 1048576;
+        el.textContent = '当前数据约 ' + (mb >= 1 ? mb.toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB') +
+          '（' + (data.questions || []).length + ' 题、' + imgs + ' 张配图）。备份到电脑的容量上限是 500MB，一般远用不满；数据越大备份越慢，属正常现象。';
+      });
     }
   };
 
@@ -2193,7 +2627,7 @@
     if (!S.session) {
       S.session = {
         images: [], subject: S.defaults.subject, grade: S.defaults.grade,
-        unit: '', batchName: '', batchDate: '', stage: 'pick'
+        unit: '', lesson: '', batchName: '', batchDate: '', stage: 'pick'
       };
     }
     return S.session;
@@ -2355,6 +2789,7 @@
       });
     });
     s.imgPool = pool;
+    const assigned = {};   // 已归属的图形：一张图只归一道题（防止不同题的配图同时增删）
     s.images.forEach(function (im, idx) {
       if (!im.text) return;
       // 手动粘贴路径没有经过 OCR.tidy，这里统一清洗（幂等，重复调用无副作用）
@@ -2362,12 +2797,18 @@
       const docImgs = im.docImages || [];
       items.forEach(function (it) {
         const found = docImgs.length ? stripImageMarkers(it, docImgs) : [];
+        // 同一张图被多道题的占位符引用时，只归第一道题，其余题不再挂这张图
+        const mine = found.filter(function (src) {
+          if (assigned[src]) return false;
+          assigned[src] = 1;
+          return true;
+        });
         drafts.push({
           key: Util.uid('d'), imgIndex: idx, no: it.no,
           text: it.text, subs: it.subs, options: it.options,
           answer: it.answer, solution: it.solution,
           type: it.type, difficulty: it.difficulty,
-          images: found,
+          images: mine,
           point: '', pointId: '', confidence: 0, needsConfirm: true, aiPending: true
         });
       });
@@ -2417,6 +2858,13 @@
           updateScanUI();
         });
         im.status = 'done';
+        // 红笔答案识别（tesseract 模式下顺带做）：一般红笔标记的是答案
+        if (im.blob && (!CONFIG.ocr.provider || CONFIG.ocr.provider === 'tesseract')) {
+          im.redAns = await OCR.redAnswer(im.blob);
+          if (im.redAns && im.redAns.found && im.redAns.text) {
+            UI.toast('检测到红笔标记，疑似答案（稍后在确认页查看核对）', 2400);
+          }
+        }
       } catch (e) {
         im.status = 'error';
         im.error = e.message;
@@ -2488,23 +2936,52 @@
     const dateInput = document.getElementById('batchDate');
     if (dateInput && dateInput.value) s.batchDate = dateInput.value;
     for (const d of S.drafts) {
-      // 考点名带上「·第N单元」后缀：优先用新建考点时选的单元，否则用本批次章节
-      const unit = d.pointUnit || s.unit || '';
-      let res;
-      try {
-        res = await resolveUnitPoint(d.point || '未分类', unit, s.subject, s.grade);
-      } catch (e) {
-        res = null;
+      // 多考点/多单元：一道题可同时挂多个考点、归入多个单元（各考点/单元题库里都能看到）
+      const entries = (d.points && d.points.length)
+        ? d.points
+        : [{ id: d.pointId || '', name: d.point || '未分类', units: d.pointUnit ? [d.pointUnit] : [] }];
+      const resolved = [];
+      const unitSet = [];
+      let primaryUnit = s.unit || '';   // 练习选了章节：这份练习的题默认都归那个单元
+      const addUnit = function (u) { if (u && unitSet.indexOf(u) < 0) unitSet.push(u); };
+      for (const e of entries) {
+        if (e.id) { resolved.push({ id: e.id, name: e.name }); continue; }
+        const u0 = (e.units && e.units[0]) || s.unit || '';
+        if (!primaryUnit && u0) primaryUnit = u0;
+        let pt = { id: '', name: e.name };
+        try {
+          const r = await resolveUnitPoint(e.name || '未分类', u0, s.subject, s.grade);
+          pt = { id: r.point.id, name: r.point.name };
+        } catch (err) { /* 解析失败按原名入库 */ }
+        resolved.push(pt);
       }
-      const point = res ? res.point : null;
+      if (!resolved.length) resolved.push({ id: '', name: '未分类' });
+      if (!primaryUnit) primaryUnit = s.unit || '';
+      addUnit(primaryUnit);
+      addUnit(s.unit);
+      entries.forEach(function (e) { (e.units || []).forEach(addUnit); });
+      // 课时：确认页填的课时作用于整批练习的主单元；新建考点时选的课时写到对应单元位置
+      const batchLesson = (s.lesson || '').trim();
+      const lessons = unitSet.map(function (u) { return u === primaryUnit ? batchLesson : ''; });
+      entries.forEach(function (e) {
+        if (!e.lesson) return;
+        (e.units || []).forEach(function (u) {
+          const i = unitSet.indexOf(u);
+          if (i >= 0 && !lessons[i]) lessons[i] = e.lesson;
+        });
+      });
       await Store.Questions.create({
         subject: s.subject,
         grade: s.grade,
-        unit: d.pointUnit || s.unit || '',
+        unit: primaryUnit,
+        units: unitSet,
+        lesson: lessons.filter(Boolean)[0] || '',
+        lessons: lessons,
         batchName: s.batchName || '',
         batchDate: s.batchDate || todayStr(),
-        pointId: point ? point.id : '',
-        pointName: point ? point.name : (Normalize.pretty(d.point || '') || '未分类'),
+        pointId: resolved[0].id,
+        pointName: resolved[0].name,
+        points: resolved,
         type: d.type,
         difficulty: d.difficulty,
         text: d.text,
@@ -2635,26 +3112,223 @@
     return html;
   }
 
-  /** 确认页图形池弹层：多选批量删除 + 本地图片 + 单图配到本题 */
+  /* ---- 多选考点弹层：输入前几个字联想已有考点，可勾选多个；没得选再新建 ---- */
+  function pickPoints(currentNames, subject, grade) {
+    return new Promise(async function (resolve) {
+      const points = await Store.Points.listBy(subject, grade);
+      const sel = {};   // key(id 或 'n:'+name) → {id, name, units:[]}
+      (currentNames || []).forEach(function (n) {
+        if (!n || n === '未分类') return;
+        const hit = points.find(p => p.name === n);
+        if (hit) sel[hit.id] = { id: hit.id, name: hit.name, units: [] };
+        else sel['n:' + n] = { id: '', name: n, units: [] };
+      });
+      S._ppm = { sel: sel, subject: subject, grade: grade, resolve: resolve, kw: '', points: points };
+
+      function rowHtml(p) {
+        const key = p.id || 'n:' + p.name;
+        const on = !!S._ppm.sel[key];
+        return '<div class="list-item" data-act="ppm:toggle" data-key="' + esc(key) + '" data-name="' + esc(p.name) + '" data-id="' + (p.id || '') + '"' +
+          (on ? ' style="background:var(--brand-soft)"' : '') + '>' +
+          '<span class="bcheck' + (on ? ' on' : '') + '"></span>' +
+          '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
+          '<div class="li-s">' + (p.count || 0) + ' 题</div></div></div>';
+      }
+      function listHtml() {
+        const kw = (S._ppm.kw || '').trim().toLowerCase();
+        // 不输入关键字时不显示已有考点，输入前几个字才联想
+        if (!kw) return '<div class="empty small" style="padding:14px">输入考点前几个字联想已有考点；没有匹配的就在下面「＋加入」新建</div>';
+        const filtered = S._ppm.points.filter(function (p) {
+          return (p.name + ' ' + (p.aliases || []).join(' ')).toLowerCase().indexOf(kw) >= 0;
+        });
+        let html = filtered.slice(0, 80).map(rowHtml).join('');
+        if (!html) html = '<div class="empty small" style="padding:14px">没有匹配的考点，可直接在下面「＋加入」新建</div>';
+        return html;
+      }
+      function footerBtn() {
+        const n = Object.keys(S._ppm.sel).length;
+        const first = S._ppm.sel[Object.keys(S._ppm.sel)[0]];
+        return '<button class="btn primary grow" data-act="ppm:done"' + (n ? '' : ' disabled') + '>✓ 核对并完成（' +
+          (n ? '主分类：' + esc(first ? first.name : '') + (n > 1 ? ' 等 ' + n + ' 个考点' : '') : '未选') + '）</button>';
+      }
+      /* 确认弹层：保存前核对考点（主分类）与单元，可删除错误的项 */
+      S._ppm.confirmSheet = function () {
+        const keys = Object.keys(S._ppm.sel);
+        const unitsSet = [];
+        keys.forEach(function (k) {
+          (S._ppm.sel[k].units || []).forEach(function (u) { if (u && unitsSet.indexOf(u) < 0) unitsSet.push(u); });
+        });
+        const ptsHtml = keys.map(function (k, i) {
+          const it = S._ppm.sel[k];
+          return '<div class="list-item" style="align-items:center">' +
+            '<div class="li-main"><div class="li-t">' + (i === 0 ? '<span class="chip brand" style="margin-right:6px">主分类</span>' : '') + esc(it.name) + '</div>' +
+            ((it.units || []).length ? '<div class="li-s">单元：' + esc(it.units.join('、')) + '</div>' : '<div class="li-s">未归入单元</div>') + '</div>' +
+            '<button class="small del" data-act="ppmc:rm" data-key="' + esc(k) + '">移除</button></div>';
+        }).join('');
+        const unitsHtml = unitsSet.length
+          ? '<div class="chips" style="flex-wrap:wrap;overflow:visible">' + unitsSet.map(function (u) {
+              return '<span class="tag active">' + esc(u) + ' <b data-act="ppmc:rmu" data-u="' + esc(u) + '" style="cursor:pointer" title="移除这个单元">✕</b></span>';
+            }).join('') + '</div>'
+          : '<p class="muted small">不归入单元（题目只按考点归类）</p>';
+        UI.sheet({
+          title: '确认考点与单元',
+          body: '<p class="muted" style="margin-bottom:8px">保存前请核对：第一个考点是<b>主分类</b>（题目卡片显示的就是它），点「移除」可删掉错误的项；删掉主分类后，下一个考点会自动顶上。</p>' +
+            '<div class="field"><label>考点（' + keys.length + ' 个）</label>' + (ptsHtml || '<p class="muted small">还没有考点</p>') + '</div>' +
+            '<div class="field"><label>归入单元（' + unitsSet.length + ' 个）</label>' + unitsHtml + '</div>' +
+            ((S.session && S.session.unit) ? '<p class="muted small">练习章节：' + esc(S.session.unit) + '（这份练习所有题默认都归它，可在页面上修改）</p>' : '') +
+            '<div class="row mt12" style="gap:8px">' +
+              '<button class="btn ghost grow" data-act="ppmc:back">← 返回修改</button>' +
+              '<button class="btn primary grow" data-act="ppmc:save"' + (keys.length ? '' : ' disabled') + '>✓ 完成保存</button>' +
+            '</div>'
+        });
+      };
+      S._ppm.render = function (keepSearch) {
+        UI.sheet({
+          title: '选择考点（可多选）',
+          body: '<p class="muted" style="margin-bottom:8px">输入考点前几个字联想；点条目勾选，<b>一道题可同时挂多个考点</b>（<b>第一个是主分类</b>，题目卡片上显示的就是它），各考点题库里都能看到它。</p>' +
+            '<div class="search" style="margin-bottom:8px">' +
+              '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>' +
+              '<input id="ppmSearch" placeholder="输入考点前几个字联想" value="' + esc(keepSearch ? S._ppm.kw : '') + '">' +
+            '</div>' +
+            '<div id="ppmList">' + listHtml() + '</div>' +
+            '<div class="field mt12"><label>没有匹配的？直接新建（内容与上方联想框同步）</label>' +
+              '<div class="row" style="gap:8px;align-items:center">' +
+                '<input class="input" id="ppmNew" placeholder="如：三角形面积求高" style="flex:1" autocomplete="off">' +
+                '<button class="btn soft" data-act="ppm:polish" style="white-space:nowrap;padding:10px 12px">AI 简短</button>' +
+                '<button class="btn soft" data-act="ppm:addNew" style="white-space:nowrap">＋加入</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="row mt12" style="gap:8px">' +
+              '<button class="btn ghost grow" data-act="ppm:cancel">取消</button>' + footerBtn() +
+            '</div>',
+          onMount: function (root) {
+            const input = root.querySelector('#ppmSearch');
+            const newEl = root.querySelector('#ppmNew');
+            if (input) {
+              if (keepSearch && S._ppm.kw) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+              input.addEventListener('input', function () {
+                S._ppm.kw = input.value;
+                root.querySelector('#ppmList').innerHTML = listHtml();
+                // 联想输入与新建框同步，方便直接续写新建
+                if (newEl) newEl.value = input.value;
+              });
+            }
+          }
+        });
+      };
+      S._ppm.render(false);
+    });
+  }
+
+  /** 新建考点时选择归入单元（可多选）。返回单元数组（可为空数组=不归入）或 null 取消 */
+  function pickUnitsForPointMulti(name, subject, grade, presetUnits) {
+    return new Promise(function (resolve) {
+      const cat = Catalog.get(subject, grade, S.defaults.term, S.defaults.version);
+      const picked = {};
+      (presetUnits || []).forEach(function (u) { if (cat.indexOf(u) >= 0) picked[u] = 1; });
+      const knownLs = knownLessonsOf('');
+      const lessonOpts = knownLs.map(function (L) { return '<option value="' + esc(L) + '">'; }).join('');
+      function chipsHtml() {
+        return '<div class="chips wrapv">' +
+          '<button class="tag' + (!Object.keys(picked).length ? ' active' : '') + '" data-act="pu2:none">不归入单元</button>' +
+          cat.map(function (u) {
+            return '<button class="tag' + (picked[u] ? ' active' : '') + '" data-act="pu2:pick" data-v="' + esc(u) + '">' + esc(u) + '</button>';
+          }).join('') + '</div>';
+      }
+      UI._resolve = resolve;
+      function renderSheet() {
+        UI.sheet({
+          title: '「' + esc(name) + '」归到哪个单元？（可多选）',
+          body: '<p class="muted" style="margin-bottom:8px">选择后考点名会带上「·第N单元」后缀（按第一个单元）；勾选多个单元时，题会同时归到这些单元的题库里。</p>' +
+            chipsHtml() +
+            '<div class="field mt8"><label>课时（选填，单元下按课时归类考点）</label>' +
+              '<input class="input" id="puLesson" placeholder="如：第3课时" list="puLessonList">' +
+              '<datalist id="puLessonList">' + lessonOpts + '</datalist></div>' +
+            '<div class="row mt12" style="gap:8px">' +
+              '<button class="btn ghost grow" data-act="pu2:cancel">取消</button>' +
+              '<button class="btn primary grow" data-act="pu2:done">✓ 确定</button>' +
+            '</div>',
+          onMount: function (root) {
+            const b = root.querySelector('.sheet-b');   // 绑在每次重建的 body 上，避免监听器累积
+            if (!b) return;
+            b.addEventListener('click', function (e) {
+              const el = e.target.closest('[data-act^="pu2:"]');
+              if (!el) return;
+              const act = el.dataset.act;
+              if (act === 'pu2:pick') {
+                const v = el.dataset.v;
+                if (picked[v]) delete picked[v]; else picked[v] = 1;
+                const box = root.querySelector('.chips.wrapv');
+                if (box) box.outerHTML = chipsHtml();
+              } else if (act === 'pu2:none') {
+                Object.keys(picked).forEach(k => delete picked[k]);
+                const box = root.querySelector('.chips.wrapv');
+                if (box) box.outerHTML = chipsHtml();
+              } else if (act === 'pu2:done') {
+                const li = root.querySelector('#puLesson');
+                const r = UI._resolve; UI._resolve = null;
+                if (r) r({ units: Object.keys(picked), lesson: (li && li.value.trim()) || '' });
+              } else if (act === 'pu2:cancel') {
+                const r = UI._resolve; UI._resolve = null; if (r) r(null);
+              }
+            });
+          }
+        });
+      }
+      renderSheet();
+    });
+  }
+
+  /** 确认页图形池弹层：右上角「多选」→ 批量勾选 → 配到本题 / 删除；普通模式单图配到本题 / 删除 */
+  function poolOwnerOf(src) {
+    let owner = -1;
+    S.drafts.forEach(function (dd, di) {
+      if (owner < 0 && (dd.images || []).indexOf(src) >= 0) owner = di;
+    });
+    return owner;
+  }
+
+  /** 一个图形只归一道题：先从其他题上摘下来，再配给目标题 */
+  function poolAssignSrcs(draftIndex, srcs) {
+    const draft = S.drafts[draftIndex];
+    if (!draft) return;
+    (srcs || []).forEach(function (src) {
+      S.drafts.forEach(function (dd) {
+        if (dd === draft) return;
+        const x = (dd.images || []).indexOf(src);
+        if (x >= 0) dd.images.splice(x, 1);
+      });
+      draft.images = draft.images || [];
+      if (draft.images.indexOf(src) < 0) draft.images.push(src);
+    });
+  }
+
   function openPoolSheet(i) {
     const s = S.session;
-    if (!s || !s.imgPool || !s.imgPool.length) {
-      // 池空也能打开，方便直接加本地图片
-      if (!s) return;
-      s.imgPool = s.imgPool || [];
-    }
+    if (!s) return;
+    s.imgPool = s.imgPool || [];
     S.poolSel = S.poolSel || {};
+    // 记住当前弹层滚动位置，重渲染后恢复（操作不再跳回顶部）
+    const keepScroll = (function () {
+      const b = sheetRoot.querySelector('.sheet-b');
+      return b ? b.scrollTop : 0;
+    })();
+    const multi = !!S.poolMulti;
     const n = s.imgPool.length;
     const selCount = Object.keys(S.poolSel).filter(function (k) { return S.poolSel[k]; }).length;
     const tiles = s.imgPool.map(function (src, pi) {
-      let owner = -1;
-      S.drafts.forEach(function (dd, di) {
-        if ((dd.images || []).indexOf(src) >= 0) owner = di;
-      });
+      const owner = poolOwnerOf(src);
       const onThis = owner === i;
       const sel = !!S.poolSel[pi];
+      if (multi) {
+        // 多选模式：整块可点（命中面积大、不灵敏问题解决），选圈只改样式不重建
+        return '<div class="pool-tile selectable' + (sel ? ' sel-on' : '') + (onThis ? ' picked' : '') + '" data-act="dpi:sel" data-i="' + i + '" data-pi="' + pi + '">' +
+          '<div class="pool-sel' + (sel ? ' on' : '') + '">' + (sel ? '✓' : '') + '</div>' +
+          '<img src="' + src + '" alt="图形' + (pi + 1) + '">' +
+          '<span class="pool-tag">' + (onThis ? '✓ 本题' : owner >= 0 ? '第' + (owner + 1) + '题' : '未配置') + '</span>' +
+          '</div>';
+      }
       return '<div class="pool-tile' + (onThis ? ' picked' : '') + '">' +
-        '<div class="pool-sel' + (sel ? ' on' : '') + '" data-act="dpi:sel" data-i="' + i + '" data-pi="' + pi + '">' + (sel ? '✓' : '') + '</div>' +
         '<img src="' + src + '" alt="图形' + (pi + 1) + '">' +
         '<span class="pool-tag">' + (onThis ? '✓ 本题' : owner >= 0 ? '第' + (owner + 1) + '题' : '未配置') + '</span>' +
         '<div class="pool-ops">' +
@@ -2662,16 +3336,47 @@
           '<button class="del" data-act="draft:imgDel" data-pi="' + pi + '">删除</button>' +
         '</div></div>';
     }).join('');
+    const head = '<div class="row between" style="margin-bottom:8px;align-items:center">' +
+      '<span class="muted">' + (multi ? '多选模式：点图形勾选（再点取消）' : '点右上角「多选」可批量配图 / 批量删除') + '</span>' +
+      '<button class="small" style="color:var(--brand);font-weight:600" data-act="dpi:mode" data-i="' + i + '">' +
+        (multi ? '✕ 退出多选' : '☑ 多选') + '</button></div>';
+    const ops = multi
+      ? '<div class="row" style="gap:8px;margin-bottom:10px">' +
+          '<button class="btn soft sm" data-act="dpi:all" data-i="' + i + '">' + (n && selCount === n ? '取消全选' : '全选') + '</button>' +
+          '<button class="btn primary sm grow" data-act="dpi:assign" data-i="' + i + '"' + (selCount ? '' : ' disabled') + '>配到本题（' + selCount + '）</button>' +
+          '<button class="btn danger-soft sm" data-act="dpi:delSel" data-i="' + i + '"' + (selCount ? '' : ' disabled') + '>删除所选</button>' +
+        '</div>'
+      : '';
     UI.sheet({
-      title: '为第 ' + (i + 1) + ' 题配图',
-      body: '<p class="muted" style="margin-bottom:10px">点图形右上角圆圈选中（可多选）→「删除所选」批量删除；「配到本题」把图形插到这道题旁，图形同时只会配给一道题。</p>' +
-        '<div class="row between" style="margin-bottom:8px">' +
-          '<button class="small" style="color:var(--brand);font-weight:600" data-act="dpi:all" data-i="' + i + '">' + (n && selCount === n ? '取消全选' : '全选') + '</button>' +
-          '<button class="small" style="color:var(--danger);font-weight:600" data-act="dpi:delSel" data-i="' + i + '"' + (selCount ? '' : ' disabled') + '>删除所选（' + selCount + '）</button>' +
-        '</div>' +
+      title: '为第 ' + (i + 1) + ' 题配图（池内 ' + n + ' 张）',
+      body: head + ops +
         '<div class="pool-grid">' + (tiles || '<div class="empty small" style="padding:14px">图形池是空的，点下面添加本地图片</div>') + '</div>' +
-        '<button class="btn ghost block mt12" data-act="dpi:addLocal" data-i="' + i + '">＋ 添加本地图片</button>'
+        '<button class="btn ghost block mt12" data-act="dpi:addLocal" data-i="' + i + '">＋ 添加本地图片</button>',
+      onMount: function () {
+        if (keepScroll) {
+          const b = sheetRoot.querySelector('.sheet-b');
+          if (b) b.scrollTop = keepScroll;
+        }
+      }
     });
+  }
+
+  /** 多选模式下原地刷新勾选状态（不重建弹层，不丢滚动、不闪烁） */
+  function poolSelUIRefresh() {
+    const s = S.session;
+    const selCount = Object.keys(S.poolSel || {}).filter(function (k) { return S.poolSel[k]; }).length;
+    sheetRoot.querySelectorAll('[data-act="dpi:sel"]').forEach(function (el) {
+      const on = !!S.poolSel[+el.dataset.pi];
+      el.classList.toggle('sel-on', on);
+      const c = el.querySelector('.pool-sel');
+      if (c) { c.classList.toggle('on', on); c.textContent = on ? '✓' : ''; }
+    });
+    const ab = sheetRoot.querySelector('[data-act="dpi:assign"]');
+    if (ab) { ab.disabled = !selCount; ab.textContent = '配到本题（' + selCount + '）'; }
+    const db = sheetRoot.querySelector('[data-act="dpi:delSel"]');
+    if (db) db.disabled = !selCount;
+    const allBtn = sheetRoot.querySelector('[data-act="dpi:all"]');
+    if (allBtn && s) allBtn.textContent = (s.imgPool.length && selCount === s.imgPool.length) ? '取消全选' : '全选';
   }
 
   /** 已入库题目的配图弹层：✕ 移除 + 文件选图添加 */
@@ -2717,6 +3422,93 @@
       }).join('') +
       '<button class="btn primary block mt12" data-act="gen:saveall">全部入库（' + g.items.length + ' 题）</button>';
     UI.sheet({ title: '举一反三 · ' + (g.question.pointName || ''), body: body });
+  }
+
+  /** 组卷弹层：按考点/单元多选 + 锁定题型 + 自动抽题 / 手动勾题 */
+  function pbuildSheet() {
+    const st = S._pbuild;
+    if (!st) return;
+    const qs = S._pbuildQs || [];
+    const unitSet = {}; const pointSet = {};
+    qs.forEach(function (q) {
+      qUnitsOf(q).forEach(function (u) { if (u !== '未归类') unitSet[u] = 1; });
+      qPointsOf(q).forEach(function (p) { if (p.name !== '未分类') pointSet[p.name] = 1; });
+    });
+    const options = st.mode === 'point' ? Object.keys(pointSet) : Object.keys(unitSet);
+    const typeChips = CONFIG.questionTypes.map(function (t) {
+      return '<button class="tag' + (st.types[t] ? ' active' : '') + '" data-act="rv:pbT" data-v="' + esc(t) + '">' + esc(t) + '</button>';
+    }).join('');
+    const selChips = options.map(function (v) {
+      return '<button class="tag' + (st.sel[v] ? ' active' : '') + '" data-act="rv:pbSel" data-v="' + esc(v) + '">' + esc(v) + '</button>';
+    }).join('');
+    UI.sheet({
+      title: '组卷 · 按考点 / 单元',
+      body: '<div class="field"><label>按什么筛选</label>' +
+        '<div class="chips" style="flex-wrap:wrap;overflow:visible">' +
+          '<button class="tag' + (st.mode === 'point' ? ' active' : '') + '" data-act="rv:pbMode" data-v="point">按考点</button>' +
+          '<button class="tag' + (st.mode === 'unit' ? ' active' : '') + '" data-act="rv:pbMode" data-v="unit">按单元</button>' +
+        '</div></div>' +
+        '<div class="field"><label>选择' + (st.mode === 'point' ? '考点' : '单元') + '（可多选）</label>' +
+          (options.length ? '<div class="chips wrapv">' + selChips + '</div>' : '<p class="muted">题库里还没有可选项目</p>') + '</div>' +
+        '<div class="field"><label>锁定题型（可多选，只抽这些题型）</label>' +
+          '<div class="chips" style="flex-wrap:wrap;overflow:visible">' + typeChips + '</div></div>' +
+        '<div class="field"><label>每种题型抽几道</label>' +
+          '<input class="input" type="number" id="rvPer" min="1" max="30" value="' + (st.per || 5) + '"></div>' +
+        '<div class="row mt12" style="gap:8px">' +
+          '<button class="btn ghost grow" data-act="rv:pbCancel">取消</button>' +
+          '<button class="btn soft grow" data-act="rv:pbManual">去手动勾题</button>' +
+          '<button class="btn primary grow" data-act="rv:pbAuto">🎯 自动抽题成卷</button>' +
+        '</div>'
+    });
+  }
+
+  /* =========================================================
+   * 按单元合并考点（题库浏览模式 · 合并考点按钮）
+   * ======================================================= */
+  function unitMergeSheet(unit, fresh) {
+    const qs = (S.cache.bankQ || []).filter(function (q) { return qUnitsOf(q).indexOf(unit) >= 0; });
+    const byPoint = {};
+    qs.forEach(function (q) {
+      qPointsOf(q).forEach(function (p) {
+        if (!p.id) return;   // 没有考点记录的（未分类）不参与合并
+        const e = byPoint[p.id] || (byPoint[p.id] = { id: p.id, name: p.name, count: 0 });
+        e.count++;
+      });
+    });
+    const list = Object.keys(byPoint).map(function (k) { return byPoint[k]; });
+    if (list.length < 2) {
+      UI.sheet({ title: '合并考点 · ' + unit, body: '<p class="muted">这个单元里可选的考点少于 2 个，不需要合并。</p>' });
+      return;
+    }
+    // 已选状态只在首次打开时初始化（重渲染时保留勾选）
+    if (!S._mergeSel || fresh || S._mergeSel.unit !== unit) {
+      S._mergeSel = { unit: unit, picked: {} };
+    } else {
+      S._mergeSel.unit = unit;
+    }
+    UI.sheet({
+      title: '合并考点 · ' + unit,
+      body: '<p class="muted" style="margin-bottom:8px">点选要合并的考点（可多选），下一步选一个作为保留的考点，其余考点的题都会归过去。</p>' +
+        '<div class="chips wrapv">' + list.map(function (p) {
+          return '<button class="tag' + (S._mergeSel.picked[p.id] ? ' active' : '') + '" data-act="um:sel" data-id="' + esc(p.id) + '" data-name="' + esc(p.name) + '">' +
+            esc(p.name) + ' · ' + p.count + '</button>';
+        }).join('') + '</div>' +
+        '<button class="btn primary block mt12" data-act="um:chooseTarget">下一步：选保留的考点</button>'
+    });
+  }
+
+  function unitMergeTargetSheet() {
+    const st = S._mergeSel;
+    const ids = Object.keys(st.picked);
+    if (ids.length < 2) { UI.toast('至少选 2 个考点才能合并'); return; }
+    UI.sheet({
+      title: '合并到哪个考点？',
+      body: '<p class="muted" style="margin-bottom:8px">选中的考点题目都会归到它名下，其余考点删除（别名保留）。</p>' +
+        '<div class="chips wrapv">' + ids.map(function (id) {
+          return '<button class="tag" data-act="um:do" data-id="' + esc(id) + '">' + esc(st.picked[id]) + '</button>';
+        }).join('') + '</div>' +
+        '<button class="btn ghost block mt12" data-act="um:back">← 重选考点</button>'
+    });
   }
 
   /* =========================================================
@@ -2979,10 +3771,12 @@
       if (!v) return;
       const parts = Splitter.splitByMarker(v);
       if (parts.length < 2) { UI.toast('没有找到 cf 分隔符，未拆分'); return; }
-      const merged = parts.map(function (p) {
+      const merged = parts.map(function (p, k) {
         return Object.assign({}, draft, {
           key: Util.uid('d'), no: p.no, text: p.text, subs: p.subs, options: p.options,
           answer: p.answer, solution: p.solution, type: p.type, difficulty: p.difficulty,
+          // 配图只留给第一段且各自独立副本：防止拆分后几段共用同一数组，改一段的图影响其他段
+          images: k === 0 ? (draft.images || []).slice() : [],
           aiPending: true
         });
       });
@@ -2999,6 +3793,11 @@
       prev.subs = []; prev.options = [];
       prev.type = Splitter.detectType(prev);
       prev.needsConfirm = true;
+      // 被合并题的配图转给上一题（避免图形丢失）
+      (cur.images || []).forEach(function (src) {
+        prev.images = prev.images || [];
+        if (prev.images.indexOf(src) < 0) prev.images.push(src);
+      });
       S.drafts.splice(i, 1);
       await render();
     },
@@ -3009,24 +3808,43 @@
 
     /* ---- 配图管理（确认页） ---- */
     'draft:imgs': function (d) {
+      S.poolMulti = false; S.poolSel = {};
+      openPoolSheet(+d.i);
+    },
+    'dpi:mode': function (d) {
+      S.poolMulti = !S.poolMulti;
+      if (!S.poolMulti) S.poolSel = {};
       openPoolSheet(+d.i);
     },
     'dpi:sel': function (d) {
+      // 多选模式：只切换勾选状态并原地刷新，不重建弹层（不卡顿、不回顶）
       const pi = +d.pi;
       S.poolSel = S.poolSel || {};
       if (S.poolSel[pi]) delete S.poolSel[pi];
       else S.poolSel[pi] = 1;
-      openPoolSheet(+d.i);
+      poolSelUIRefresh();
     },
     'dpi:all': function (d) {
-      const i = +d.i;
       const s = S.session;
+      if (!s) return;
       S.poolSel = S.poolSel || {};
-      const all = s.imgPool.every(function (src, pi) { return S.poolSel[pi]; });
+      const all = s.imgPool.length && s.imgPool.every(function (src, pi) { return S.poolSel[pi]; });
       s.imgPool.forEach(function (src, pi) {
         if (all) delete S.poolSel[pi]; else S.poolSel[pi] = 1;
       });
+      poolSelUIRefresh();
+    },
+    'dpi:assign': async function (d) {
+      const i = +d.i;
+      const s = S.session;
+      const sel = Object.keys(S.poolSel || {}).map(Number).sort(function (a, b) { return a - b; });
+      if (!sel.length) { UI.toast('先点图形选中要配的'); return; }
+      const srcs = sel.map(function (pi) { return s.imgPool[pi]; }).filter(Boolean);
+      poolAssignSrcs(i, srcs);
+      S.poolSel = {};
+      UI.toast('已把 ' + srcs.length + ' 张图形配给第 ' + (i + 1) + ' 题');
       openPoolSheet(i);
+      await render();
     },
     'dpi:delSel': async function (d) {
       const i = +d.i;
@@ -3041,7 +3859,7 @@
         dd.images = (dd.images || []).filter(function (src) { return srcs.indexOf(src) < 0; });
       });
       S.poolSel = {};
-      if (!s.imgPool.length) { UI.close(); UI.toast('已删除所选图形'); }
+      if (!s.imgPool.length) { S.poolMulti = false; UI.close(); UI.toast('已删除所选图形'); }
       else openPoolSheet(i);
       await render();
     },
@@ -3057,24 +3875,20 @@
         const files = Array.from(input.files || []);
         if (!files.length) return;
         s.imgPool = s.imgPool || [];
+        const added = [];
         for (const f of files) {
           try {
             const r = await ImageTool.compress(f);
             const src = await blobToDataURL(r.blob);
             if (s.imgPool.indexOf(src) < 0) s.imgPool.push(src);
-            // 新加的图直接配到当前题（可在弹层里取消配图）
-            const draft = S.drafts[i];
-            if (draft) {
-              S.drafts.forEach(function (dd) {
-                const x = (dd.images || []).indexOf(src);
-                if (x >= 0 && dd !== draft) dd.images.splice(x, 1);
-              });
-              draft.images = draft.images || [];
-              if (draft.images.indexOf(src) < 0) draft.images.push(src);
-            }
+            if (added.indexOf(src) < 0) added.push(src);
           } catch (e) {
             UI.toast('有图片处理失败：' + (e.message || e));
           }
+        }
+        if (added.length) {
+          // 新加的图直接配到当前题（独占：先从其他题摘下来）
+          poolAssignSrcs(i, added);
         }
         UI.toast('已添加 ' + files.length + ' 张本地图片');
         if (s.imgPool.length) openPoolSheet(i);
@@ -3088,17 +3902,11 @@
       const src = s && s.imgPool ? s.imgPool[pi] : null;
       if (!src || !S.drafts[i]) return;
       const draft = S.drafts[i];
-      draft.images = draft.images || [];
-      const k = draft.images.indexOf(src);
+      const k = (draft.images || []).indexOf(src);
       if (k >= 0) {
         draft.images.splice(k, 1);             // 取消配图
       } else {
-        // 一个图形只属于一道题：先从其他题上摘下来
-        S.drafts.forEach(function (dd) {
-          const x = (dd.images || []).indexOf(src);
-          if (x >= 0) dd.images.splice(x, 1);
-        });
-        draft.images.push(src);
+        poolAssignSrcs(i, [src]);              // 独占配图
       }
       openPoolSheet(i);
       await render();
@@ -3115,7 +3923,7 @@
         const x = (dd.images || []).indexOf(src);
         if (x >= 0) dd.images.splice(x, 1);
       });
-      if (!s.imgPool.length) UI.close();
+      if (!s.imgPool.length) { S.poolMulti = false; UI.close(); }
       else openPoolSheet(+d.i);
       await render();
     },
@@ -3166,6 +3974,60 @@
     'dcalc:impCalc': function () {
       const el = document.getElementById('dcCalcFile');
       if (el) el.click(); else UI.toast('请在每日计算设置卡里使用导入按钮');
+    },
+    /* 拍照识别计算题 → 确认层（可移除）→ 加入我的计算题库 */
+    'dcalc:ocrCalc': function () {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.multiple = true;
+      input.onchange = async function () {
+        const files = Array.from(input.files || []);
+        if (!files.length) return;
+        let allText = '';
+        let fail = 0;
+        for (let i = 0; i < files.length; i++) {
+          UI.toast('正在识别第 ' + (i + 1) + '/' + files.length + ' 张…', 60000);
+          try {
+            const r = await ImageTool.compress(files[i]);
+            const t = await OCR.recognize(r.blob, null);
+            allText += (t || '') + '\n';
+          } catch (e) { fail++; }
+        }
+        const parsed = dcParseCalcText(allText);
+        if (!parsed.items.length) {
+          UI.toast('没识别出计算式题——需要一步加减乘除或分数式（如 3.6+2.7、1/2+1/4），字迹尽量清晰', 3600);
+          return;
+        }
+        S._dcOcr = { items: parsed.items };
+        dcOcrSheet();
+        UI.toast('识别完成' + (fail ? '（' + fail + ' 张失败）' : '') + '，请核对后加入', 2600);
+      };
+      input.click();
+    },
+    'dcoc:rm': function (d) {
+      if (!S._dcOcr) return;
+      S._dcOcr.items.splice(+d.i, 1);
+      if (!S._dcOcr.items.length) { S._dcOcr = null; UI.close(); UI.toast('已全部移除'); return; }
+      dcOcrSheet();
+    },
+    'dcoc:save': function () {
+      if (!S._dcOcr) return;
+      const bank = readCalcBank();
+      const key = s => String(s || '').replace(/\s/g, '');
+      const exists = {}; bank.forEach(it => { exists[key(it.q)] = 1; });
+      let added = 0, dup = 0;
+      S._dcOcr.items.forEach(function (it) {
+        if (exists[key(it.q)]) { dup++; return; }
+        bank.push({ q: it.q, a: it.a, at: Date.now() });
+        exists[key(it.q)] = 1;
+        added++;
+      });
+      saveCalcBank(bank);
+      S._dcOcr = null;
+      UI.close();
+      UI.toast('已加入 ' + added + ' 道计算题' + (dup ? '，跳过重复 ' + dup + ' 道' : '') + (bank.length >= 300 ? '（题库已达 300 道上限）' : ''), 3000);
+      render();
     },
     'dcalc:clearBank': async function () {
       const n = readCalcBank().length;
@@ -3235,7 +4097,8 @@
         kinds: draft.kinds, perDay: draft.perDay, timerMin: draft.timerMin,
         diff: draft.diff || 2, useBank: draft.useBank !== false, weak: draft.weak || [],
         notes: draft.notes || [],
-        confirmed: true, planStart: plan.monday, planSeed: draft.planSeed
+        confirmed: true, planStart: plan.monday, planSeed: draft.planSeed,
+        planEdits: plan.edits || {}
       });
       S.dcalcDraft = null; S.dcalcPlan = null;
       S.dcalcKinds = null; S.dcalcWeak = null; S.dcalcDiff = null; S.dcalcUseBank = null; S.dcalcNotes = null;
@@ -3261,6 +4124,62 @@
         });
       }
       UI.sheet({ title: '本周计划 · ' + cfg.grade, body: dcalcPlanBody({ mondayMd: (base.getMonth() + 1) + '月' + base.getDate() + '日', days: days }, 'view') });
+    },
+    'dcalc:editQ': function (d) {
+      const plan = S.dcalcPlan;
+      if (!plan) return;
+      dcEditSheet(plan, +d.d, +d.i);
+    },
+    /* 式子 + 答案 + 题型 + 难度一起保存；答案与式子算出的不一致时先让老师选以哪个为准 */
+    'dcalc:editSave': function (d) {
+      const plan = S.dcalcPlan;
+      if (!plan) return;
+      const di = +d.d, i = +d.i;
+      const q = (document.getElementById('dcEq').value || '').trim();
+      const ansIn = (document.getElementById('dcAnsv').value || '').trim();
+      const kindIn = document.getElementById('dcKind').value;
+      const diffIn = document.getElementById('dcDiff').value;
+      if (!q) { UI.toast('式子不能为空'); return; }
+      const computed = dcCalcAnswer(q);
+      if (computed === '') { UI.toast('算不出答案：请输入一步加减乘除或分数式（如 3.6+2.7、1/2+1/4）', 2800); return; }
+      const norm = function (s) { return String(s).replace(/\s/g, '').replace(/−/g, '-'); };
+      if (ansIn && norm(ansIn) !== norm(computed)) {
+        // 答案与式子不一致：反推「保留哪个数、系统改另一个数」的精确方案，绝不保存错答案
+        dcEditSheet(plan, di, i, {
+          warn: '你填的答案是「' + ansIn + '」，原式算出是「' + computed + '」。两边对不上，选一个改法（或改回系统答案）。',
+          vals: { q: q, a: ansIn, kindIn: kindIn, diffIn: diffIn, computed: computed },
+          fixes: dcSolveFixes(q, ansIn),
+          computed: computed
+        });
+        return;
+      }
+      dcEditApply(plan, di, i, q, ansIn, kindIn, diffIn);
+    },
+    /* 选了「保留某个数」：式子换成反推出的新式子（data-q），答案用老师填的。
+       保存前再复核一次：新式子必须精确算出所填答案，否则拒绝保存。 */
+    'dcalc:editFix': function (d) {
+      const plan = S.dcalcPlan;
+      if (!plan) return;
+      const newQ = String(d.q || '').trim();
+      const ansIn = (document.getElementById('dcAnsv').value || '').trim();
+      const kindIn = document.getElementById('dcKind').value;
+      const diffIn = document.getElementById('dcDiff').value;
+      const computed = dcCalcAnswer(newQ);
+      if (!newQ || computed === '' || !ansIn || !dcSameNum(computed, ansIn)) {
+        UI.toast('这个改法算不出你填的答案，已拦下，请换一个选项', 2800);
+        return;
+      }
+      dcEditApply(plan, +d.d, +d.i, newQ, ansIn, kindIn, diffIn);
+    },
+    /* 答案与式子不一致时：用系统重算的答案 */
+    'dcalc:editSys': function (d) {
+      const plan = S.dcalcPlan;
+      if (!plan) return;
+      dcEditApply(plan, +d.d, +d.i,
+        (document.getElementById('dcEq').value || '').trim(),
+        '',
+        document.getElementById('dcKind').value,
+        document.getElementById('dcDiff').value);
     },
     'dcalc:setup': function () {
       S.dcalcKinds = null; S.dcalcWeak = null; S.dcalcDiff = null; S.dcalcUseBank = null; S.dcalcNotes = null;   // 重新打开设置时按已存配置初始化题型
@@ -3349,13 +4268,128 @@
     'draft:point': async function (d) {
       const i = +d.i;
       const s = S.session;
-      const picked = await pickPoint(S.drafts[i].point, s.subject, s.grade);
-      if (!picked) return;
-      S.drafts[i].point = picked.name;
-      S.drafts[i].pointId = picked.id || '';
-      S.drafts[i].pointUnit = picked.unit || '';     // 新建考点时选的归类单元
-      S.drafts[i].needsConfirm = false;
+      const draft = S.drafts[i];
+      const curNames = (draft.points && draft.points.length)
+        ? draft.points.map(p => p.name)
+        : (draft.point && draft.point !== '未分类' ? [draft.point] : []);
+      const picked = await pickPoints(curNames, s.subject, s.grade);
+      if (!picked || !picked.length) return;
+      draft.points = picked.map(function (p) { return { id: p.id || '', name: p.name, units: p.units || [] }; });
+      draft.point = picked[0].name;
+      draft.pointId = picked[0].id || '';
+      draft.pointUnit = (picked[0].units && picked[0].units[0]) || '';
+      draft.needsConfirm = false;
       await render();
+    },
+    /* ---- 多选考点弹层 ---- */
+    'ppm:toggle': function (d) {
+      if (!S._ppm) return;
+      if (S._ppm.sel[d.key]) delete S._ppm.sel[d.key];
+      else S._ppm.sel[d.key] = { id: d.id || '', name: d.name, units: [] };
+      // 原地刷新选中样式与底部计数（不重建弹层、不丢滚动）
+      sheetRoot.querySelectorAll('[data-act="ppm:toggle"]').forEach(function (el) {
+        const on = !!S._ppm.sel[el.dataset.key];
+        el.style.background = on ? 'var(--brand-soft)' : '';
+        const c = el.querySelector('.bcheck');
+        if (c) c.classList.toggle('on', on);
+      });
+      const btn = sheetRoot.querySelector('[data-act="ppm:done"]');
+      if (btn) {
+        const keys = Object.keys(S._ppm.sel);
+        const first = S._ppm.sel[keys[0]];
+        btn.textContent = '✓ 核对并完成（' + (keys.length
+          ? '主分类：' + (first ? first.name : '') + (keys.length > 1 ? ' 等 ' + keys.length + ' 个考点' : '')
+          : '未选') + '）';
+        btn.disabled = !keys.length;
+      }
+    },
+    'ppm:cancel': function () {
+      const r = S._ppm && S._ppm.resolve;
+      S._ppm = null;
+      UI.close();
+      if (r) r(null);
+    },
+    'ppm:done': function () {
+      if (!S._ppm) return;
+      if (!Object.keys(S._ppm.sel).length) { UI.toast('先勾选至少一个考点'); return; }
+      // 保存前先核对考点与单元（可删除错误的项）
+      S._ppm.confirmSheet();
+    },
+    'ppmc:rm': function (d) {
+      if (!S._ppm) return;
+      const it = S._ppm.sel[d.key];
+      delete S._ppm.sel[d.key];
+      if (!Object.keys(S._ppm.sel).length) {
+        // 全部移除：回到考点选择层继续勾选
+        S._ppm.render(true);
+        UI.toast(it ? '已移除：' + it.name + '，请重新勾选考点' : '已全部移除');
+        return;
+      }
+      S._ppm.confirmSheet();
+      UI.toast(it ? '已移除：' + it.name : '已移除');
+    },
+    'ppmc:rmu': function (d) {
+      if (!S._ppm) return;
+      Object.keys(S._ppm.sel).forEach(function (k) {
+        const it = S._ppm.sel[k];
+        it.units = (it.units || []).filter(function (u) { return u !== d.u; });
+      });
+      S._ppm.confirmSheet();
+      UI.toast('已从考点单元中移除：' + d.u);
+    },
+    'ppmc:back': function () {
+      if (!S._ppm) return;
+      S._ppm.render(true);
+    },
+    'ppmc:save': function () {
+      if (!S._ppm) return;
+      const arr = Object.keys(S._ppm.sel).map(function (k) { return S._ppm.sel[k]; });
+      if (!arr.length) { UI.toast('先勾选至少一个考点'); return; }
+      const r = S._ppm.resolve;
+      S._ppm = null;
+      UI.close();
+      if (r) r(arr);
+    },
+    'ppm:polish': async function () {
+      const el = document.getElementById('ppmNew');
+      const raw = el ? el.value.trim() : '';
+      if (!raw) { UI.toast('先输入考点说法，再点「AI 简短」'); return; }
+      const btn = document.querySelector('[data-act="ppm:polish"]');
+      if (btn) { btn.disabled = true; btn.textContent = '润色中…'; }
+      try {
+        const out = await AI.polish(raw);
+        if (el) el.value = out;
+        UI.toast(out ? '已提炼：' + out : '没有提炼出结果', 2200);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'AI 简短'; }
+      }
+    },
+    'ppm:addNew': async function () {
+      if (!S._ppm) return;
+      const el = document.getElementById('ppmNew');
+      const name = el ? el.value.trim() : '';
+      if (!name) { UI.toast('请输入考点名'); return; }
+      if (S._ppm.sel['n:' + name] || S._ppm.sel[name]) { UI.toast('这个考点已在所选里'); return; }
+      // 练习已选章节时默认预选该单元（可再勾选多个，也可保持这一个）；可顺带填课时
+      const preset = (S.session && S.session.unit) ? [S.session.unit] : [];
+      const r2 = await pickUnitsForPointMulti(name, S._ppm.subject, S._ppm.grade, preset);
+      if (r2 === null) return;   // 取消选单元 → 回到考点弹层
+      const units = r2.units || [];
+      const lesson = r2.lesson || '';
+      // 立即创建考点（带单元后缀、走归一化复用已有考点），不等入库
+      const u0 = units[0] || '';
+      const res = await resolveUnitPoint(name, u0, S._ppm.subject, S._ppm.grade);
+      const p = res.point;
+      // 插入联想快照：本次弹层内输入前几个字立刻能搜到
+      if (!S._ppm.points.some(function (x) { return x.id === p.id; })) S._ppm.points.push(p);
+      // 新建即切换：清掉其他勾选，只留新考点（主分类立即变为新考点）；想多挂可再勾选
+      S._ppm.sel = {};
+      S._ppm.sel[p.id] = { id: p.id, name: p.name, units: units, lesson: lesson };
+      // 确认页还没选章节时，把这道题默认归入新建考点所选的单元
+      if (S.session && !S.session.unit && u0) S.session.unit = u0;
+      if (el) el.value = '';
+      S._ppm.render(true);
+      UI.toast((res.isNew ? '已新建并选用：' : '已选用：') + p.name + '（可再勾选其他考点一起挂）', 2600);
     },
     'pp:pick': function (d) {
       const v = { name: d.name, id: d.id };
@@ -3398,6 +4432,27 @@
       });
       const picked = document.getElementById('unitPicked');
       if (picked) picked.textContent = S.session.unit || '未选择';
+      // 换章节后课时联想跟着变：重建整个确认页（草稿内容已实时写回，不丢）
+      render();
+    },
+
+    /* 课时（选填）：点联想课时快速填入 */
+    'confirm:lesson': function (d) {
+      if (!S.session) return;
+      S.session.lesson = (S.session.lesson === d.v) ? '' : d.v;
+      render();
+    },
+
+    /* 复制红笔识别出的答案文本 */
+    'confirm:copyRed': async function () {
+      const s = S.session;
+      if (!s) return;
+      const lines = [];
+      (s.images || []).forEach(function (im) {
+        if (im.redAns && im.redAns.found && im.redAns.text) lines.push(im.redAns.text);
+      });
+      const ok = await copyText(lines.join('\n'));
+      UI.toast(ok ? '已复制，可粘贴到各题答案框' : '复制失败，请手动选择文字复制');
     },
 
     'confirm:addUnit': async function () {
@@ -3462,6 +4517,7 @@
         await Store.Questions.create({
           subject: q.subject, grade: q.grade, unit: q.unit || '',
           pointId: q.pointId, pointName: q.pointName,
+          points: qPointsOf(q), units: qUnitsOf(q),
           type: it.type, difficulty: it.difficulty,
           text: it.text, answer: it.answer, solution: it.solution,
           batchName: '举一反三', source: 'generated',
@@ -3476,8 +4532,8 @@
     },
 
     /* ---- 题库 ---- */
-    'bank:subject': function (d) { S.bank.subject = d.v; render(); },
-    'bank:grade': function (d) { S.bank.grade = d.v; render(); },
+    'bank:subject': function (d) { S.bank.subject = d.v; S.bank.multiUnit = []; S.bank.multiPoint = []; render(); },
+    'bank:grade': function (d) { S.bank.grade = d.v; S.bank.multiUnit = []; S.bank.multiPoint = []; render(); },
     'bank:unit': function (d) {
       const u = d.unit || d.v || '';
       S.bank.unit = u;
@@ -3491,15 +4547,54 @@
       }
     },
     'unit:paper': function (d) {
-      const qs = (S.cache.bankQ || []).filter(q => (q.unit || '未归类') === d.unit);
+      const qs = (S.cache.bankQ || []).filter(q => qUnitsOf(q).indexOf(d.unit) >= 0);
       if (!qs.length) { UI.toast('这个章节还没有题目'); return; }
       Paper.setIds(qs.map(q => q.id));
       S.paperTitle = d.unit + ' 单元练习';
       UI.toast('已选 ' + qs.length + ' 道题进组卷篮');
       navigate('paper');
     },
+    /* ---- 按单元合并考点 ---- */
+    'unit:mergePoints': function (d) { unitMergeSheet(d.unit, true); },
+
+    /* 单元卡里的课时切换：点课时只列该课时的考点；再点一次或点「全部考点」恢复 */
+    'bank:lesson': function (d) {
+      S.bank.lessonSel = S.bank.lessonSel || {};
+      if (S.bank.lessonSel[d.unit] === d.v) delete S.bank.lessonSel[d.unit];
+      else S.bank.lessonSel[d.unit] = d.v;
+      render();
+    },
+    'um:sel': function (d) {
+      if (!S._mergeSel) return;
+      if (S._mergeSel.picked[d.id]) delete S._mergeSel.picked[d.id];
+      else S._mergeSel.picked[d.id] = d.name;
+      unitMergeSheet(S._mergeSel.unit);
+    },
+    'um:chooseTarget': function () { unitMergeTargetSheet(); },
+    'um:back': function () { unitMergeSheet(S._mergeSel.unit); },
+    'um:do': async function (d) {
+      const st = S._mergeSel;
+      if (!st) return;
+      const fromIds = Object.keys(st.picked).filter(function (x) { return x !== d.id; });
+      if (!fromIds.length) { UI.toast('请选至少两个不同的考点'); return; }
+      const targetName = st.picked[d.id];
+      UI.close();
+      for (const from of fromIds) {
+        try { await Store.Points.merge(from, d.id); }
+        catch (e) { UI.toast('合并失败：' + e.message); }
+      }
+      S._mergeSel = null;
+      await Store.Points.recount();
+      UI.toast('已合并到「' + targetName + '」（' + fromIds.length + ' 个考点并入）');
+      await render();
+    },
     'bank:status': function (d) { S.bank.status = d.v; render(); },
-    'bank:clear': function () { S.bank.keyword = ''; S.bank.unit = ''; S.bank.point = ''; render(); },
+    'bank:clear': function () {
+      S.bank.keyword = ''; S.bank.unit = ''; S.bank.point = '';
+      S.bank.multiUnit = []; S.bank.multiPoint = [];
+      S.batch.on = false; S.batch.set = {};
+      render();
+    },
     'bank:confirmList': function () {
       if (S.page !== 'bank') { S.bank.status = 'confirm'; navigate('bank'); return; }
       S.bank.status = S.bank.status === 'confirm' ? '全部' : 'confirm'; render();
@@ -3507,19 +4602,24 @@
     'bank:filter': async function () {
       const b = S.bank;
       const types = ['全部'].concat(CONFIG.questionTypes);
-      // 单元 / 考点筛选项从当前题库已有的题目内容里生成
+      // 单元 / 考点筛选项从当前题库已有的题目内容里生成（一题多考点/多单元时取并集）
       const qs = S.cache.bankQ || [];
-      const units = Array.from(new Set(qs.map(q => q.unit || '未归类')));
-      const points = Array.from(new Set(qs.map(q => q.pointName || '未分类')));
+      const unitSet = {}; const pointSet = {};
+      qs.forEach(function (q) {
+        qUnitsOf(q).forEach(u => { unitSet[u] = 1; });
+        qPointsOf(q).forEach(p => { pointSet[p.name] = 1; });
+      });
+      const units = Object.keys(unitSet);
+      const points = Object.keys(pointSet);
       const all = '<button class="tag' + (!b.unit ? ' active' : '') + '" data-act="bank:setUnit" data-v="">全部</button>';
       const unitChips = units.length
-        ? '<div class="chips">' + all + units.map(function (u) {
+        ? '<div class="chips wrapv">' + all + units.map(function (u) {
             return '<button class="tag' + (b.unit === u ? ' active' : '') + '" data-act="bank:setUnit" data-v="' + esc(u) + '">' + esc(u) + '</button>';
           }).join('') + '</div>'
         : '<p class="muted">题库里还没有带单元的题目</p>';
       const pall = '<button class="tag' + (!b.point ? ' active' : '') + '" data-act="bank:setPoint" data-v="">全部</button>';
       const pointChips = points.length
-        ? '<div class="chips">' + pall + points.map(function (pn) {
+        ? '<div class="chips wrapv">' + pall + points.map(function (pn) {
             return '<button class="tag' + (b.point === pn ? ' active' : '') + '" data-act="bank:setPoint" data-v="' + esc(pn) + '">' + esc(pn) + '</button>';
           }).join('') + '</div>'
         : '<p class="muted">题库里还没有题目</p>';
@@ -3536,8 +4636,8 @@
         '<button class="btn ghost block" data-act="bank:resetFilter">重置筛选</button>';
       UI.sheet({ title: '筛选', body: body });
     },
-    'bank:setUnit': function (d) { S.bank.unit = d.v; UI.close(); render(); },
-    'bank:setPoint': function (d) { S.bank.point = d.v; UI.close(); render(); },
+    'bank:setUnit': function (d) { S.bank.unit = d.v; S.bank.multiUnit = []; UI.close(); render(); },
+    'bank:setPoint': function (d) { S.bank.point = d.v; S.bank.multiPoint = []; UI.close(); render(); },
     'bank:setType': function (d) { S.bank.type = d.v; UI.close(); render(); },
     'bank:setDiff': function (d) { S.bank.difficulty = d.v; UI.close(); render(); },
     'bank:resetFilter': function () { S.bank.type = '全部'; S.bank.difficulty = ''; UI.close(); render(); },
@@ -3545,7 +4645,8 @@
     /* ---- 题库批量选择 ---- */
     'bank:batch': function () {
       const b = S.bank;
-      const browsing = !b.keyword.trim() && b.status === '全部' && b.type === '全部' && !b.difficulty && !b.unit && !b.point;
+      const browsing = !b.keyword.trim() && b.status === '全部' && b.type === '全部' && !b.difficulty &&
+        !b.unit && !b.point && !(b.multiUnit && b.multiUnit.length) && !(b.multiPoint && b.multiPoint.length);
       if (!S.batch.on && browsing) { UI.toast('先搜索或筛选出题目列表，再批量操作'); return; }
       S.batch.on = !S.batch.on;
       S.batch.set = {};
@@ -3587,19 +4688,30 @@
       if (!ids.length) { UI.toast('先勾选题目'); return; }
       const first = await DB.get('questions', ids[0]);
       if (!first) return;
-      const picked = await pickPoint(first.pointName, first.subject, first.grade);
-      if (!picked) return;
+      const picked = await pickPoints([], first.subject, first.grade);
+      if (!picked || !picked.length) return;
       let n = 0;
       for (const id of ids) {
         const q = await DB.get('questions', id);
         if (!q) continue;
-        // 按每道题自己的章节带上「·第N单元」后缀
-        const res = await resolveUnitPoint(picked.name, q.unit, q.subject, q.grade);
-        await Store.Questions.update(id, { pointId: res.point.id, pointName: res.point.name, needsConfirm: false });
+        const pts = [];
+        for (const e of picked) {
+          if (e.id) { pts.push({ id: e.id, name: e.name }); continue; }
+          // 新建考点：按每道题自己的章节带上「·第N单元」后缀
+          try {
+            const res = await resolveUnitPoint(e.name, (e.units && e.units[0]) || q.unit, q.subject, q.grade);
+            pts.push({ id: res.point.id, name: res.point.name });
+          } catch (err) {
+            pts.push({ id: '', name: e.name });
+          }
+        }
+        await Store.Questions.update(id, {
+          points: pts, pointId: pts[0].id, pointName: pts[0].name, needsConfirm: false
+        });
         n++;
       }
       await Store.Points.recount();
-      UI.toast('已把 ' + n + ' 道题改为「' + picked.name + '」');
+      UI.toast('已把 ' + n + ' 道题挂上 ' + picked.length + ' 个考点');
       S.batch.on = false; S.batch.set = {};
       render();
     },
@@ -3692,6 +4804,10 @@
       const pointOpts = pnames.map(function (p) {
         return '<option' + (p === curPoint ? ' selected' : '') + '>' + esc(p) + '</option>';
       }).join('');
+      // 课时（选填）：当前单元下的课时
+      const curLesson = qLessonOf(q, curUnit) || '';
+      const knownLs = knownLessonsOf(curUnit);
+      const lessonOptsHtml = knownLs.map(function (L) { return '<option value="' + esc(L) + '">'; }).join('');
       UI.sheet({
         title: '编辑题目',
         body: '<div class="field"><label>题干</label>' +
@@ -3712,6 +4828,9 @@
             '<select class="select" id="qeUnit" style="flex:1">' + unitOpts + '</select>' +
             '<select class="select" id="qePoint" style="flex:1.4">' + pointOpts + '</select>' +
           '</div>' +
+          '<div class="field mt8"><label>课时（选填，单元下按课时归类考点）</label>' +
+            '<input class="input" id="qeLesson" placeholder="如：第3课时" value="' + esc(curLesson) + '" list="qeLessonList">' +
+            '<datalist id="qeLessonList">' + lessonOptsHtml + '</datalist></div>' +
           '<button class="btn primary block mt12" data-act="q:editSave" data-id="' + q.id + '">保存修改</button>'
       });
     },
@@ -3727,9 +4846,10 @@
         type: document.getElementById('qeType').value,
         difficulty: Number(document.getElementById('qeDiff').value)
       };
-      // 考点 / 单元：原来没设置也能在这里选定；换单元时自动换对应后缀考点
+      // 考点 / 单元：原来没设置也能在这里选定；换单元时自动换对应后缀考点；课时与单元对齐
       const unitSel = document.getElementById('qeUnit');
       const pointSel = document.getElementById('qePoint');
+      const lessonEl = document.getElementById('qeLesson');
       if (unitSel && pointSel) {
         const unit = unitSel.value || '';
         let base = pointSel.value || '未分类';
@@ -3743,6 +4863,14 @@
           patch.pointName = base;
           patch.unit = unit;
         }
+        // units / lessons 数组与所选单元对齐（保留其他次要单元）
+        const oldU = qUnitsOf(q).filter(function (x) { return x && x !== '未归类'; });
+        const others = oldU.filter(function (x) { return unit && x !== unit && x !== (q.unit || ''); });
+        const units = unit ? [unit].concat(others) : oldU;
+        const lessonVal = lessonEl ? lessonEl.value.trim() : '';
+        patch.units = units;
+        patch.lessons = units.map(function (x) { return x === unit ? lessonVal : qLessonOf(q, x); });
+        patch.lesson = lessonVal;
       }
       await Store.Questions.update(d.id, patch);
       UI.close();
@@ -3762,6 +4890,10 @@
       UI.close();
       UI.toast('已移除图形');
       await render();
+    },
+    'q:imgToggle': function (d) {
+      S.openImg[d.id] = S.openImg[d.id] === false ? true : false;
+      render();
     },
     'q:imgAdd': function (d) {
       const input = document.createElement('input');
@@ -3794,15 +4926,47 @@
     'q:point': async function (d) {
       const q = await DB.get('questions', d.id);
       if (!q) return;
-      const picked = await pickPoint(q.pointName, q.subject, q.grade);
-      if (!picked) return;
-      // 按题目所在章节给考点带上「·第N单元」后缀
-      const res = await resolveUnitPoint(picked.name, q.unit, q.subject, q.grade);
-      await Store.Questions.update(d.id, {
-        pointId: res.point.id, pointName: res.point.name, needsConfirm: false
-      });
+      const curNames = qPointsOf(q).map(function (p) { return p.name; })
+        .filter(function (n) { return n && n !== '未分类'; });
+      const picked = await pickPoints(curNames, q.subject, q.grade);
+      if (!picked || !picked.length) return;
+      const pts = [];
+      for (const e of picked) {
+        if (e.id) { pts.push({ id: e.id, name: e.name }); continue; }
+        // 按题目所在章节给新考点带上「·第N单元」后缀
+        try {
+          const res = await resolveUnitPoint(e.name, (e.units && e.units[0]) || q.unit, q.subject, q.grade);
+          pts.push({ id: res.point.id, name: res.point.name });
+        } catch (err) {
+          pts.push({ id: '', name: e.name });
+        }
+      }
+      const patch = {
+        points: pts, pointId: pts[0].id, pointName: pts[0].name, needsConfirm: false
+      };
+      // 新建/勾选考点时所选的单元并入该题的多单元归属（题目同时在各单元题库里可见）
+      const unitAdd = [];
+      picked.forEach(function (e) { (e.units || []).forEach(function (u) { if (u && unitAdd.indexOf(u) < 0) unitAdd.push(u); }); });
+      if (unitAdd.length) {
+        const curU = qUnitsOf(q).filter(function (u) { return u && u !== '未归类'; });
+        const merged = curU.slice();
+        unitAdd.forEach(function (u) { if (merged.indexOf(u) < 0) merged.push(u); });
+        patch.units = merged;
+        if (!patch.unit && merged.length) patch.unit = merged[0];
+        // 新建考点时选了课时：写到对应单元位置（与 units 对齐），已有时课时不覆盖
+        const lessonByUnit = {};
+        picked.forEach(function (e) { if (e.lesson) (e.units || []).forEach(function (u) { if (u && !lessonByUnit[u]) lessonByUnit[u] = e.lesson; }); });
+        if (Object.keys(lessonByUnit).length) {
+          const curLessons = qLessonsOf(q);
+          patch.lessons = merged.map(function (u, i) {
+            return lessonByUnit[u] || curLessons[curU.indexOf(u)] || (i === 0 ? (q.lesson || '') : '');
+          });
+          patch.lesson = patch.lessons.filter(Boolean)[0] || q.lesson || '';
+        }
+      }
+      await Store.Questions.update(d.id, patch);
       await Store.Points.recount();
-      UI.toast('已改为「' + res.point.name + '」');
+      UI.toast('已挂上 ' + pts.length + ' 个考点');
       await render();
     },
     'q:del': async function (d) {
@@ -3925,6 +5089,83 @@
     'review:quit': function () {
       S.review = null;
       render();
+    },
+
+    /* ---- 复习 · 组卷（按考点/单元筛选 + 锁定题型） ---- */
+    'rv:pbuild': async function () {
+      const qs = await Store.Questions.list({
+        subject: S.defaults.subject, grade: S.defaults.grade, status: '全部'
+      });
+      S._pbuildQs = qs;
+      if (!S._pbuild) S._pbuild = { mode: 'point', sel: {}, types: {}, per: 5 };
+      pbuildSheet();
+    },
+    'rv:pbMode': function (d) {
+      if (!S._pbuild) return;
+      S._pbuild.mode = d.v;
+      S._pbuild.sel = {};
+      pbuildSheet();
+    },
+    'rv:pbSel': function (d) {
+      if (!S._pbuild) return;
+      if (S._pbuild.sel[d.v]) delete S._pbuild.sel[d.v];
+      else S._pbuild.sel[d.v] = 1;
+      pbuildSheet();
+    },
+    'rv:pbT': function (d) {
+      if (!S._pbuild) return;
+      if (S._pbuild.types[d.v]) delete S._pbuild.types[d.v];
+      else S._pbuild.types[d.v] = 1;
+      pbuildSheet();
+    },
+    'rv:pbCancel': function () { S._pbuild = null; UI.close(); },
+    'rv:pbAuto': function () {
+      const st = S._pbuild;
+      if (!st) return;
+      const perEl = document.getElementById('rvPer');
+      st.per = Math.max(1, Math.min(30, parseInt(perEl && perEl.value, 10) || 5));
+      const selNames = Object.keys(st.sel);
+      if (!selNames.length) { UI.toast('先选' + (st.mode === 'point' ? '考点' : '单元')); return; }
+      const types = Object.keys(st.types);
+      if (!types.length) { UI.toast('先勾选要锁定的题型'); return; }
+      const pool = (S._pbuildQs || []).filter(function (q) {
+        return st.mode === 'point'
+          ? qPointsOf(q).some(p => st.sel[p.name])
+          : qUnitsOf(q).some(u => st.sel[u]);
+      });
+      const ids = [];
+      types.forEach(function (t) {
+        const list = pool.filter(q => (q.type || '解答题') === t);
+        for (let i = list.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          const tmp = list[i]; list[i] = list[j]; list[j] = tmp;
+        }
+        list.slice(0, st.per).forEach(q => ids.push(q.id));
+      });
+      if (!ids.length) { UI.toast('选的范围里没有匹配题型的题目'); return; }
+      Paper.setIds(ids);
+      S.paperTitle = selNames.slice(0, 2).join('、') + (selNames.length > 2 ? '等' : '') +
+        (st.mode === 'point' ? ' 考点练习' : ' 单元练习');
+      S._pbuild = null;
+      UI.close();
+      UI.toast('已组卷：' + ids.length + ' 题进试卷篮，可调整顺序后保存 / 打印');
+      navigate('paper');
+    },
+    'rv:pbManual': function () {
+      const st = S._pbuild;
+      if (!st) return;
+      const selNames = Object.keys(st.sel);
+      if (!selNames.length) { UI.toast('先选' + (st.mode === 'point' ? '考点' : '单元')); return; }
+      const b = S.bank;
+      b.keyword = ''; b.status = '全部'; b.type = '全部'; b.difficulty = '';
+      b.unit = ''; b.point = '';
+      if (st.mode === 'point') { b.multiPoint = selNames; b.multiUnit = []; }
+      else { b.multiUnit = selNames; b.multiPoint = []; }
+      S.batch.on = true; S.batch.set = {};
+      S._pbuild = null;
+      UI.close();
+      navigate('bank');
+      UI.toast('已按范围过滤题库并进入批量模式：勾题后点「入组卷」', 3000);
     },
 
     /* ---- 设置 ---- */
@@ -4246,6 +5487,15 @@
       const s = ensureSession();
       s.images.forEach(im => URL.revokeObjectURL(im.url));
       s.images = [{ id: Util.uid('im'), blob: null, url: '', status: 'done', text: text, pct: 1, docImages: res.images || [] }];
+      // 文档里的图片也做红笔答案检测（一般红笔标记的是答案）
+      if (res.images && res.images.length && (!CONFIG.ocr.provider || CONFIG.ocr.provider === 'tesseract')) {
+        const reds = [];
+        for (const src of res.images.slice(0, 8)) {
+          const r = await OCR.redAnswer(src);
+          if (r && r.found && r.text) reds.push(r.text);
+        }
+        if (reds.length) s.images[0].redAns = { found: true, text: reds.join('\n') };
+      }
       if (!s.batchName) s.batchName = file.name.replace(/\.[a-z0-9]+$/i, '');
       buildDrafts();
       s.stage = 'confirm';
@@ -4299,9 +5549,13 @@
     dcDaySet: dcDaySet, dcWeightedPool: dcWeightedPool, dcNextMonday: dcNextMonday,
     dcWorkdayIndex: dcWorkdayIndex, dcDateKey: dcDateKey,
     dcCalcAnswer: dcCalcAnswer, dcParseCalcText: dcParseCalcText, calcKindOf: calcKindOf,
+    dcOcrSheet: dcOcrSheet, dcalcPlanBody: dcalcPlanBody,
     dcExtractWeak: dcExtractWeak, dcWeakVaried: dcWeakVaried, dcWeakKind: dcWeakKind,
     dcCollectWeak: dcCollectWeak, readCalcBank: readCalcBank, saveCalcBank: saveCalcBank,
-    dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs };
+    dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs, dcEditSheet: dcEditSheet, dcEditApply: dcEditApply,
+    dcSolveFixes: dcSolveFixes, dcSameNum: dcSameNum,
+    qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
+    knownLessonsOf: knownLessonsOf, pickPoints: pickPoints };
 
   /* =========================================================
    * 启动

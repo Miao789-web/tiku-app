@@ -412,7 +412,15 @@ body[data-tab="off"] .view { padding-bottom: calc(92px + var(--safe-b)); }
   display: grid; place-items: center;
   color: #fff; font-size: 13px; font-weight: 800;
 }
-.pool-sel.on { background: var(--danger); border-color: #fff; }
+.pool-sel.on { background: var(--brand); border-color: #fff; }
+/* 图形池 · 多选模式：整块可点，圈更大更好点 */
+.pool-tile.selectable { cursor: pointer; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+.pool-tile.selectable .pool-sel { width: 30px; height: 30px; font-size: 15px; right: 8px; top: 8px; }
+.pool-tile.selectable .pool-ops { display: none; }
+.pool-tile.sel-on { border-color: var(--brand); box-shadow: 0 0 0 2px var(--brand-soft); }
+.pool-tile.sel-on .pool-sel { background: var(--brand); border-color: #fff; }
+/* 筛选弹层里的 chips：换行纵向看，不再左右拖 */
+.chips.wrapv { flex-wrap: wrap; overflow-x: visible; overflow-y: auto; max-height: 200px; padding: 2px 0 8px; }
 
 /* 首页 · 每日计算 */
 .dc-q {

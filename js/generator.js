@@ -213,8 +213,17 @@ const Generator = (function () {
   }
 
   /* ---------------- 数字变体兜底 ---------------- */
+  /** 把题干里的数字换成相近量级的新数字；
+   *  日期（如 2025年10月8日）近两年的原样保留——举一反三重点是改数量关系里的数据 */
   function mutateNumbers(text) {
-    return String(text || '').replace(/\d+(\.\d+)?/g, function (m) {
+    const cy = new Date().getFullYear();
+    const DATE_RE = /(\d{4})\s*年(?:\s*(\d{1,2})\s*月)?(?:\s*(\d{1,2})\s*[日号])?/g;
+    const dates = [];
+    const withTokens = String(text || '').replace(DATE_RE, function (m, y) {
+      dates.push({ m: m, y: parseInt(y, 10), recent: parseInt(y, 10) >= cy - 1 });
+      return '\x00' + (dates.length - 1) + '\x01';
+    });
+    const out = withTokens.replace(/\d+(\.\d+)?/g, function (m) {
       const v = parseFloat(m);
       if (v <= 2) return String(v);
       const delta = Math.max(1, Math.round(v * 0.3));
@@ -222,6 +231,13 @@ const Generator = (function () {
         ? Math.max(1, v + ri(-delta, delta))
         : Math.round((v + (Math.random() - 0.5) * delta) * 10) / 10;
       return String(nv === v ? v + 1 : nv);
+    });
+    return out.replace(/\x00(\d+)\x01/g, function (m, i) {
+      const d = dates[+i];
+      if (!d) return '';
+      if (d.recent) return d.m;                      // 近两年：日期不动
+      const ny = Math.max(2015, d.y + ri(-2, 2));    // 更早的日期只换年份，月日不动
+      return d.m.replace(String(d.y), String(ny === d.y ? d.y - 1 : ny));
     });
   }
 

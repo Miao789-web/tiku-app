@@ -126,10 +126,102 @@ const OCR = (function () {
     return recognizeTesseract(blob, onProgress);
   }
 
+  /* ---------------- 红笔答案识别 ----------------
+   * 练习册上一般用红笔写答案：先把红色像素按颜色抠出来，
+   * 再把红色区域单独交给 OCR（数字白名单）识别。
+   * 手写体识别不一定完全准确，结果只作为参考，老师需核对。 */
+
+  function loadImage(src) {
+    return new Promise(function (resolve, reject) {
+      const img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('图片加载失败')); };
+      img.src = src;
+    });
+  }
+
+  function imageToCanvas(img, maxSide) {
+    const scale = Math.min(1, (maxSide || 1600) / Math.max(img.width || 1, img.height || 1));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round((img.width || 1) * scale));
+    c.height = Math.max(1, Math.round((img.height || 1) * scale));
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  /** 纯函数（便于自测）：在 canvas 里找红色像素 → { ratio, mask, box }；mask 是红笔黑白的二值图 */
+  function redMaskOf(canvas) {
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    const d = ctx.getImageData(0, 0, w, h).data;
+    const out = document.createElement('canvas');
+    out.width = w; out.height = h;
+    const octx = out.getContext('2d');
+    const od = octx.createImageData(w, h);
+    let red = 0, minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        // 红笔判定：红通道明显高于绿蓝（排除黑字、灰底、蓝笔）
+        const isRed = r > 95 && r - g > 45 && r - b > 45;
+        if (isRed) {
+          red++;
+          od.data[i] = 0; od.data[i + 1] = 0; od.data[i + 2] = 0; od.data[i + 3] = 255;
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+        } else {
+          od.data[i] = 255; od.data[i + 1] = 255; od.data[i + 2] = 255; od.data[i + 3] = 255;
+        }
+      }
+    }
+    octx.putImageData(od, 0, 0);
+    return { ratio: red / (w * h), mask: out, box: maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } };
+  }
+
+  /**
+   * 识别图里的红笔内容。src 可以是 Blob 或 dataURL。
+   * 返回 { found: boolean, text?: string, ratio? }；异常一律返回 found:false，不打断主流程。
+   */
+  async function redAnswer(src) {
+    try {
+      const url = (src && src instanceof Blob) ? await blobToDataURL(src) : src;
+      if (!url) return { found: false };
+      const img = await loadImage(url);
+      const canvas = imageToCanvas(img, 1600);
+      const m = redMaskOf(canvas);
+      if (!m.box || m.ratio < 0.0015) return { found: false, ratio: m.ratio };
+      const pad = 10;
+      const bx = Math.max(0, m.box.x - pad), by = Math.max(0, m.box.y - pad);
+      const bw = Math.min(canvas.width - bx, m.box.w + pad * 2);
+      const bh = Math.min(canvas.height - by, m.box.h + pad * 2);
+      const crop = document.createElement('canvas');
+      crop.width = bw; crop.height = bh;
+      crop.getContext('2d').drawImage(m.mask, bx, by, bw, bh, 0, 0, bw, bh);
+      // 红色区域单独识别：数字/分数/运算符白名单（只在 tesseract 引擎下做）
+      const p = CONFIG.ocr.provider;
+      if (p === 'baidu' || p === 'tencent' || p === 'manual') return { found: true, text: '', ratio: m.ratio, needManual: true };
+      const w = await getWorker(null);
+      await w.setParameters({ tessedit_char_whitelist: '0123456789./=+−×÷():：' });
+      let text = '';
+      try {
+        const res = await w.recognize(crop);
+        text = (res && res.data && res.data.text) || '';
+      } finally {
+        try { await w.setParameters({ tessedit_char_whitelist: '' }); } catch (e) { /* 恢复失败不影响 */ }
+      }
+      text = String(text).replace(/[\s\u3000]+/g, ' ').replace(/^[^\d(（]+/, '').trim();
+      if (!/\d/.test(text)) return { found: true, text: '', ratio: m.ratio };
+      return { found: true, text: text, ratio: m.ratio };
+    } catch (e) {
+      return { found: false, error: e && e.message };
+    }
+  }
+
   function destroy() {
     if (worker) { try { worker.terminate(); } catch (e) {} }
     worker = null; loading = null;
   }
 
-  return { recognize, destroy, tidy };
+  return { recognize, redAnswer, redMaskOf, destroy, tidy };
 })();
