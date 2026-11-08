@@ -562,7 +562,7 @@
   /** 采集题库里的常错计算（ IndexedDB ，预览时调用一次） */
   async function dcCollectWeak() {
     try {
-      const all = await Store.Questions.all();
+      const all = await Store.Questions.list({});
       return dcExtractWeak(all);
     } catch (e) { return []; }
   }
@@ -1240,9 +1240,14 @@
       return (q.lessons && q.lessons[i]) || (i === 0 && q.lesson) || '';
     });
   }
-  /** 题库某单元下出现过的课时名（去重） */
-  function knownLessonsOf(unit) {
+  /** 题库某单元下出现过的课时名（去重）；目录里配好的课时排在最前面 */
+  function knownLessonsOf(unit, subject, grade) {
     const out = [];
+    const sbj = subject || S.defaults.subject, gd = grade || S.defaults.grade;
+    // 目录里配好的课时优先
+    Catalog.lessonsOf(sbj, gd, S.defaults.term, S.defaults.version, unit || '').forEach(function (L) {
+      if (out.indexOf(L) < 0) out.push(L);
+    });
     (S.cache.bankQ || []).forEach(function (q) {
       const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
       us.forEach(function (u, i) {
@@ -1252,6 +1257,88 @@
       });
     });
     return out;
+  }
+
+  /* ---- 目录课时 · 自动配对与自动归类 ----
+   * 1) syncCatalogLessons：题库里某单元已经用过的课时，自动配对进教材目录（老师可在设置里改）；
+   * 2) autoAssignLessons：目录里配好课时后，按「考点名 ↔ 课时名」自动把没课时的题归到课时，
+   *    判断不出的留给「分配课时」批量工具（按考点选课时或「无」）。 */
+  function catalogLessonsAll(subject, grade) {
+    const out = {};
+    Catalog.get(subject, grade, S.defaults.term, S.defaults.version).forEach(function (u) {
+      out[u] = Catalog.lessonsOf(subject, grade, S.defaults.term, S.defaults.version, u);
+    });
+    return out;
+  }
+  /** 题库已用课时 → 自动并入目录（返回并入了几个单元） */
+  async function syncCatalogLessons(subject, grade) {
+    const sbj = subject || S.defaults.subject, gd = grade || S.defaults.grade;
+    const used = {};
+    (S.cache.bankQ || []).forEach(function (q) {
+      if (q.subject !== sbj || q.grade !== gd) return;
+      const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
+      const ls = qLessonsOf(q);
+      us.forEach(function (u, i) {
+        if (!u || u === '未归类' || !ls[i] || ls[i] === '无') return;   // 「无」是显式标记，不配对进目录
+        (used[u] = used[u] || []);
+        if (used[u].indexOf(ls[i]) < 0) used[u].push(ls[i]);
+      });
+    });
+    let n = 0;
+    Object.keys(used).forEach(function (u) {
+      const cur = Catalog.lessonsOf(sbj, gd, S.defaults.term, S.defaults.version, u);
+      const merged = cur.slice();
+      used[u].forEach(function (L) { if (merged.indexOf(L) < 0) merged.push(L); });
+      if (merged.length !== cur.length) { Catalog.setLessons(sbj, gd, S.defaults.term, S.defaults.version, u, merged); n++; }
+    });
+    return n;
+  }
+  /** 考点基本名（去掉「·第N单元」后缀） */
+  function pointBaseName(name) {
+    return String(name || '').replace(/·第\d+单元$/, '').trim();
+  }
+  /** 目录配好课时后：按考点名匹配课时，把没课时的题自动归类。返回 { assigned, pending } */
+  async function autoAssignLessons(subject, grade) {
+    const sbj = subject || S.defaults.subject, gd = grade || S.defaults.grade;
+    const catLs = catalogLessonsAll(sbj, gd);
+    const all = await Store.Questions.list({});
+    let assigned = 0, pending = 0;
+    for (const q of all) {
+      if (q.subject !== sbj || q.grade !== gd) continue;
+      const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
+      if (!us.length) continue;
+      const ls = qLessonsOf(q);
+      // 已经全有课时（含显式「无」）的题不动
+      const needIdx = [];
+      us.forEach(function (u, i) { if (!ls[i]) needIdx.push(i); });
+      if (!needIdx.length) continue;
+      const bases = qPointsOf(q).map(function (p) { return pointBaseName(p.name); }).filter(Boolean);
+      const patchLessons = ls.slice();
+      let changed = false;
+      needIdx.forEach(function (i) {
+        const u = us[i];
+        const lessons = catLs[u] || [];
+        if (!lessons.length) return;
+        const hits = lessons.filter(function (L) {
+          return bases.some(function (b) { return b === L || b.indexOf(L) >= 0 || L.indexOf(b) >= 0; });
+        });
+        if (hits.length === 1) { patchLessons[i] = hits[0]; changed = true; }
+      });
+      if (changed) {
+        await Store.Questions.update(q.id, { lessons: patchLessons, lesson: patchLessons.filter(Boolean)[0] || q.lesson || '' });
+        assigned++;
+      } else {
+        pending++;
+      }
+    }
+    return { assigned: assigned, pending: pending };
+  }
+  /** 某单元下「还没有课时」的题（显式『无』也算已分配） */
+  function unassignedOf(q, unit) {
+    const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
+    const i = us.indexOf(unit);
+    if (i < 0) return false;
+    return !((q.lessons && q.lessons[i]) || (i === 0 && q.lesson) || '');
   }
   /** 写库时同步主字段（pointId/pointName/unit 取第一个），保证老逻辑不受影响 */
   function syncPrimaryRef(q) {
@@ -1414,11 +1501,17 @@
     const url = S.imgUrls[q.id];
     const batch = !!opts.batch;
     const sel = batch && !!S.batch.set[q.id];
+    // 标签 = 考点（主考点，多考点显示 +N） + 单元名 + 课时名
+    const pts = qPointsOf(q);
+    const mainUnit = qUnitsOf(q)[0] || '';
+    const mainLesson = qLessonOf(q, mainUnit);
     return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="batch:sel"' : '') + '>' +
       '<div class="row between wrap" style="gap:6px;margin-bottom:8px">' +
         '<div class="row wrap" style="gap:6px">' +
           (batch ? '<span class="bcheck' + (sel ? ' on' : '') + '"></span>' : '') +
-          (opts.hidePoint ? '' : '<span class="chip brand">' + esc(q.pointName || '未分类') + '</span>') +
+          (opts.hidePoint ? '' : '<span class="chip brand">' + esc(pts[0].name || '未分类') + (pts.length > 1 ? ' +' + (pts.length - 1) : '') + '</span>') +
+          (mainUnit && mainUnit !== '未归类' ? '<span class="chip gray">📖 ' + esc(mainUnit) + '</span>' : '') +
+          (mainLesson ? '<span class="chip gray">⏱ ' + esc(mainLesson) + '</span>' : '') +
           '<span class="chip gray">' + esc(q.type) + '</span>' +
           '<span class="chip gray">难度 ' + q.difficulty + '</span>' +
         '</div>' +
@@ -1460,6 +1553,52 @@
         '<button class="del" data-act="q:del" data-id="' + q.id + '">删除</button>' +
       '</div>') +
     '</article>';
+  }
+
+  /** 批量分配课时：按考点列出该单元下还没课时的题，点课时（或「无」）一次归入 */
+  function lessonAssignSheet(unit) {
+    const qs = (S.cache.bankQ || []).filter(function (q) {
+      return qUnitsOf(q).indexOf(unit) >= 0 && unassignedOf(q, unit);
+    });
+    const lessons = knownLessonsOf(unit);
+    const byPoint = {};
+    qs.forEach(function (q) {
+      qPointsOf(q).forEach(function (p) {
+        const key = p.id || 'n:' + p.name;
+        const e = byPoint[key] || (byPoint[key] = { name: p.name, count: 0 });
+        e.count++;
+      });
+    });
+    const rows = Object.keys(byPoint).map(function (k) {
+      const p = byPoint[k];
+      const chips = '<div class="chips wrapv" style="margin-top:6px">' +
+        lessons.map(function (L) {
+          return '<button class="tag" data-act="bank:assignLesson" data-unit="' + esc(unit) + '" data-point="' + esc(p.name) + '" data-v="' + esc(L) + '">' + esc(L) + '</button>';
+        }).join('') +
+        '<button class="tag" data-act="bank:assignLesson" data-unit="' + esc(unit) + '" data-point="' + esc(p.name) + '" data-v="无">无</button></div>';
+      return '<div class="list-item" style="flex-wrap:wrap;align-items:flex-start">' +
+        '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
+        '<span class="muted" style="font-size:12px">' + p.count + ' 题未分课时，点课时一次归入：</span>' + chips + '</div></div>';
+    }).join('');
+    const body = qs.length
+      ? '<p class="muted" style="margin-bottom:8px">「' + esc(unit) + '」还有 ' + qs.length + ' 题没分课时。系统按考点判断不出的，在这里按考点批量归：点一个课时，该考点下这些题就都归到那个课时；点「无」表示明确不按课时分。</p>' + rows
+      : '<div class="empty"><b>这个单元的题都有课时了</b>自动归类 + 手动分配已完成</div>' +
+        '<button class="btn soft block" data-act="sheet:close">完成</button>';
+    UI.sheet({ title: '分配课时 · ' + unit, body: body });
+  }
+
+  /** 编辑某单元的课时列表（设置页「每单元的课时」→ ✎） */
+  function lessonEditSheet(unit) {
+    const cv2 = S._catVersion || S.defaults.version;
+    const ls = Catalog.lessonsOf(S.defaults.subject, S.defaults.grade, S.defaults.term, cv2, unit);
+    UI.sheet({
+      title: '「' + unit + '」的课时',
+      body: '<p class="muted" style="margin-bottom:8px">每行一个课时（如：第1课时、三角形的面积）。保存后系统会按考点自动把该单元没课时的题归到对应课时，判断不出的去题库该单元卡「分配课时」批量归；清空表示这个单元不按课时分。</p>' +
+        '<textarea class="textarea" id="unitLessonText" style="min-height:140px" placeholder="第1课时&#10;第2课时">' + esc(Catalog.toText(ls)) + '</textarea>' +
+        '<div class="row mt12" style="gap:8px">' +
+          '<button class="btn ghost grow" data-act="sheet:close">取消</button>' +
+          '<button class="btn primary grow" data-act="settings:lessonsSave" data-unit="' + esc(unit) + '">保存并自动归类</button></div>'
+    });
   }
 
   /** 同类题（同考点历史题目，标明日期与来源练习） */
@@ -2049,6 +2188,10 @@
         needsConfirm: b.status === 'confirm',
         type: b.type, difficulty: b.difficulty
       });
+      // 题库里已经用过的课时自动配对进教材目录（老师可在设置里编辑修改）
+      if (b.subject !== '全部' && b.grade !== '全部') {
+        try { await syncCatalogLessons(b.subject, b.grade); } catch (e) { /* 配对失败不影响浏览 */ }
+      }
     },
     html() {
       const b = S.bank;
@@ -2163,11 +2306,15 @@
         const L = lessonOf(q);
         if (L && lessonSet.indexOf(L) < 0) lessonSet.push(L);
       });
+      // 排序：数字课时在前（第2 < 第10），「无」排最后
       lessonSet.sort(function (a, b) {
+        if (a === '无') return 1;
+        if (b === '无') return -1;
         const na = parseInt(String(a).replace(/\D/g, ''), 10), nb = parseInt(String(b).replace(/\D/g, ''), 10);
         if (!isNaN(na) && !isNaN(nb) && na !== nb) return na - nb;
         return a.localeCompare(b, 'zh');
       });
+      const unassigned = list.filter(function (q) { return unassignedOf(q, u); }).length;
       const effList = lessonSel ? list.filter(function (q) { return lessonOf(q) === lessonSel; }) : list;
       const byPoint = {};
       effList.forEach(function (q) {
@@ -2195,6 +2342,7 @@
         '<div class="card-h"><h3>' + esc(u) + '</h3>' +
           '<div class="row" style="gap:6px"><span class="muted">' + (lessonSel ? effList.length + ' / ' : '') + list.length + ' 题 · ' +
             Object.keys(byPoint).length + ' 考点' + (lessonSet.length ? ' · ' + lessonSet.length + ' 课时' : '') + '</span>' +
+          (unassigned ? '<button class="btn ghost sm" data-act="bank:lessonAssign" data-unit="' + esc(u) + '">分配课时 ' + unassigned + '</button>' : '') +
           '<button class="btn ghost sm" data-act="unit:mergePoints" data-unit="' + esc(u) + '">合并考点</button>' +
           '<button class="btn ghost sm" data-act="unit:paper" data-unit="' + esc(u) + '">组单元卷</button></div></div>' +
         lessonChips +
@@ -2486,6 +2634,20 @@
             '<button class="btn ghost grow" data-act="settings:catreset">恢复默认</button>' +
             '<button class="btn primary grow" data-act="settings:catsave">保存目录</button>' +
           '</div>' +
+        '</section>' +
+
+        '<section class="card">' +
+          '<div class="card-h"><h3>每单元的课时</h3></div>' +
+          '<p class="muted" style="margin-bottom:6px">给单元配上课时后，系统会按考点自动把该单元没课时的题归到对应课时；判断不出的，去题库该单元卡点「分配课时」按考点批量归（可选「无」）。题库里已经用过的课时会自动配对进来。</p>' +
+          catList.map(function (u) {
+            const ls = Catalog.lessonsOf(S.defaults.subject, S.defaults.grade, S.defaults.term, cv, u);
+            return '<div class="row between" style="padding:8px 2px;border-bottom:0.5px solid var(--line);align-items:center;gap:8px">' +
+              '<span style="font-size:13.5px;font-weight:600;flex-shrink:0;max-width:40%">' + esc(u) + '</span>' +
+              '<span style="flex:1;text-align:right;overflow:hidden">' + (ls.length
+                ? '<span class="muted" style="font-size:12.5px">' + esc(ls.join('、')) + '</span>'
+                : '<span class="muted" style="font-size:12.5px">未设置课时</span>') + '</span>' +
+              '<button class="btn ghost sm" data-act="settings:lessonsEdit" data-unit="' + esc(u) + '">✎ 课时</button></div>';
+          }).join('') +
         '</section>' +
 
         '<div class="sec-title">数据</div>' +
@@ -4564,6 +4726,36 @@
       else S.bank.lessonSel[d.unit] = d.v;
       render();
     },
+
+    /* 批量分配课时（按考点）：点课时或「无」，该考点下未分配的题一次归入 */
+    'bank:lessonAssign': function (d) { lessonAssignSheet(d.unit); },
+    'bank:assignLesson': async function (d) {
+      const unit = d.unit, v = d.v, pname = d.point;
+      const targets = (S.cache.bankQ || []).filter(function (q) {
+        return qUnitsOf(q).indexOf(unit) >= 0 && unassignedOf(q, unit) &&
+          qPointsOf(q).some(function (p) { return p.name === pname; });
+      });
+      for (const q of targets) {
+        const us = qUnitsOf(q);
+        const ls = qLessonsOf(q);
+        const i = us.indexOf(unit);
+        if (i < 0) continue;
+        ls[i] = v;
+        await Store.Questions.update(q.id, { lessons: ls, lesson: ls.filter(function (x) { return x && x !== '无'; })[0] || ls[0] || '' });
+      }
+      UI.toast(targets.length ? '已把 ' + targets.length + ' 道题归到「' + v + '」' : '没有需要处理的题', 2400);
+      // 刷新题库缓存（顺带把新课时配对进目录）后重开弹层
+      try {
+        await PAGES.bank.load();
+        // 题库筛选是「全部」时 load() 不知道科目，用被分配题目自己的科目/年级补一次配对
+        const fq = targets[0];
+        if (fq && (S.bank.subject === '全部' || S.bank.grade === '全部')) {
+          await syncCatalogLessons(fq.subject, fq.grade);
+        }
+      } catch (e) { /* 保底不阻断 */ }
+      lessonAssignSheet(unit);
+      await render();
+    },
     'um:sel': function (d) {
       if (!S._mergeSel) return;
       if (S._mergeSel.picked[d.id]) delete S._mergeSel.picked[d.id];
@@ -5310,6 +5502,24 @@
       render();
     },
 
+    /* ---- 每单元的课时（编辑 + 保存后自动归类） ---- */
+    'settings:lessonsEdit': function (d) { lessonEditSheet(d.unit); },
+    'settings:lessonsSave': async function (d) {
+      const cv2 = S._catVersion || S.defaults.version;
+      const t = document.getElementById('unitLessonText');
+      Catalog.setLessons(S.defaults.subject, S.defaults.grade, S.defaults.term, cv2, d.unit, Catalog.fromText(t ? t.value : ''));
+      UI.close();
+      try {
+        const r = await autoAssignLessons(S.defaults.subject, S.defaults.grade);
+        UI.toast(r.assigned
+          ? '已按考点自动归类 ' + r.assigned + ' 道题' + (r.pending ? '，' + r.pending + ' 道判断不出，可去题库「分配课时」' : '')
+          : (r.pending ? r.pending + ' 道题判断不出课时，可去题库该单元卡「分配课时」批量归' : '没有需要归类的题'), 3400);
+      } catch (e) {
+        UI.toast('自动归类失败：' + (e.message || e), 2800);
+      }
+      render();
+    },
+
     /* ---- 数据 ---- */
     'data:seed': async function () { await seedDemo(); },
     'data:export': async function () {
@@ -5554,6 +5764,8 @@
     dcCollectWeak: dcCollectWeak, readCalcBank: readCalcBank, saveCalcBank: saveCalcBank,
     dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs, dcEditSheet: dcEditSheet, dcEditApply: dcEditApply,
     dcSolveFixes: dcSolveFixes, dcSameNum: dcSameNum,
+    autoAssignLessons: autoAssignLessons, syncCatalogLessons: syncCatalogLessons, pointBaseName: pointBaseName,
+    lessonAssignSheet: lessonAssignSheet, lessonEditSheet: lessonEditSheet,
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints };
 

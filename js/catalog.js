@@ -127,5 +127,34 @@ const Catalog = (function () {
     return list;
   }
 
-  return { get, setCustom, hasCustom, addUnit, removeUnit, versions: VERSIONS, toText, fromText, DATA: RJ };
+  /* ---------- 单元下的课时（可编辑，本机保存） ---------- */
+  const LS_LESSONS = 'tiku.catalog.lessons';
+
+  function loadLessons() {
+    try { return JSON.parse(localStorage.getItem(LS_LESSONS) || '{}'); } catch (e) { return {}; }
+  }
+  function saveLessons(map) {
+    localStorage.setItem(LS_LESSONS, JSON.stringify(map || {}));
+  }
+  /** 某单元的课时列表（未设置返回 []） */
+  function lessonsOf(subject, grade, term, version, unit) {
+    const m = loadLessons()[ckey(subject, grade, term, version)];
+    return (m && m[unit] && m[unit].length) ? m[unit].slice() : [];
+  }
+  /** 设置某单元的课时列表（空数组/空串表示清除该单元的课时划分） */
+  function setLessons(subject, grade, term, version, unit, lessons) {
+    unit = String(unit || '').trim();
+    if (!unit) return;
+    const all = loadLessons();
+    const k = ckey(subject, grade, term, version);
+    const m = all[k] || {};
+    const arr = (lessons || []).map(s => String(s).trim()).filter(Boolean);
+    if (arr.length) m[unit] = arr;
+    else delete m[unit];
+    if (Object.keys(m).length) all[k] = m; else delete all[k];
+    saveLessons(all);
+  }
+
+  return { get, setCustom, hasCustom, addUnit, removeUnit, versions: VERSIONS, toText, fromText, DATA: RJ,
+    lessonsOf, setLessons };
 })();
