@@ -151,7 +151,7 @@ const Store = (function () {
         unit: '',                 // 教材章节（目录单元名）
         pointId: '',
         pointName: '',
-        type: '解答题',
+        type: '应用题',
         difficulty: 2,
         text: '',
         options: [],

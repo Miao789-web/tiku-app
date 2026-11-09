@@ -9,7 +9,7 @@
 const Paper = (function () {
 
   const KEY = 'tiku.basket';
-  const TYPE_ORDER = ['计算题', '填空题', '判断题', '选择题', '应用题', '解答题'];
+  const TYPE_ORDER = ['计算题', '填空题', '判断题', '选择题', '应用题', '操作题'];
   const CN_NUM = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
 
   /* ---------- 试卷篮（localStorage 持久化） ---------- */
@@ -82,7 +82,7 @@ const Paper = (function () {
     const answerParts = [];
 
     TYPE_ORDER.forEach(function (type) {
-      const list = qs.filter(q => (q.type || '解答题') === type);
+      const list = qs.filter(q => (q.type || '应用题') === type);
       if (!list.length) return;
       const label = CN_NUM[sections.length] || String(sections.length + 1);
       let inner = '';
@@ -100,7 +100,7 @@ const Paper = (function () {
     });
 
     // 未归入常规题型的兜底
-    const rest = qs.filter(q => TYPE_ORDER.indexOf(q.type || '解答题') < 0);
+    const rest = qs.filter(q => TYPE_ORDER.indexOf(q.type || '应用题') < 0);
     if (rest.length) {
       let inner = '';
       rest.forEach(function (q, i) {

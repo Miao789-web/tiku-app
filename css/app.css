@@ -632,6 +632,21 @@ body[data-tab="off"] .tabbar { display: none; }
 }
 .gen-item .textarea { background: #fff; }
 
+/* ---------------- 讲评 · 对比分析 ---------------- */
+.cmp-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+@media (min-width: 560px) {
+  .cmp-grid { grid-template-columns: 1fr 1fr; }
+}
+.cmp-box {
+  background: var(--panel-2);
+  border: 1px solid #e3eaf8;
+  border-radius: 12px;
+  padding: 12px;
+}
+.cmp-box > b { font-size: 13px; color: var(--brand); }
+.cmp-text { white-space: pre-wrap; font-size: 14px; line-height: 1.7; margin: 6px 0 0; }
+.cmp-text.opt { color: var(--ink-2); }
+
 /* ---------------- 试卷（组卷 / 打印） ---------------- */
 .paper-wrap {
   background: #fff;

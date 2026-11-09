@@ -31,7 +31,7 @@ const AI = (function () {
       '【输出字段】',
       '- point：考点名（严格遵守上面规则）',
       '- solution：解题关键思路，一句话说明第一步想到什么，不超过 40 字',
-      '- type：选择题 / 填空题 / 判断题 / 计算题 / 解答题 / 应用题 之一',
+      '- type：选择题 / 填空题 / 判断题 / 计算题 / 应用题 / 操作题 之一',
       '- difficulty：1-3 的整数',
       '- answer：能确定就给出答案，否则空字符串',
       '- confidence：0-1，考点判断把握；不确定就给低分',
@@ -94,7 +94,7 @@ const AI = (function () {
   /* ---------------- 本地规则兜底 ---------------- */
   const RULES = [
     { re: /三角形[\s\S]{0,20}(面积|底|高)|面积[\s\S]{0,10}三角形/, point: '三角形面积求高',
-      solution: 'S=ah÷2，反解 h=2S÷a：先算 2S 再除以底（或 a=2S÷h）。', type: '解答题' },
+      solution: 'S=ah÷2，反解 h=2S÷a：先算 2S 再除以底（或 a=2S÷h）。', type: '应用题' },
     { re: /平行四边形/, point: '平行四边形面积', solution: 'S=ah，底×对应高，注意高要与底垂直。' },
     { re: /(长方形|正方形)[\s\S]{0,20}(面积|周长)|(面积|周长)[\s\S]{0,10}(长方形|正方形)/,
       point: '长方形与正方形的面积周长', solution: '先分清求面积（长×宽）还是周长（(长+宽)×2），再代数据。' },
@@ -134,7 +134,7 @@ const AI = (function () {
           return {
             point: r.point,
             solution: r.solution,
-            type: r.type || it.type || '解答题',
+            type: r.type || it.type || '应用题',
             difficulty: it.difficulty || 2,
             answer: it.answer || '',
             confidence: 0.74
@@ -144,7 +144,7 @@ const AI = (function () {
       return {
         point: '未分类',
         solution: '暂未识别出解题思路，请手动指定考点。',
-        type: it.type || '解答题',
+        type: it.type || '应用题',
         difficulty: it.difficulty || 2,
         answer: it.answer || '',
         confidence: 0.3
@@ -169,7 +169,7 @@ const AI = (function () {
         return {
           point: (o.point || '未分类').trim(),
           solution: (o.solution || '').trim(),
-          type: o.type || it.type || '解答题',
+          type: o.type || it.type || '应用题',
           difficulty: Util.clamp(Number(o.difficulty) || it.difficulty || 2, 1, 3),
           answer: o.answer || '',
           confidence: typeof o.confidence === 'number' ? o.confidence : 0.75
@@ -224,7 +224,7 @@ const AI = (function () {
           text: String(it.text || '').trim(),
           answer: String(it.answer || '').trim(),
           solution: String(it.solution || '').trim(),
-          type: question.type || '解答题',
+          type: question.type || '应用题',
           difficulty: question.difficulty || 2
         };
       }).filter(it => it.text);
