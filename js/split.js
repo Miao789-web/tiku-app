@@ -143,7 +143,7 @@ const Splitter = (function () {
     if (/计算|口算|竖式|脱式|解方程|直接写出得数|简便方法/.test(t)) return '计算题';
     if (/[=＝]/.test(t) && /[×÷]/.test(t)) return '计算题';
     if (/应用|多少|一共|还剩|平均|解决问题/.test(t)) return '应用题';
-    return '解答题';
+    return '应用题';
   }
 
   function detectDifficulty(q) {

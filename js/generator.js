@@ -32,9 +32,9 @@ const Generator = (function () {
         const au = '平方' + lu;
         return askH
           ? { text: `一个三角形的面积是 ${S} ${au}，底是 ${a} ${lu}，它的高是多少${lu}？`,
-              answer: `${h} ${lu}`, solution: `由 S=ah÷2 得 h=2S÷a=${2 * S}÷${a}=${h}（${lu}）。`, type: '解答题', difficulty: 2 }
+              answer: `${h} ${lu}`, solution: `由 S=ah÷2 得 h=2S÷a=${2 * S}÷${a}=${h}（${lu}）。`, type: '应用题', difficulty: 2 }
           : { text: `一个三角形的面积是 ${S} ${au}，高是 ${h} ${lu}，它的底是多少${lu}？`,
-              answer: `${a} ${lu}`, solution: `由 S=ah÷2 得 a=2S÷h=${2 * S}÷${h}=${a}（${lu}）。`, type: '解答题', difficulty: 2 };
+              answer: `${a} ${lu}`, solution: `由 S=ah÷2 得 a=2S÷h=${2 * S}÷${h}=${a}（${lu}）。`, type: '应用题', difficulty: 2 };
       }
     },
     {
@@ -45,10 +45,10 @@ const Generator = (function () {
         const au = '平方' + lu;
         if (Math.random() < 0.7) {
           return { text: `一个平行四边形的底是 ${a} ${lu}，高是 ${h} ${lu}，面积是多少${au}？`,
-            answer: `${a * h} ${au}`, solution: `S=ah=${a}×${h}=${a * h}。`, type: '解答题', difficulty: 1 };
+            answer: `${a * h} ${au}`, solution: `S=ah=${a}×${h}=${a * h}。`, type: '应用题', difficulty: 1 };
         }
         return { text: `一个平行四边形的面积是 ${a * h} ${au}，底是 ${a} ${lu}，高是多少${lu}？`,
-          answer: `${h} ${lu}`, solution: `h=S÷a=${a * h}÷${a}=${h}（${lu}）。`, type: '解答题', difficulty: 2 };
+          answer: `${h} ${lu}`, solution: `h=S÷a=${a * h}÷${a}=${h}（${lu}）。`, type: '应用题', difficulty: 2 };
       }
     },
     {
@@ -58,10 +58,10 @@ const Generator = (function () {
         const S = a * b, C = 2 * (a + b);
         if (Math.random() < 0.5) {
           return { text: `一块长方形菜地长 ${a} 米、宽 ${b} 米，它的面积是多少平方米？周长是多少米？`,
-            answer: `${S} 平方米；${C} 米`, solution: `面积=长×宽=${a}×${b}=${S}；周长=(长+宽)×2=(${a}+${b})×2=${C}。`, type: '解答题', difficulty: 1 };
+            answer: `${S} 平方米；${C} 米`, solution: `面积=长×宽=${a}×${b}=${S}；周长=(长+宽)×2=(${a}+${b})×2=${C}。`, type: '应用题', difficulty: 1 };
         }
         return { text: `一个长方形的面积是 ${S} 平方厘米，宽是 ${b} 厘米，长是多少厘米？`,
-          answer: `${a} 厘米`, solution: `长=面积÷宽=${S}÷${b}=${a}（厘米）。`, type: '解答题', difficulty: 2 };
+          answer: `${a} 厘米`, solution: `长=面积÷宽=${S}÷${b}=${a}（厘米）。`, type: '应用题', difficulty: 2 };
       }
     },
     {
@@ -70,10 +70,10 @@ const Generator = (function () {
         const r = ri(1, 10), C = Math.round(2 * 3.14 * r * 10) / 10, S = Math.round(3.14 * r * r * 100) / 100;
         if (Math.random() < 0.5) {
           return { text: `一个圆的半径是 ${r} 厘米，它的周长是多少厘米？（π 取 3.14）`,
-            answer: `${C} 厘米`, solution: `C=2πr=2×3.14×${r}=${C}（厘米）。`, type: '解答题', difficulty: 1 };
+            answer: `${C} 厘米`, solution: `C=2πr=2×3.14×${r}=${C}（厘米）。`, type: '应用题', difficulty: 1 };
         }
         return { text: `一个圆的直径是 ${2 * r} 厘米，它的面积是多少平方厘米？（π 取 3.14）`,
-          answer: `${S} 平方厘米`, solution: `r=${2 * r}÷2=${r}，S=πr²=3.14×${r}²=${S}（平方厘米）。`, type: '解答题', difficulty: 2 };
+          answer: `${S} 平方厘米`, solution: `r=${2 * r}÷2=${r}，S=πr²=3.14×${r}²=${S}（平方厘米）。`, type: '应用题', difficulty: 2 };
       }
     },
     {
@@ -81,7 +81,7 @@ const Generator = (function () {
       gen() {
         const a = ri(2, 9), b = ri(2, 9), c = ri(2, 9);
         return { text: `一个长方体木箱长 ${a} 分米、宽 ${b} 分米、高 ${c} 分米，它的体积是多少立方分米？`,
-          answer: `${a * b * c} 立方分米`, solution: `V=abh=${a}×${b}×${c}=${a * b * c}（立方分米）。`, type: '解答题', difficulty: 1 };
+          answer: `${a * b * c} 立方分米`, solution: `V=abh=${a}×${b}×${c}=${a * b * c}（立方分米）。`, type: '应用题', difficulty: 1 };
       }
     },
     {
@@ -275,7 +275,7 @@ const Generator = (function () {
         text: mutateNumbers(question.text),
         answer: '',
         solution: question.solution || '（请核对题目后填写思路与答案）',
-        type: question.type || '解答题',
+        type: question.type || '应用题',
         difficulty: question.difficulty || 2
       });
     }

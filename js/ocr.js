@@ -58,13 +58,41 @@ const OCR = (function () {
     return loading;
   }
 
-  async function recognizeTesseract(blob, onProgress) {
+  /** 把 tesseract 结果里的行（含 bbox）拍平：用于把红笔答案对到具体题目 */
+  function flatLines(data) {
+    const out = [];
+    try {
+      (data.blocks || []).forEach(function (b) {
+        (b.paragraphs || []).forEach(function (p) {
+          (p.lines || []).forEach(function (l) {
+            const txt = String(l.text || '').trim();
+            if (txt) {
+              const bb = l.bbox || {};
+              out.push({ text: txt, y: bb.y0 || 0, h: Math.max(0, (bb.y1 || 0) - (bb.y0 || 0)) });
+            }
+          });
+        });
+      });
+    } catch (e) { /* blocks 结构缺失时返回空数组 */ }
+    return out;
+  }
+
+  /** 带版面的识别：返回 { text, lines:[{text,y,h}] }；云 OCR / 异常时 lines 为空 */
+  async function recognizeLayout(blob, onProgress) {
+    const p = CONFIG.ocr.provider;
+    if (p === 'baidu' || p === 'tencent') return { text: await callProxy(p, blob), lines: [] };
+    if (p === 'manual') throw new Error('当前为手动录入模式');
     const w = await getWorker(onProgress);
     if (onProgress) onProgress(0.5, '正在识别文字');
     const enhanced = await ImageTool.enhanceForOCR(blob);
-    const res = await w.recognize(enhanced);
-    const text = (res && res.data && res.data.text) || '';
-    return tidy(text);
+    const res = await w.recognize(enhanced, {}, { text: true, blocks: true });
+    const data = (res && res.data) || {};
+    return { text: tidy(data.text || ''), lines: flatLines(data) };
+  }
+
+  async function recognizeTesseract(blob, onProgress) {
+    const lay = await recognizeLayout(blob, onProgress);
+    return lay.text;
   }
 
   /* 中文 OCR 常见问题：汉字之间被插入空格、全角数字字母、控制类乱码字符 */
@@ -181,7 +209,9 @@ const OCR = (function () {
 
   /**
    * 识别图里的红笔内容。src 可以是 Blob 或 dataURL。
-   * 返回 { found: boolean, text?: string, ratio? }；异常一律返回 found:false，不打断主流程。
+   * 返回 { found, text?, ratio?, items?: [{text, y, h}], height? }
+   * items 是红色字按「行的位置」拆开的结果（y 为原图坐标），用来把答案对到具体题目附近。
+   * 异常一律返回 found:false，不打断主流程。
    */
   async function redAnswer(src) {
     try {
@@ -204,15 +234,42 @@ const OCR = (function () {
       const w = await getWorker(null);
       await w.setParameters({ tessedit_char_whitelist: '0123456789./=+−×÷():：' });
       let text = '';
+      let lines = [];
       try {
-        const res = await w.recognize(crop);
+        const res = await w.recognize(crop, {}, { text: true, blocks: true });
         text = (res && res.data && res.data.text) || '';
+        // 行的 bbox 加上裁剪偏移 → 换算回整页坐标
+        lines = flatLines((res && res.data) || {}).map(function (l) {
+          return { text: l.text, y: by + l.y, h: l.h };
+        });
       } finally {
         try { await w.setParameters({ tessedit_char_whitelist: '' }); } catch (e) { /* 恢复失败不影响 */ }
       }
       text = String(text).replace(/[\s\u3000]+/g, ' ').replace(/^[^\d(（]+/, '').trim();
-      if (!/\d/.test(text)) return { found: true, text: '', ratio: m.ratio };
-      return { found: true, text: text, ratio: m.ratio };
+      if (!/\d/.test(text)) return { found: true, text: '', ratio: m.ratio, height: canvas.height };
+      // 把挨得很近的红字行并成一条答案（同一个答案可能被拆成两行）
+      const items = [];
+      lines
+        .filter(function (l) { return /\d/.test(l.text); })
+        .sort(function (a, b) { return a.y - b.y; })
+        .forEach(function (l) {
+          const last = items[items.length - 1];
+          const clean = String(l.text).replace(/[\s\u3000]+/g, ' ').trim();
+          if (last && l.y - (last.y + (last.h || 0)) < 42) {
+            last.text = (last.text + ' ' + clean).trim();
+            last.h = Math.max(last.h || 0, l.y + (l.h || 0) - last.y);
+          } else {
+            items.push({ text: clean, y: l.y, h: l.h || 0 });
+          }
+        });
+      // 拿不到行位置时：按识别文本里的片段均匀铺到整页，尽量还能对上题
+      if (!items.length) {
+        const parts = text.split(/\s+/).filter(function (x) { return /\d/.test(x); });
+        parts.forEach(function (tx, i) {
+          items.push({ text: tx, y: Math.round((i + 0.5) / Math.max(1, parts.length) * canvas.height), h: 0 });
+        });
+      }
+      return { found: true, text: text, ratio: m.ratio, items: items, height: canvas.height };
     } catch (e) {
       return { found: false, error: e && e.message };
     }
@@ -223,5 +280,5 @@ const OCR = (function () {
     worker = null; loading = null;
   }
 
-  return { recognize, redAnswer, redMaskOf, destroy, tidy };
+  return { recognize, recognizeLayout, redAnswer, redMaskOf, flatLines, destroy, tidy };
 })();

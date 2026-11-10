@@ -2139,16 +2139,19 @@
           }).join('') + '</div>'
         : '';
 
-      // 红笔答案检测：一般红笔标记的是答案，汇总提示（识别手写体仅供参考）
+      // 红笔答案检测：红字一般就是这道题的答案，已按位置填到对应题答案框（手写识别仅供参考）
       const redLines = [];
       (s.images || []).forEach(function (im) {
         if (im.redAns && im.redAns.found && im.redAns.text) redLines.push(im.redAns.text);
       });
+      const redFilled = S.drafts.filter(function (d) { return d.answerFromRed; }).length;
       const redCard = redLines.length
         ? '<section class="card" style="border-left:3px solid #e5484d;margin-bottom:10px">' +
             '<div class="card-h"><h3>🔍 识别到红笔标记</h3>' +
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:copyRed">复制</button></div>' +
-            '<p class="small muted">一般红笔写的是答案（手写识别仅供参考，请核对后填到各题的答案框）：</p>' +
+            '<p class="small muted">' + (redFilled
+              ? '已按位置把最可能的红笔答案填到 <b>' + redFilled + ' 道题</b>的答案框（带「✍ 红笔」标记），请逐题核对修改；没填的题就是没识别出来，直接手填即可。'
+              : '一般红笔写的是答案，但这次没对上具体题目（手写识别仅供参考），请核对后填到各题的答案框：') + '</p>' +
             '<p style="white-space:pre-wrap;font-size:14px;font-weight:600;color:#b3261e;margin-top:6px">' + esc(redLines.join('\n')) + '</p>' +
           '</section>'
         : '';
@@ -2159,15 +2162,16 @@
           : '<span class="chip brand tap" data-act="draft:point" data-i="' + i + '">' + esc(d.point || '选择考点') + ' ›</span>';
         const chipWarn = (!d.aiPending && d.needsConfirm)
           ? '<span class="chip warn">待确认</span>' : '';
+        const chipRed = d.answerFromRed ? '<span class="chip gray">✍ 红笔</span>' : '';
         const body = [d.text].concat(d.subs || [], d.options || []).join('\n');
         return '<article class="qcard' + (d.needsConfirm && !d.aiPending ? ' needs' : '') + '">' +
           '<div class="qcard-h">' +
-            '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipWarn +
+            '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipWarn + chipRed +
             '<span class="chip gray">' + esc(d.type) + '</span>' +
             '<span class="chip gray">难度 ' + d.difficulty + '</span>' +
           '</div>' +
           '<p class="qtext">' + esc(body) + '</p>' +
-          '<div class="field mt8" style="margin-bottom:0"><label>答案（选填）</label>' +
+          '<div class="field mt8" style="margin-bottom:0"><label>答案（选填' + (d.answerFromRed ? ' · 红笔识别，请核对' : '') + '）</label>' +
             '<input class="input" data-draft-ans="' + i + '" value="' + esc(d.answer || '') + '" placeholder="可留空，入库后随时补"></div>' +
           (d.images && d.images.length
             ? '<div class="dimg-list">' + d.images.map(function (src, k) {
@@ -3227,6 +3231,58 @@
     return swept;
   }
 
+  /** 归一化比较文本（去空格与常见标点），配红笔答案用 */
+  function normCmpText(s) {
+    return String(s || '').replace(/\s+/g, '').replace(/[，。；：、,.;:！？!?"'“”‘’（）()【】\[\]…—\-_]/g, '').toLowerCase();
+  }
+
+  /** 红笔答案 → 每题：红色字一般写在题目附近，按图片里的行位置归到它上面最近的那道题。
+   *  返回 { 题目下标: 答案文本 }；没有位置信息时按顺序均分兜底。 */
+  function assignRedAnswers(im, items) {
+    const reds = (im.redAns && im.redAns.found && (im.redAns.items || []).length)
+      ? im.redAns.items.filter(function (x) { return x && x.text; })
+      : [];
+    if (!reds.length || !items || !items.length) return {};
+    const lines = im.lines || [];
+    const height = (im.redAns && im.redAns.height) || 0;
+    // 1) 每题在图片里的起始 y：按阅读顺序在识别行里找文字匹配
+    let li = 0;
+    const qy = items.map(function (it) {
+      const key = normCmpText(it.text).slice(0, 8);
+      if (!key || !lines.length) return null;
+      for (let k = li; k < lines.length; k++) {
+        const ln = normCmpText(lines[k].text);
+        if (ln && (ln.indexOf(key) >= 0 || (ln.length >= 4 && key.indexOf(ln.slice(0, 6)) >= 0))) {
+          li = k + 1;
+          return lines[k].y;
+        }
+      }
+      return null;
+    });
+    // 2) 没匹配到位置的题：用已匹配的题线性插值，实在没有就按顺序均分
+    const known = [];
+    qy.forEach(function (y, i) { if (y != null) known.push(i); });
+    qy.forEach(function (y, i) {
+      if (y != null) return;
+      if (known.length >= 2) {
+        const before = known.filter(function (k) { return k < i; }).pop();
+        const after = known.filter(function (k) { return k > i; })[0];
+        if (before != null && after != null) { qy[i] = qy[before] + (qy[after] - qy[before]) * (i - before) / (after - before); return; }
+        if (before != null) { qy[i] = qy[before]; return; }
+        if (after != null) { qy[i] = Math.max(0, qy[after] - 1); return; }
+      }
+      qy[i] = height ? Math.round((i + 0.5) / items.length * height) : i;
+    });
+    // 3) 每条红字归到「起始位置在它上面且最近」的那道题；同一题多条就拼起来
+    const out = {};
+    reds.forEach(function (r) {
+      let best = 0;
+      qy.forEach(function (y, i) { if (y <= r.y) best = i; });
+      out[best] = out[best] ? (out[best] + ' ' + r.text) : r.text;
+    });
+    return out;
+  }
+
   function buildDrafts() {
     const s = S.session;
     const drafts = [];
@@ -3244,7 +3300,9 @@
       // 手动粘贴路径没有经过 OCR.tidy，这里统一清洗（幂等，重复调用无副作用）
       const items = Splitter.split(OCR.tidy ? OCR.tidy(im.text) : im.text);
       const docImgs = im.docImages || [];
-      items.forEach(function (it) {
+      // 红笔答案按位置归到对应题（没识别出答案的题留空，等老师填）
+      const redAt = assignRedAnswers(im, items);
+      items.forEach(function (it, k) {
         const found = docImgs.length ? stripImageMarkers(it, docImgs) : [];
         // 同一张图被多道题的占位符引用时，只归第一道题，其余题不再挂这张图
         const mine = found.filter(function (src) {
@@ -3252,10 +3310,12 @@
           assigned[src] = 1;
           return true;
         });
+        const redTxt = redAt[k] || '';
         drafts.push({
           key: Util.uid('d'), imgIndex: idx, no: it.no,
           text: it.text, subs: it.subs, options: it.options,
-          answer: it.answer, solution: it.solution,
+          answer: it.answer || redTxt, solution: it.solution,
+          answerFromRed: !it.answer && !!redTxt,
           type: it.type, difficulty: it.difficulty,
           images: mine,
           point: '', pointId: '', confidence: 0, needsConfirm: true, aiPending: true
@@ -3302,10 +3362,12 @@
       im.pct = 0;
       updateScanUI();
       try {
-        im.text = await OCR.recognize(im.blob, function (p) {
+        const lay = await OCR.recognizeLayout(im.blob, function (p) {
           im.pct = p;
           updateScanUI();
         });
+        im.text = (lay && lay.text) || '';
+        im.lines = (lay && lay.lines) || [];   // 行位置：把红笔答案对到具体题目用
         im.status = 'done';
         // 红笔答案识别（tesseract 模式下顺带做）：一般红笔标记的是答案
         if (im.blob && (!CONFIG.ocr.provider || CONFIG.ocr.provider === 'tesseract')) {
@@ -3562,6 +3624,56 @@
   }
 
   /* ---- 多选考点弹层：输入前几个字联想已有考点，可勾选多个；没得选再新建 ---- */
+  /** 核对层拖动排序：按住 ⋮⋮ 上下拖，松手后按新顺序保存（第一位=主分类） */
+  function ppmApplyOrder(keys) {
+    if (!S._ppm) return;
+    const old = S._ppm.sel, nu = {};
+    keys.forEach(function (k) { if (old[k]) nu[k] = old[k]; });
+    S._ppm.sel = nu;
+  }
+
+  function ppmWireDrag(root) {
+    if (!root || !S._ppm) return;
+    const box = root.querySelector('#ppmPts');
+    if (!box) return;
+    box.querySelectorAll('.drag-h').forEach(function (h) {
+      h.addEventListener('pointerdown', function (ev) {
+        if (ev.button != null && ev.button !== 0) return;
+        ev.preventDefault();
+        const row = h.closest('[data-ptkey]');
+        if (!row) return;
+        const sb = root.querySelector('.sheet-b');
+        const startScroll = sb ? sb.scrollTop : 0;
+        row.classList.add('dragging');
+        try { h.setPointerCapture(ev.pointerId); } catch (e) { /* 老浏览器忽略 */ }
+        const move = function (e) {
+          e.preventDefault();
+          const rows = Array.prototype.slice.call(box.querySelectorAll('[data-ptkey]')).filter(function (r) { return r !== row; });
+          let target = null;
+          for (let i = 0; i < rows.length; i++) {
+            const r = rows[i].getBoundingClientRect();
+            if (e.clientY < r.top + r.height / 2) { target = rows[i]; break; }
+          }
+          if (target) { if (row.nextSibling !== target) box.insertBefore(row, target); }
+          else if (box.lastElementChild !== row) box.appendChild(row);
+        };
+        const up = function () {
+          document.removeEventListener('pointermove', move);
+          document.removeEventListener('pointerup', up);
+          document.removeEventListener('pointercancel', up);
+          row.classList.remove('dragging');
+          const keys = Array.prototype.slice.call(box.querySelectorAll('[data-ptkey]')).map(function (r) { return r.dataset.ptkey; });
+          ppmApplyOrder(keys);
+          if (S._ppm) S._ppm.scroll = startScroll;
+          if (S._ppm) S._ppm.confirmSheet();
+        };
+        document.addEventListener('pointermove', move, { passive: false });
+        document.addEventListener('pointerup', up);
+        document.addEventListener('pointercancel', up);
+      });
+    });
+  }
+
   function pickPoints(currentNames, subject, grade) {
     return new Promise(async function (resolve) {
       const points = await Store.Points.listBy(subject, grade);
@@ -3569,7 +3681,7 @@
       (currentNames || []).forEach(function (n) {
         if (!n || n === '未分类') return;
         const hit = points.find(p => p.name === n);
-        if (hit) sel[hit.id] = { id: hit.id, name: hit.name, units: [] };
+        if (hit) sel[hit.id] = { id: hit.id, name: hit.name, units: (hit.units || []).slice() };
         else sel['n:' + n] = { id: '', name: n, units: [] };
       });
       S._ppm = { sel: sel, subject: subject, grade: grade, resolve: resolve, kw: '', points: points };
@@ -3600,7 +3712,7 @@
         return '<button class="btn primary grow" data-act="ppm:done"' + (n ? '' : ' disabled') + '>✓ 核对并完成（' +
           (n ? '主分类：' + esc(first ? first.name : '') + (n > 1 ? ' 等 ' + n + ' 个考点' : '') : '未选') + '）</button>';
       }
-      /* 确认弹层：保存前核对考点（主分类）与单元，可删除错误的项 */
+      /* 确认弹层：保存前核对考点（主分类）与单元，可删除错误的项、拖动排序 */
       S._ppm.confirmSheet = function () {
         const keys = Object.keys(S._ppm.sel);
         const unitsSet = [];
@@ -3609,9 +3721,11 @@
         });
         const ptsHtml = keys.map(function (k, i) {
           const it = S._ppm.sel[k];
-          return '<div class="list-item" style="align-items:center">' +
+          return '<div class="list-item ppm-pt" data-ptkey="' + esc(k) + '"' + (i === 0 ? ' data-first="1"' : '') + '>' +
+            '<span class="drag-h" title="按住拖动排序">⋮⋮</span>' +
             '<div class="li-main"><div class="li-t">' + (i === 0 ? '<span class="chip brand" style="margin-right:6px">主分类</span>' : '') + esc(it.name) + '</div>' +
             ((it.units || []).length ? '<div class="li-s">单元：' + esc(it.units.join('、')) + '</div>' : '<div class="li-s">未归入单元</div>') + '</div>' +
+            (i > 0 ? '<button class="small" data-act="ppmc:top" data-key="' + esc(k) + '">置顶</button>' : '') +
             '<button class="small del" data-act="ppmc:rm" data-key="' + esc(k) + '">移除</button></div>';
         }).join('');
         const unitsHtml = unitsSet.length
@@ -3621,14 +3735,23 @@
           : '<p class="muted small">不归入单元（题目只按考点归类）</p>';
         UI.sheet({
           title: '确认考点与单元',
-          body: '<p class="muted" style="margin-bottom:8px">保存前请核对：第一个考点是<b>主分类</b>（题目卡片显示的就是它），点「移除」可删掉错误的项；删掉主分类后，下一个考点会自动顶上。</p>' +
-            '<div class="field"><label>考点（' + keys.length + ' 个）</label>' + (ptsHtml || '<p class="muted small">还没有考点</p>') + '</div>' +
+          body: '<p class="muted" style="margin-bottom:8px">保存前请核对：<b>第一个考点是主分类</b>（题目卡片显示的就是它）。按住考点左边的 <b>⋮⋮</b> 可以拖动排序，拖到第一位就是主分类；「移除」可删掉不要的考点——<b>新旧考点都在这里，留一个或都留都由你定</b>。</p>' +
+            '<div class="field"><label>考点（' + keys.length + ' 个）</label>' +
+              '<div id="ppmPts">' + (ptsHtml || '<p class="muted small">还没有考点</p>') + '</div></div>' +
             '<div class="field"><label>归入单元（' + unitsSet.length + ' 个）</label>' + unitsHtml + '</div>' +
             ((S.session && S.session.unit) ? '<p class="muted small">练习章节：' + esc(S.session.unit) + '（这份练习所有题默认都归它，可在页面上修改）</p>' : '') +
             '<div class="row mt12" style="gap:8px">' +
               '<button class="btn ghost grow" data-act="ppmc:back">← 返回修改</button>' +
               '<button class="btn primary grow" data-act="ppmc:save"' + (keys.length ? '' : ' disabled') + '>✓ 完成保存</button>' +
-            '</div>'
+            '</div>',
+          onMount: function (root) {
+            ppmWireDrag(root);
+            if (S._ppm && S._ppm.scroll != null) {
+              const b = root.querySelector('.sheet-b');
+              if (b) b.scrollTop = S._ppm.scroll;
+              S._ppm.scroll = null;
+            }
+          }
         });
       };
       S._ppm.render = function (keepSearch) {
@@ -4198,16 +4321,55 @@
         ACTIONS['draft:edit']({ i: String(S.drafts.length - 1) });
       }, 60);
     },
-    'draft:edit': async function (d) {
+    'draft:edit': function (d) {
       const i = +d.i;
       const draft = S.drafts[i];
+      if (!draft) return;
       const body = [draft.text].concat(draft.subs || [], draft.options || []).join('\n');
-      const v = await UI.prompt({ title: '编辑第 ' + (i + 1) + ' 题', value: body, rows: 8 });
-      if (v == null) return;
-      draft.text = v.trim();
+      const typeOpts = CONFIG.questionTypes.map(function (t) {
+        return '<option' + ((draft.type || '') === t ? ' selected' : '') + '>' + t + '</option>';
+      }).join('');
+      const diffOpts = [1, 2, 3].map(function (n) {
+        return '<option value="' + n + '"' + (Number(draft.difficulty) === n ? ' selected' : '') + '>难度 ' + n + '</option>';
+      }).join('');
+      UI.sheet({
+        title: '编辑第 ' + (i + 1) + ' 题',
+        body: '<div class="field"><label>题干</label>' +
+            '<textarea class="textarea" id="deText" style="min-height:130px">' + esc(body) + '</textarea></div>' +
+          '<div class="field"><label>答案（选填）</label>' +
+            '<input class="input" id="deAns" value="' + esc(draft.answer || '') + '" placeholder="可留空，入库后随时补"></div>' +
+          '<div class="row" style="gap:8px">' +
+            '<div class="field" style="flex:1.4;margin:0"><label>题型（可改）</label>' +
+              '<select class="select" id="deType">' + typeOpts + '</select></div>' +
+            '<div class="field" style="flex:1;margin:0"><label>难度（可改）</label>' +
+              '<select class="select" id="deDiff">' + diffOpts + '</select></div>' +
+          '</div>' +
+          '<div class="field mt8"><label>解题思路（选填）</label>' +
+            '<textarea class="textarea" id="deSol" style="min-height:80px">' + esc(draft.solution || '') + '</textarea></div>' +
+          '<div class="row mt12" style="gap:8px">' +
+            '<button class="btn ghost grow" data-act="sheet:close">取消</button>' +
+            '<button class="btn primary grow" data-act="draft:editSave" data-i="' + i + '">保存修改</button></div>'
+      });
+    },
+    'draft:editSave': function (d) {
+      const i = +d.i;
+      const draft = S.drafts[i];
+      if (!draft) return;
+      const txt = ((document.getElementById('deText') || {}).value || '').trim();
+      if (!txt) { UI.toast('题干不能为空'); return; }
+      draft.text = txt;
       draft.subs = []; draft.options = [];
-      draft.type = Splitter.detectType(draft);
+      draft.answer = ((document.getElementById('deAns') || {}).value || '').trim();
+      draft.answerFromRed = false;
+      const t = (document.getElementById('deType') || {}).value;
+      if (t) draft.type = t;
+      const df = Number((document.getElementById('deDiff') || {}).value);
+      if (df) draft.difficulty = df;
+      draft.solution = ((document.getElementById('deSol') || {}).value || '').trim();
+      draft.needsConfirm = true;
+      UI.close();
       render();
+      UI.toast('已保存：' + draft.type + ' · 难度 ' + draft.difficulty);
     },
     'draft:split': async function (d) {
       const i = +d.i;
@@ -4761,7 +4923,11 @@
     'ppm:toggle': function (d) {
       if (!S._ppm) return;
       if (S._ppm.sel[d.key]) delete S._ppm.sel[d.key];
-      else S._ppm.sel[d.key] = { id: d.id || '', name: d.name, units: [] };
+      else {
+        // 勾选已有考点时带上它自己归属的单元（确认层能看到、能核对）
+        const hit = (S._ppm.points || []).find(function (p) { return d.id && p.id === d.id; });
+        S._ppm.sel[d.key] = { id: d.id || '', name: d.name, units: (hit && hit.units || []).slice() };
+      }
       // 原地刷新选中样式与底部计数（不重建弹层、不丢滚动）
       sheetRoot.querySelectorAll('[data-act="ppm:toggle"]').forEach(function (el) {
         const on = !!S._ppm.sel[el.dataset.key];
@@ -4817,6 +4983,15 @@
       if (!S._ppm) return;
       S._ppm.render(true);
     },
+    /* 核对层：把某个考点挪到第一位（成为主分类） */
+    'ppmc:top': function (d) {
+      if (!S._ppm || !S._ppm.sel[d.key]) return;
+      const keys = Object.keys(S._ppm.sel).filter(function (k) { return k !== d.key; });
+      ppmApplyOrder([d.key].concat(keys));
+      S._ppm.confirmSheet();
+      const it = S._ppm.sel[d.key];
+      UI.toast('已设为主分类：' + (it ? it.name : ''), 2000);
+    },
     'ppmc:save': function () {
       if (!S._ppm) return;
       const arr = Object.keys(S._ppm.sel).map(function (k) { return S._ppm.sel[k]; });
@@ -4858,14 +5033,14 @@
       const p = res.point;
       // 插入联想快照：本次弹层内输入前几个字立刻能搜到
       if (!S._ppm.points.some(function (x) { return x.id === p.id; })) S._ppm.points.push(p);
-      // 新建即切换：清掉其他勾选，只留新考点（主分类立即变为新考点）；想多挂可再勾选
-      S._ppm.sel = {};
+      // 新旧考点都保留：新选的追加在后面，进「核对考点」层后再决定删一个还是都留、拖动调主分类
       S._ppm.sel[p.id] = { id: p.id, name: p.name, units: units, lesson: lesson };
       // 确认页还没选章节时，把这道题默认归入新建考点所选的单元
       if (S.session && !S.session.unit && u0) S.session.unit = u0;
       if (el) el.value = '';
       S._ppm.render(true);
-      UI.toast((res.isNew ? '已新建并选用：' : '已选用：') + p.name + '（可再勾选其他考点一起挂）', 2600);
+      const n = Object.keys(S._ppm.sel).length;
+      UI.toast((res.isNew ? '已新建并选用：' : '已选用：') + p.name + (n > 1 ? '（原有 ' + (n - 1) + ' 个考点保留，核对时可删可留）' : ''), 2800);
     },
     'pp:pick': function (d) {
       const v = { name: d.name, id: d.id };
@@ -5381,12 +5556,14 @@
           '<div class="field"><label>解题思路</label>' +
             '<textarea class="textarea" id="qeSol" style="min-height:90px">' + esc(q.solution || '') + '</textarea></div>' +
           '<div class="row" style="gap:8px">' +
-            '<select class="select" id="qeType" style="flex:1">' + typeOpts + '</select>' +
-            '<select class="select" id="qeDiff" style="flex:1">' +
-              [1, 2, 3].map(function (n) {
-                return '<option value="' + n + '"' + (Number(q.difficulty) === n ? ' selected' : '') + '>难度 ' + n + '</option>';
-              }).join('') +
-            '</select>' +
+            '<div class="field" style="flex:1.4;margin:0"><label>题型（可改）</label>' +
+              '<select class="select" id="qeType">' + typeOpts + '</select></div>' +
+            '<div class="field" style="flex:1;margin:0"><label>难度（可改）</label>' +
+              '<select class="select" id="qeDiff">' +
+                [1, 2, 3].map(function (n) {
+                  return '<option value="' + n + '"' + (Number(q.difficulty) === n ? ' selected' : '') + '>难度 ' + n + '</option>';
+                }).join('') +
+              '</select></div>' +
           '</div>' +
           '<div class="row mt8" style="gap:8px">' +
             '<select class="select" id="qeUnit" style="flex:1">' + unitOpts + '</select>' +
@@ -6140,6 +6317,7 @@
     lessonAssignSheet: lessonAssignSheet, lessonEditSheet: lessonEditSheet,
     jpLoad: jpLoad, jpSave: jpSave, jpHas: jpHas, jpCmpSheet: jpCmpSheet, jpCmpBox: jpCmpBox,
     dcOpenDays: dcOpenDays, migrateQuestionTypes: migrateQuestionTypes,
+    assignRedAnswers: assignRedAnswers, normCmpText: normCmpText, ppmApplyOrder: ppmApplyOrder,
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints };
 
