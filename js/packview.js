@@ -62,9 +62,29 @@
       'align-items:center;justify-content:center;padding:10px}',
       '.pv-zoom.show{display:flex}',
       '.pv-zoom img{max-width:100%;max-height:100%;object-fit:contain}',
-      'body.big .pv-text{font-size:18.5px;line-height:1.8}',
-      'body.big .pv-opt{font-size:17px}',
-      'body.big .pv-ans,body.big .pv-sol{font-size:16.5px}',
+      '.pv-fs{flex:none;display:flex;align-items:center;gap:2px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:2px}',
+      '.pv-fs button{flex:none;width:30px;height:28px;padding:0;border:0;background:transparent;color:var(--ink2);',
+      'border-radius:7px;font-size:14px;font-weight:700}',
+      '.pv-fs button:active{background:var(--soft)}',
+      '.pv-fs button.off{opacity:.35}',
+      '.pv-fs span{min-width:30px;text-align:center;font-size:11px;color:var(--ink3);font-weight:600}',
+      /* 字号 0-5 档：文字、选项、答案、思路一起放大 */
+      'body.fs1 .pv-text{font-size:17px}',
+      'body.fs2 .pv-text{font-size:18.5px}',
+      'body.fs3 .pv-text{font-size:20px}',
+      'body.fs4 .pv-text{font-size:22px}',
+      'body.fs5 .pv-text{font-size:24px}',
+      'body.fs1 .pv-opt{font-size:15.5px}',
+      'body.fs2 .pv-opt{font-size:17px}',
+      'body.fs3 .pv-opt{font-size:18.5px}',
+      'body.fs4 .pv-opt{font-size:20px}',
+      'body.fs5 .pv-opt{font-size:22px}',
+      'body.fs1 .pv-ans,body.fs1 .pv-sol{font-size:15px}',
+      'body.fs2 .pv-ans,body.fs2 .pv-sol{font-size:16px}',
+      'body.fs3 .pv-ans,body.fs3 .pv-sol{font-size:17.5px}',
+      'body.fs4 .pv-ans,body.fs4 .pv-sol{font-size:19px}',
+      'body.fs5 .pv-ans,body.fs5 .pv-sol{font-size:21px}',
+      'body.fs1 .pv-text,body.fs2 .pv-text,body.fs3 .pv-text,body.fs4 .pv-text,body.fs5 .pv-text{line-height:1.85}',
       'body.hide-ans .pv-ans,body.hide-ans .pv-sol{display:none}',
       '@media print{.pv-bar{display:none}.pv-card{break-inside:avoid;box-shadow:none;border:1px solid var(--line)}}'
     ].join('');
@@ -130,7 +150,11 @@
         '</header>' +
         '<div class="pv-bar">' +
           '<button data-pv="ans" class="on">显示答案</button>' +
-          '<button data-pv="big">放大字号</button>' +
+          '<div class="pv-fs">' +
+            '<button data-pv="minus" aria-label="缩小字号">A−</button>' +
+            '<span id="pvFs">1/6</span>' +
+            '<button data-pv="plus" aria-label="放大字号">A＋</button>' +
+          '</div>' +
           '<button data-pv="print">打印</button>' +
         '</div>' +
         (main.length ? '<div class="pv-sec">讲评题 ' + main.length + ' 道</div>' + main.map(function (it, i) { return cardHtml(it, i + 1); }).join('') : '<div class="pv-sec">讲评题</div><article class="pv-card">这个包里没有题目</article>') +
@@ -145,6 +169,24 @@
 
     var zoom = root.querySelector('#pvZoom');
     var zoomImg = zoom.querySelector('img');
+
+    // 字号：6 档（1/6 ~ 6/6），记在本机，下次打开保持
+    var FS_MAX = 5;
+    var fsLv = 0;
+    try { fsLv = Math.max(0, Math.min(FS_MAX, parseInt(localStorage.getItem('pv.fs'), 10) || 0)); } catch (e) { fsLv = 0; }
+    var fsLabel = root.querySelector('#pvFs');
+    var minusBtn = root.querySelector('[data-pv="minus"]');
+    var plusBtn = root.querySelector('[data-pv="plus"]');
+    function applyFs() {
+      for (var i = 1; i <= FS_MAX; i++) document.body.classList.remove('fs' + i);
+      if (fsLv > 0) document.body.classList.add('fs' + fsLv);
+      if (fsLabel) fsLabel.textContent = (fsLv + 1) + '/' + (FS_MAX + 1);
+      if (minusBtn) minusBtn.classList.toggle('off', fsLv === 0);
+      if (plusBtn) plusBtn.classList.toggle('off', fsLv === FS_MAX);
+      try { localStorage.setItem('pv.fs', String(fsLv)); } catch (e) {}
+    }
+    applyFs();
+
     root.addEventListener('click', function (e) {
       var btn = e.target.closest('[data-pv]');
       if (btn) {
@@ -153,9 +195,10 @@
           document.body.classList.toggle('hide-ans');
           btn.classList.toggle('on', !document.body.classList.contains('hide-ans'));
           btn.textContent = document.body.classList.contains('hide-ans') ? '显示答案' : '隐藏答案';
-        } else if (k === 'big') {
-          document.body.classList.toggle('big');
-          btn.classList.toggle('on', document.body.classList.contains('big'));
+        } else if (k === 'plus') {
+          if (fsLv < FS_MAX) { fsLv++; applyFs(); }
+        } else if (k === 'minus') {
+          if (fsLv > 0) { fsLv--; applyFs(); }
         } else if (k === 'print') {
           window.print();
         }

@@ -34,6 +34,8 @@
     _lassMode: 'q',      // 改课时弹层：q=按题目、point=按考点
     _lassSel: {},        // 改课时弹层里已勾选的题目 id
     batch: { on: false, set: {} },   // 题库批量选择模式：set 为题目 id 集合
+    jpSel: { on: false, set: {} },   // 讲评页批量选择（标为已讲评）
+    jpLast: null,                    // 上一次「标为已讲评」的一批（供撤回）
     reviewCfg: { subject: '全部', scope: 'due', limit: 10 },
     review: null
   };
@@ -1658,13 +1660,15 @@
     const open = !!S.open[q.id];
     const url = S.imgUrls[q.id];
     const batch = !!opts.batch;
-    const sel = batch && !!S.batch.set[q.id];
+    const selSet = opts.selSet || S.batch.set;
+    const selAct = opts.selAct || 'batch:sel';
+    const sel = batch && !!selSet[q.id];
     // 标签 = 考点（主考点，多考点显示 +N） + 单元名 + 课时名
     const pts = qPointsOf(q);
     const mainUnit = qUnitsOf(q)[0] || '';
     const mainLesson = qLessonOf(q, mainUnit);
     // 卡片标签随时点都能直接编辑（批量模式除外——点卡片是勾选题目）
-    return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="batch:sel"' : '') + '>' +
+    return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="' + selAct + '"' : '') + '>' +
       '<div class="row between wrap" style="gap:6px;margin-bottom:8px">' +
         '<div class="row wrap" style="gap:6px">' +
           (batch ? '<span class="bcheck' + (sel ? ' on' : '') + '"></span>' : '') +
@@ -1709,7 +1713,7 @@
         '<button data-act="q:imgs" data-id="' + q.id + '">配图</button>' +
         '<button data-act="q:basket" data-id="' + q.id + '">' + (Paper.has(q.id) ? '✓ 已入卷' : '加入组卷') + '</button>' +
         '<button data-act="q:point" data-id="' + q.id + '">改考点</button>' +
-        '<button data-act="q:jp" data-id="' + q.id + '">' + (jpHas(q.id) ? '✓ 已讲评' : '讲评') + '</button>' +
+        '<button data-act="q:jp" data-id="' + q.id + '">' + (jpHas(q.id) ? '✓ 在讲评单' : '讲评') + '</button>' +
         (opts.extraOps || '') +
         '<button class="del" data-act="q:del" data-id="' + q.id + '">删除</button>' +
       '</div>') +
@@ -1924,31 +1928,80 @@
     '</div>';
   }
 
-  /** 同类对比：先列同考点，再列同题型 */
+  /* ---- 考点名相似度（v1.14.0）：共同文字越多越「类似」 ---- */
+  /** 两个考点名最长的一段共同文字（去掉「的、与、和」这类虚词再比） */
+  function pointCommon(a, b) {
+    const A = String(a || '').replace(/[\s的与和及了之其、，,·（）()“”"']/g, '');
+    const B = String(b || '').replace(/[\s的与和及了之其、，,·（）()“”"']/g, '');
+    let best = '';
+    const dp = [];
+    for (let x = 0; x <= A.length; x++) dp.push(new Array(B.length + 1).fill(0));
+    for (let x = 1; x <= A.length; x++) {
+      for (let y = 1; y <= B.length; y++) {
+        if (A.charAt(x - 1) === B.charAt(y - 1)) {
+          const n = dp[x - 1][y - 1] + 1;
+          dp[x][y] = n;
+          if (n > best.length) best = A.substr(x - n, n);
+        }
+      }
+    }
+    return best;
+  }
+  /** 题与题的考点相似度：取最像的一对考点名（共同文字越长越像） */
+  function pointSimOf(a, b) {
+    const an = qPointsOf(a).map(function (p) { return p.name; }).filter(Boolean);
+    const bn = qPointsOf(b).map(function (p) { return p.name; }).filter(Boolean);
+    let best = { score: 0, common: '', name: '' };
+    an.forEach(function (x) {
+      bn.forEach(function (y) {
+        const c = pointCommon(x, y);
+        if (c.length > best.score) best = { score: c.length, common: c, name: y };
+      });
+    });
+    return best;
+  }
+  /** 2 个字以上相同才算「类似」，避免「数」「图」这类单字到处命中 */
+  const SIM_MIN = 2;
+
+  /** 同类对比：同考点 → 类似考点（共同文字多的靠前）→ 同题型 */
   async function jpCmpSheet(qid) {
     const q = await DB.get('questions', qid);
     if (!q) return;
     S._jpCmpId = qid;
     const all = await Store.Questions.list({ type: q.type });
     const myPts = qPointsOf(q).map(p => p.id).filter(Boolean);
+    const myNames = qPointsOf(q).map(p => p.name).filter(Boolean);
     const others = all.filter(function (x) { return x.id !== q.id; });
-    const samePoint = myPts.length ? others.filter(x => qPointsOf(x).some(p => myPts.indexOf(p.id) >= 0)) : [];
-    const sameType = others.filter(x => samePoint.indexOf(x) < 0);
-    const rowHtml = function (x) {
+    const exact = [], sim = [], typeOnly = [];
+    others.forEach(function (x) {
+      const xp = qPointsOf(x);
+      const isExact = xp.some(function (p) { return (p.id && myPts.indexOf(p.id) >= 0) || myNames.indexOf(p.name) >= 0; });
+      if (isExact) { exact.push(x); return; }
+      const sr = pointSimOf(q, x);
+      if (sr.score >= SIM_MIN) { sim.push({ q: x, score: sr.score, common: sr.common }); return; }
+      typeOnly.push(x);
+    });
+    sim.sort(function (a, b) { return b.score - a.score || (b.q.createdAt || 0) - (a.q.createdAt || 0); });
+
+    const rowHtml = function (x, extra) {
       const pts = qPointsOf(x);
       return '<div class="list-item" data-act="jp:cmpShow" data-id="' + x.id + '">' +
         '<div class="li-main"><div class="li-t">' + esc(Util.cut(x.text, 36)) + '</div>' +
-        '<div class="li-s">' + esc(pts[0].name || '未分类') + ' · ' + esc(x.type || '') + ' · 难度 ' + esc(x.difficulty) + '</div></div>' +
+        '<div class="li-s">' + (extra ? extra + ' · ' : '') + esc(pts[0].name || '未分类') + ' · ' + esc(x.type || '') + ' · 难度 ' + esc(x.difficulty) + '</div></div>' +
         ARROW + '</div>';
     };
     const body =
-      '<p class="muted" style="margin-bottom:8px">当前题型：<b>' + esc(q.type || '') + '</b>。点一道题，和讲评题并排对比分析。</p>' +
-      (samePoint.length
-        ? '<div class="sec-title">同考点 · ' + samePoint.length + ' 道</div>' + samePoint.slice(0, 20).map(rowHtml).join('')
+      '<p class="muted" style="margin-bottom:8px">当前考点：<b>' + esc(myNames[0] || '未分类') + '</b>，题型：<b>' + esc(q.type || '') + '</b>。点一道题，和讲评题并排对比分析。</p>' +
+      (exact.length
+        ? '<div class="sec-title">同考点 · ' + exact.length + ' 道</div>' + exact.slice(0, 20).map(function (x) { return rowHtml(x); }).join('')
+        : '<div class="sec-title">同考点 · 0 道</div><div class="empty small" style="padding:10px 0">题库里还没有同考点的其他题</div>') +
+      (sim.length
+        ? '<div class="sec-title">类似考点 · ' + sim.length + ' 道（共同文字越多越靠前）</div>' +
+          sim.slice(0, 20).map(function (e) { return rowHtml(e.q, '共同「' + esc(e.common) + '」'); }).join('')
         : '') +
-      (sameType.length
-        ? '<div class="sec-title">同题型 · ' + sameType.length + ' 道</div>' + sameType.slice(0, 30).map(rowHtml).join('')
-        : '<div class="empty small" style="padding:16px 0">题库里还没有' + (samePoint.length ? '其他' : '') + '「' + esc(q.type || '') + '」的题</div>');
+      (typeOnly.length
+        ? '<div class="sec-title">同题型 · ' + typeOnly.length + ' 道</div>' + typeOnly.slice(0, 20).map(function (x) { return rowHtml(x); }).join('')
+        : '');
     UI.sheet({ title: '同类对比 · 选一道题', body: body });
   }
 
@@ -1999,15 +2052,18 @@
     const picks = [];
     mains.forEach(function (q) {
       const pts = qPointsOf(q).map(function (p) { return p.name; }).filter(Boolean);
-      const score = function (x) {
+      const rank = function (x) {
         const xp = qPointsOf(x).map(function (p) { return p.name; });
-        return (pts.length && xp.some(function (n) { return pts.indexOf(n) >= 0; })) ? 0 : 1;
+        if (pts.length && xp.some(function (n) { return pts.indexOf(n) >= 0; })) return 0;
+        const s2 = pointSimOf(q, x).score;
+        if (s2 >= SIM_MIN) return 1 + (20 - Math.min(20, s2));   // 共同文字多的靠前
+        return 30;
       };
       const pool = all.filter(function (x) {
         if (seen[x.id]) return false;
-        return score(x) === 0 || x.type === q.type;
+        return rank(x) < 30 || x.type === q.type;
       }).sort(function (a, b) {
-        return score(a) - score(b) || (b.createdAt || 0) - (a.createdAt || 0);
+        return rank(a) - rank(b) || (b.createdAt || 0) - (a.createdAt || 0);
       }).slice(0, 3);
       pool.forEach(function (x) {
         if (seen[x.id] || picks.length >= sameMax) return;
@@ -2110,9 +2166,13 @@
     tab: false,
     topbar() {
       const n = (S.cache.jpQs || []).length;
-      return backBtn() + '<div class="tb-title">讲评<div class="tb-sub">' + n + ' 道待讲评</div></div>' +
-        (n ? '<button class="tb-btn text" data-act="pack:open">生成包</button>' : '') +
-        (n ? '<button class="tb-btn text" data-act="jp:clear">清空</button>' : '');
+      const on = S.jpSel.on;
+      const sel = Object.keys(S.jpSel.set).length;
+      return backBtn() + '<div class="tb-title">讲评<div class="tb-sub">' +
+          (on ? '批量选择 · 已选 ' + sel + ' 题' : n + ' 道待讲评') + '</div></div>' +
+        (on ? '<button class="tb-btn text" data-act="jp:batch">退出</button>' : '') +
+        (!on && n ? '<button class="tb-btn text" data-act="jp:batch">批量</button>' : '') +
+        (!on && n ? '<button class="tb-btn text" data-act="pack:open">生成包</button>' : '');
     },
     async load() {
       const ids = jpLoad();
@@ -2126,19 +2186,38 @@
     },
     html() {
       const qs = S.cache.jpQs || [];
+      const last = S.jpLast
+        ? '<div class="row between" style="margin:14px 4px 0"><span class="muted" style="font-size:12.5px">刚标了 ' + S.jpLast.ids.length + ' 道已讲评</span>' +
+            '<button class="small" style="color:var(--brand);font-weight:600" data-act="jp:undone">↩ 撤回</button></div>'
+        : '';
       if (!qs.length) {
         return '<section class="card">' +
-          '<div class="empty"><b>还没有要讲评的题</b>在题库 / 全部题目里点题目卡下方的「讲评」按钮加入</div>' +
+          '<div class="empty"><b>还没有要讲评的题</b>在题库 / 全部题目里点题目卡下方的「讲评」按钮加入' +
+          (S.jpLast ? '<br>上一批已讲评 ' + S.jpLast.ids.length + ' 道，点下面可以撤回' : '') + '</div>' +
           '<button class="btn primary block mt12" data-act="goto" data-to="bank">去题库选题</button>' +
+          (S.jpLast ? '<button class="btn ghost block mt12" data-act="jp:undone">↩ 撤回上次讲评</button>' : '') +
         '</section>';
       }
-      return '<p class="muted" style="margin:2px 4px 10px">课上讲评：点每题的「同类对比」，从题库调出同考点 / 同题型的题并排对比分析。</p>' +
-        qs.map(function (q, i) {
+      const batch = S.jpSel.on;
+      return (batch
+          ? '<p class="muted" style="margin:2px 4px 10px">勾选这一课已经讲完的题（可多选），点底部「标为已讲评」一次移出讲评单。</p>'
+          : '<p class="muted" style="margin:2px 4px 10px">课上讲评：点每题的「同类对比」，从题库调出同考点 / 类似考点 / 同题型的题并排对比分析。</p>') +
+        qs.map(function (q) {
           return questionCard(q, {
+            batch: batch, selSet: S.jpSel.set, selAct: 'jp:sel',
             extraOps: '<button data-act="jp:cmp" data-id="' + q.id + '">同类对比</button>' +
               '<button class="del" data-act="jp:rm" data-id="' + q.id + '">移出讲评</button>'
           });
-        }).join('');
+        }).join('') +
+        (batch
+          ? '<div class="bottombar">' +
+              '<div class="bb-info">已选<br>' + Object.keys(S.jpSel.set).length + ' 题</div>' +
+              '<button class="btn ghost sm" data-act="jp:all">' +
+                (qs.length && qs.every(function (q) { return S.jpSel.set[q.id]; }) ? '取消全选' : '全选') + '</button>' +
+              '<button class="btn primary sm" data-act="jp:markDone"' + (Object.keys(S.jpSel.set).length ? '' : ' disabled') + '>标为已讲评</button>' +
+            '</div>'
+          : '<div class="row between" style="margin:16px 4px 0"><span class="muted" style="font-size:12.5px">共 ' + qs.length + ' 道待讲评</span>' +
+              '<button class="small" style="color:var(--ink-3)" data-act="jp:clear">清空讲评单</button></div>' + last);
     }
   };
 
@@ -6130,6 +6209,44 @@
       jpSave(ids);
       render();
     },
+    'jp:batch': function () {
+      S.jpSel.on = !S.jpSel.on;
+      S.jpSel.set = {};
+      render();
+    },
+    'jp:sel': function (d) {
+      if (S.jpSel.set[d.id]) delete S.jpSel.set[d.id];
+      else S.jpSel.set[d.id] = 1;
+      render();
+    },
+    'jp:all': function () {
+      const ids = (S.cache.jpQs || []).map(function (q) { return q.id; });
+      const all = ids.length && ids.every(function (id) { return S.jpSel.set[id]; });
+      if (all) ids.forEach(function (id) { delete S.jpSel.set[id]; });
+      else ids.forEach(function (id) { S.jpSel.set[id] = 1; });
+      render();
+    },
+    /* 批量标为已讲评：移出讲评单，留一批记录供撤回 */
+    'jp:markDone': async function () {
+      const ids = Object.keys(S.jpSel.set);
+      if (!ids.length) { UI.toast('先勾选题目'); return; }
+      jpSave(jpLoad().filter(function (x) { return ids.indexOf(x) < 0; }));
+      S.jpLast = { ids: ids, at: Date.now() };
+      S.jpSel.on = false; S.jpSel.set = {};
+      await PAGES.jp.load();
+      UI.toast('已标为已讲评 ' + ids.length + ' 道', 2600);
+      render();
+    },
+    'jp:undone': async function () {
+      if (!S.jpLast) { UI.toast('没有可撤回的讲评记录'); return; }
+      const ids = jpLoad();
+      S.jpLast.ids.forEach(function (id) { if (ids.indexOf(id) < 0) ids.unshift(id); });
+      jpSave(ids);
+      S.jpLast = null;
+      await PAGES.jp.load();
+      UI.toast('已撤回，题目回到讲评单');
+      render();
+    },
     'jp:rm': async function (d) {
       const ids = jpLoad().filter(function (x) { return x !== d.id; });
       jpSave(ids);
@@ -6180,6 +6297,7 @@
       const ok = await UI.confirm('清空讲评单？只移出讲评列表，题目本身不会删除。');
       if (!ok) return;
       jpSave([]);
+      S.jpSel.on = false; S.jpSel.set = {}; S.jpLast = null;
       await PAGES.jp.load();
       render();
     },
