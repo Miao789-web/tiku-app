@@ -1952,11 +1952,166 @@
     UI.sheet({ title: '同类对比 · 选一道题', body: body });
   }
 
+  /* =========================================================
+   * 讲评包（v1.13.0）
+   * 把讲评单里的题 + 同考点/同题型候选题，打包成一条链接（推到自己的
+   * GitHub Pages）或一个自包含 HTML 文件。链接页打开一次即离线可用。
+   * ======================================================= */
+  const PACK_SVC_KEY = 'tiku.pack.svc';
+  const PACK_KEEP_KEY = 'tiku.pack.keep';
+
+  function packServiceUrl() {
+    const v = localStorage.getItem(PACK_SVC_KEY) || (CONFIG.pack && CONFIG.pack.serviceUrl) || 'http://127.0.0.1:8787';
+    return String(v).replace(/\/+$/, '');
+  }
+  function packKeepDays() {
+    const n = Number(localStorage.getItem(PACK_KEEP_KEY));
+    return n > 0 ? n : ((CONFIG.pack && CONFIG.pack.keepDays) || 7);
+  }
+
+  function packItemOf(q, role) {
+    const us = qUnitsOf(q);
+    const u = us[0] || '';
+    return {
+      role: role,
+      id: q.id,
+      text: q.text || '',
+      options: (q.options || []).slice(),
+      answer: q.answer || '',
+      solution: q.solution || '',
+      type: q.type || '',
+      difficulty: q.difficulty || '',
+      unit: (u && u !== '未归类') ? u : '',
+      lesson: qLessonOf(q, u) || '',
+      points: qPointsOf(q).map(function (p) { return p.name; }).filter(Boolean),
+      images: (q.images || []).slice()
+    };
+  }
+
+  /** 组包：讲评单的题当主体，再补每道的同考点/同题型候选（最多 3 道/题，总数封顶） */
+  async function buildPack() {
+    const mains = (S.cache.jpQs || []).slice();
+    if (!mains.length) throw new Error('讲评单是空的，先在题库里点题目卡下面的「讲评」把题加进来');
+    const seen = {};
+    mains.forEach(function (q) { seen[q.id] = 1; });
+    const all = await Store.Questions.list({});
+    const sameMax = (CONFIG.pack && CONFIG.pack.sameMax) || 30;
+    const picks = [];
+    mains.forEach(function (q) {
+      const pts = qPointsOf(q).map(function (p) { return p.name; }).filter(Boolean);
+      const score = function (x) {
+        const xp = qPointsOf(x).map(function (p) { return p.name; });
+        return (pts.length && xp.some(function (n) { return pts.indexOf(n) >= 0; })) ? 0 : 1;
+      };
+      const pool = all.filter(function (x) {
+        if (seen[x.id]) return false;
+        return score(x) === 0 || x.type === q.type;
+      }).sort(function (a, b) {
+        return score(a) - score(b) || (b.createdAt || 0) - (a.createdAt || 0);
+      }).slice(0, 3);
+      pool.forEach(function (x) {
+        if (seen[x.id] || picks.length >= sameMax) return;
+        seen[x.id] = 1;
+        picks.push(x);
+      });
+    });
+    const items = mains.map(function (q) { return packItemOf(q, 'main'); })
+      .concat(picks.map(function (q) { return packItemOf(q, 'same'); }));
+    const first = mains[0];
+    let unit = qUnitsOf(first)[0] || '';
+    if (unit === '未归类') unit = '';
+    return {
+      title: (unit ? unitLabelOf(unit) + ' · ' : '') + '讲评包',
+      subject: first.subject || '',
+      grade: first.grade || '',
+      unit: unit,
+      items: items,
+      mainCount: mains.length,
+      sameCount: picks.length
+    };
+  }
+
+  function packBytes(p) {
+    let n = 0;
+    p.items.forEach(function (it) {
+      n += (it.text || '').length + (it.answer || '').length + (it.solution || '').length;
+      (it.images || []).forEach(function (src) { n += String(src).length; });
+    });
+    return n;
+  }
+
+  async function packSheet() {
+    let p;
+    try { p = await buildPack(); } catch (e) { UI.toast(e.message, 2600); return; }
+    S._pack = p;
+    const imgs = p.items.reduce(function (n, it) { return n + (it.images || []).length; }, 0);
+    const bytes = packBytes(p);
+    const mb = bytes / 1048576;
+    const keep = packKeepDays();
+    const keepChips = [3, 7, 15].map(function (d) {
+      return '<button class="tag' + (keep === d ? ' active' : '') + '" data-act="pack:keep" data-v="' + d + '">' + d + ' 天</button>';
+    }).join('');
+    const body = '' +
+      '<p class="muted" style="margin-bottom:10px">讲评题 <b>' + p.mainCount + '</b> 道 · 同类题 <b>' + p.sameCount +
+        '</b> 道 · 配图 <b>' + imgs + '</b> 张 · 约 <b>' + (mb >= 1 ? mb.toFixed(1) + ' MB' : Math.max(1, Math.round(bytes / 1024)) + ' KB') + '</b></p>' +
+      '<div class="field"><label>标题（显示在页面顶部）</label>' +
+        '<input class="input" id="packTitle" value="' + esc(p.title) + '"></div>' +
+      '<div class="field"><label>保留多久（到期自动从线上清掉）</label><div class="chips">' + keepChips + '</div></div>' +
+      '<button class="btn primary block" data-act="pack:link">🔗 生成链接（含二维码）</button>' +
+      '<p class="muted" style="margin:6px 0 14px">需要电脑上的题库服务在运行（本机 8787）。生成后教室电脑/手机打开链接，打开一次就会缓存，之后断网也能讲。</p>' +
+      '<button class="btn ghost block" data-act="pack:file">💾 导出单文件 HTML（离线兜底）</button>' +
+      '<p class="muted" style="margin:6px 0 0">手机或不方便开服务时用这个：一个 HTML 文件，用微信发到教室电脑，双击就能看，断网也不影响。</p>';
+    UI.sheet({ title: '生成讲评包', body: body });
+  }
+
+  function qrSvg(text) {
+    try {
+      if (typeof qrcode !== 'function') return '';
+      const q = qrcode(0, 'M');
+      q.addData(text);
+      q.make();
+      return q.createSvgTag({ cellSize: 5, margin: 2, scalable: true });
+    } catch (e) { return ''; }
+  }
+
+  function packResultSheet(res) {
+    const url = res.url || '';
+    const when = res.expiresAt ? PackView.fmt(res.expiresAt) : '';
+    const body = '' +
+      '<p class="muted" style="margin-bottom:8px">教室电脑或手机打开这条链接：</p>' +
+      '<input class="input code" id="packUrl" readonly value="' + esc(url) + '">' +
+      '<div class="row" style="gap:8px;margin:10px 0 6px">' +
+        '<button class="btn primary grow" data-act="pack:copy">复制链接</button>' +
+        '<a class="btn ghost grow" href="' + esc(url) + '" target="_blank" rel="noopener" style="text-align:center">现在打开</a>' +
+      '</div>' +
+      (qrSvg(url) ? '<div class="qr-wrap">' + qrSvg(url) + '<p class="muted">手机扫这个也能进</p></div>' : '') +
+      '<p class="muted" style="margin-top:10px">· 线上共 ' + res.packs + ' 个包，占用约 ' + res.sizeMB + ' MB' +
+        (when ? '，本包保留到 ' + when : '') + '</p>' +
+      '<p class="muted">· GitHub Pages 需要 30–90 秒生效，刚生成就打不开是正常的，等一会儿刷新。</p>' +
+      '<p class="muted">· 课前在教室电脑上打开一次，页面就会缓存，课上断网也能翻。</p>';
+    UI.sheet({ title: '讲评包已生成', body: body });
+  }
+
+  async function packExportFile() {
+    const p = S._pack;
+    if (!p) { UI.toast('先点「生成讲评包」'); return; }
+    const t = document.getElementById('packTitle');
+    if (t && t.value.trim()) p.title = t.value.trim();
+    let src = '';
+    try { src = await (await fetch('js/packview.js')).text(); } catch (e) { src = ''; }
+    const html = window.PackView && PackView.standalone
+      ? PackView.standalone(p, src)
+      : '<!doctype html><meta charset="utf-8"><h1>' + esc(p.title) + '</h1><p>打包失败</p>';
+    Util.download('讲评包-' + (p.unit || '本课') + '-' + Util.fmtDate(Date.now()) + '.html', html);
+    UI.toast('已导出，用微信发到教室电脑双击打开', 3000);
+  }
+
   PAGES.jp = {
     tab: false,
     topbar() {
       const n = (S.cache.jpQs || []).length;
       return backBtn() + '<div class="tb-title">讲评<div class="tb-sub">' + n + ' 道待讲评</div></div>' +
+        (n ? '<button class="tb-btn text" data-act="pack:open">生成包</button>' : '') +
         (n ? '<button class="tb-btn text" data-act="jp:clear">清空</button>' : '');
     },
     async load() {
@@ -5981,6 +6136,46 @@
       await PAGES.jp.load();
       render();
     },
+    /* ---- 讲评包 ---- */
+    'pack:open': function () { packSheet(); },
+    'pack:keep': function (d) {
+      localStorage.setItem(PACK_KEEP_KEY, String(d.v));
+      sheetRedraw(function () { packSheet(); });
+    },
+    'pack:link': async function () {
+      const p = S._pack;
+      if (!p) { UI.toast('先重新打开「生成讲评包」'); return; }
+      const t = document.getElementById('packTitle');
+      if (t && t.value.trim()) p.title = t.value.trim();
+      p.keepDays = packKeepDays();
+      UI.toast('正在打包并上传，稍等（首次会慢一点）…', 4000);
+      let j;
+      try {
+        const r = await fetch(packServiceUrl() + '/api/pack', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(p)
+        });
+        j = await r.json();
+      } catch (e) {
+        throw new Error('连不上电脑上的题库服务：请确认这台电脑上已运行 node server/ocr-proxy.mjs（或直接用下面的「导出单文件」）');
+      }
+      if (!j || j.error) throw new Error((j && j.error) || '生成失败');
+      packResultSheet(j);
+    },
+    'pack:file': async function () { await packExportFile(); },
+    'pack:copy': async function () {
+      const el = document.getElementById('packUrl');
+      if (!el) return;
+      try {
+        await navigator.clipboard.writeText(el.value);
+        UI.toast('链接已复制');
+      } catch (e) {
+        el.select();
+        UI.toast('已选中，按 Ctrl+C 复制');
+      }
+    },
+
     'jp:clear': async function () {
       const ok = await UI.confirm('清空讲评单？只移出讲评列表，题目本身不会删除。');
       if (!ok) return;

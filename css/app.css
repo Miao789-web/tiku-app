@@ -750,3 +750,11 @@ body[data-tab="off"] .tabbar { display: none; }
   margin-top: 12px; padding: 10px 0 6px;
   background: #fff; border-top: 1px solid var(--line);
 }
+
+/* ---------------- v1.13.0 讲评包 ---------------- */
+.qr-wrap { margin: 12px 0 4px; text-align: center; }
+.qr-wrap svg {
+  width: 180px; height: 180px; padding: 6px; background: #fff;
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.qr-wrap p { margin: 6px 0 0; font-size: 12px; color: var(--ink-3); }
