@@ -159,6 +159,7 @@ body[data-tab="off"] .view { padding-bottom: calc(92px + var(--safe-b)); }
 .chip.warn { background: var(--warn-soft); color: var(--warn); }
 .chip.ok { background: var(--ok-soft); color: var(--ok); }
 .chip.gray { background: #f2f4f9; color: var(--ink-3); }
+.chip.tap { cursor: pointer; }
 .chip.tap:active { opacity: .7; }
 
 .chips { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0 6px; scrollbar-width: none; }

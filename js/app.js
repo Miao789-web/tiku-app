@@ -1257,10 +1257,11 @@
   function knownLessonsOf(unit, subject, grade) {
     const out = [];
     const sbj = subject || S.defaults.subject, gd = grade || S.defaults.grade;
-    // 目录里配好的课时优先
+    // 目录里配好的课时优先：目录配了课时就只给目录课时（老师编辑目录后，重选课时只看到目录里的课时名）
     Catalog.lessonsOf(sbj, gd, S.defaults.term, S.defaults.version, unit || '').forEach(function (L) {
-      if (out.indexOf(L) < 0) out.push(L);
+      if (L && out.indexOf(L) < 0) out.push(L);
     });
+    if (out.length) return out;
     (S.cache.bankQ || []).forEach(function (q) {
       const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
       us.forEach(function (u, i) {
@@ -1518,15 +1519,16 @@
     const pts = qPointsOf(q);
     const mainUnit = qUnitsOf(q)[0] || '';
     const mainLesson = qLessonOf(q, mainUnit);
+    // 卡片标签随时点都能直接编辑（批量模式除外——点卡片是勾选题目）
     return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="batch:sel"' : '') + '>' +
       '<div class="row between wrap" style="gap:6px;margin-bottom:8px">' +
         '<div class="row wrap" style="gap:6px">' +
           (batch ? '<span class="bcheck' + (sel ? ' on' : '') + '"></span>' : '') +
-          (opts.hidePoint ? '' : '<span class="chip brand">' + esc(pts[0].name || '未分类') + (pts.length > 1 ? ' +' + (pts.length - 1) : '') + '</span>') +
+          (opts.hidePoint ? '' : '<span' + (batch ? ' class="chip brand"' : ' class="chip tap" data-act="q:point" data-id="' + q.id + '" title="点击修改考点"') + '>' + esc(pts[0].name || '未分类') + (pts.length > 1 ? ' +' + (pts.length - 1) : '') + '</span>') +
           (mainUnit && mainUnit !== '未归类' ? '<span class="chip gray">📖 ' + esc(mainUnit) + '</span>' : '') +
-          (mainLesson ? '<span class="chip gray">⏱ ' + esc(mainLesson) + '</span>' : '') +
-          '<span class="chip gray">' + esc(q.type) + '</span>' +
-          '<span class="chip gray">难度 ' + q.difficulty + '</span>' +
+          (mainLesson ? '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:lessonSel" data-id="' + q.id + '" title="点击修改课时"') + '>⏱ ' + esc(mainLesson) + '</span>' : '') +
+          '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:typeSel" data-id="' + q.id + '" title="点击修改题型"') + '>' + esc(q.type) + '</span>' +
+          '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:diffSel" data-id="' + q.id + '" title="点击修改难度"') + '>难度 ' + q.difficulty + '</span>' +
         '</div>' +
       '</div>' +
       '<p class="qtext" style="padding:0">' + esc(q.text) + '</p>' +
@@ -3404,7 +3406,7 @@
     const pending = S.drafts.filter(d => d.aiPending);
     if (!pending.length) return;
     S.aiFallback = AI.enabled() ? '' : '未配置大模型';
-    const s = S.session;
+    const s = S.session || S.defaults;
     const known = (await Store.Points.listBy(s.subject, s.grade)).map(p => p.name);
 
     // 逐批（每批 6 题）调用，避免超长上下文
@@ -4176,6 +4178,22 @@
   /* =========================================================
    * 动作表
    * ======================================================= */
+  /** 按 cf 分段结果替换第 i 道草稿（draft:split 与编辑保存里的 cf 拆分共用） */
+  function splitDraftAt(i, parts) {
+    const draft = S.drafts[i];
+    if (!draft) return;
+    const merged = parts.map(function (p, k) {
+      return Object.assign({}, draft, {
+        key: Util.uid('d'), no: p.no, text: p.text, subs: p.subs, options: p.options,
+        answer: p.answer, solution: p.solution, type: p.type, difficulty: p.difficulty,
+        // 配图只留给第一段且各自独立副本：防止拆分后几段共用同一数组，改一段的图影响其他段
+        images: k === 0 ? (draft.images || []).slice() : [],
+        aiPending: true
+      });
+    });
+    S.drafts.splice.apply(S.drafts, [i, 1].concat(merged));
+  }
+
   const ACTIONS = {
     'goto': function (d) { return navigate(d.to, d.id ? { id: d.id } : {}); },
     'back': back,
@@ -4344,19 +4362,33 @@
             '<div class="field" style="flex:1;margin:0"><label>难度（可改）</label>' +
               '<select class="select" id="deDiff">' + diffOpts + '</select></div>' +
           '</div>' +
-          '<div class="field mt8"><label>解题思路（选填）</label>' +
+          '<div class="field mt8"><div class="row between" style="align-items:center;margin-bottom:2px"><label>解题思路（选填，自动识别的思路可直接清空重写）</label>' +
+            '<button class="small muted" data-act="de:clearSol">清空思路</button></div>' +
             '<textarea class="textarea" id="deSol" style="min-height:80px">' + esc(draft.solution || '') + '</textarea></div>' +
           '<div class="row mt12" style="gap:8px">' +
             '<button class="btn ghost grow" data-act="sheet:close">取消</button>' +
             '<button class="btn primary grow" data-act="draft:editSave" data-i="' + i + '">保存修改</button></div>'
       });
     },
-    'draft:editSave': function (d) {
+    'draft:editSave': async function (d) {
       const i = +d.i;
       const draft = S.drafts[i];
       if (!draft) return;
       const txt = ((document.getElementById('deText') || {}).value || '').trim();
       if (!txt) { UI.toast('题干不能为空'); return; }
+      // 编辑里识别到独立一行的 cf → 先问要不要按它拆分；选「取消」就当普通文字保存
+      const parts = Splitter.splitByMarker(txt);
+      if (parts.length >= 2) {
+        const ok = await UI.confirm('识别到独立一行的 cf。要根据它把这道题拆成 ' + parts.length + ' 题吗？\n（取消则把 cf 当普通文字保存）');
+        if (ok) {
+          UI.close();
+          splitDraftAt(i, parts);
+          await render();
+          await classifyDrafts();
+          UI.toast('已拆成 ' + parts.length + ' 题');
+          return;
+        }
+      }
       draft.text = txt;
       draft.subs = []; draft.options = [];
       draft.answer = ((document.getElementById('deAns') || {}).value || '').trim();
@@ -4371,6 +4403,14 @@
       render();
       UI.toast('已保存：' + draft.type + ' · 难度 ' + draft.difficulty);
     },
+    'de:clearSol': function () {
+      const el = document.getElementById('deSol');
+      if (el) { el.value = ''; el.focus(); }
+    },
+    'qe:clearSol': function () {
+      const el = document.getElementById('qeSol');
+      if (el) { el.value = ''; el.focus(); }
+    },
     'draft:split': async function (d) {
       const i = +d.i;
       const draft = S.drafts[i];
@@ -4382,16 +4422,7 @@
       if (!v) return;
       const parts = Splitter.splitByMarker(v);
       if (parts.length < 2) { UI.toast('没有找到 cf 分隔符，未拆分'); return; }
-      const merged = parts.map(function (p, k) {
-        return Object.assign({}, draft, {
-          key: Util.uid('d'), no: p.no, text: p.text, subs: p.subs, options: p.options,
-          answer: p.answer, solution: p.solution, type: p.type, difficulty: p.difficulty,
-          // 配图只留给第一段且各自独立副本：防止拆分后几段共用同一数组，改一段的图影响其他段
-          images: k === 0 ? (draft.images || []).slice() : [],
-          aiPending: true
-        });
-      });
-      S.drafts.splice.apply(S.drafts, [i, 1].concat(merged));
+      splitDraftAt(i, parts);
       await render();
       await classifyDrafts();
     },
@@ -5553,7 +5584,8 @@
             '<textarea class="textarea" id="qeText" style="min-height:120px">' + esc(q.text) + '</textarea></div>' +
           '<div class="field"><label>答案</label>' +
             '<input class="input" id="qeAns" value="' + esc(q.answer || '') + '"></div>' +
-          '<div class="field"><label>解题思路</label>' +
+          '<div class="field"><div class="row between" style="align-items:center;margin-bottom:2px"><label>解题思路</label>' +
+            '<button class="small muted" data-act="qe:clearSol">清空思路</button></div>' +
             '<textarea class="textarea" id="qeSol" style="min-height:90px">' + esc(q.solution || '') + '</textarea></div>' +
           '<div class="row" style="gap:8px">' +
             '<div class="field" style="flex:1.4;margin:0"><label>题型（可改）</label>' +
@@ -5662,6 +5694,78 @@
         await render();
       };
       input.click();
+    },
+
+    /* ---- 卡片标签快捷编辑：课时 / 题型 / 难度（考点复用 q:point） ---- */
+    'q:lessonSel': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q) return;
+      const unit = qUnitsOf(q)[0] || q.unit || '';
+      const cur = qLessonOf(q, unit);
+      const choices = knownLessonsOf(unit, q.subject, q.grade); // 目录里配的课时优先（没配目录回退题库已用）
+      const chip = function (v, label) {
+        return '<button class="tag' + (cur === v ? ' active' : '') + '" data-act="q:lessonSet" data-id="' + q.id + '" data-v="' + esc(v) + '">' + esc(label || (v || '无')) + '</button>';
+      };
+      UI.sheet({
+        title: '改课时',
+        body: '<p class="muted" style="margin-bottom:8px">「' + esc(unit || '未归类') + '」下的课时' +
+          (choices.length ? '（来自教材目录，可在设置页「每单元的课时」里编辑）' : '还没在目录里配置——去设置页「每单元的课时」编辑后，这里就只列目录课时') + '。当前：' + (cur ? esc(cur) : '未标') + '</p>' +
+          '<div class="chips wrapv">' +
+          (choices.length ? choices.map(function (L) { return chip(L); }).join('') : '') +
+          chip('', cur ? '清除课时' : '无') +
+          '</div>'
+      });
+    },
+    'q:lessonSet': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q) return;
+      const us = qUnitsOf(q);
+      const unit = us[0] || q.unit || '';
+      const idx = us.indexOf(unit);
+      const v = (d.v || '').trim();
+      const lessons = us.map(function (u, i) { return i === idx ? v : qLessonOf(q, u); });
+      await Store.Questions.update(d.id, { lessons: lessons, lesson: idx === 0 ? v : (q.lesson || '') });
+      UI.close();
+      UI.toast(v ? '课时已改为「' + v + '」' : '已清除课时');
+      await render();
+    },
+    'q:typeSel': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q) return;
+      UI.sheet({
+        title: '改题型',
+        body: '<p class="muted" style="margin-bottom:8px">当前：' + esc(q.type) + '。点一个就改过去。</p>' +
+          '<div class="chips wrapv">' +
+          CONFIG.questionTypes.map(function (t) {
+            return '<button class="tag' + (q.type === t ? ' active' : '') + '" data-act="q:typeSet" data-id="' + q.id + '" data-v="' + esc(t) + '">' + esc(t) + '</button>';
+          }).join('') +
+          '</div>'
+      });
+    },
+    'q:typeSet': async function (d) {
+      await Store.Questions.update(d.id, { type: d.v });
+      UI.close();
+      UI.toast('题型已改为「' + d.v + '」');
+      await render();
+    },
+    'q:diffSel': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q) return;
+      UI.sheet({
+        title: '改难度',
+        body: '<p class="muted" style="margin-bottom:8px">当前：难度 ' + Number(q.difficulty) + '。点一档就改过去。</p>' +
+          '<div class="chips wrapv">' +
+          [1, 2, 3].map(function (n) {
+            return '<button class="tag' + (Number(q.difficulty) === n ? ' active' : '') + '" data-act="q:diffSet" data-id="' + q.id + '" data-v="' + n + '">难度 ' + n + '</button>';
+          }).join('') +
+          '</div>'
+      });
+    },
+    'q:diffSet': async function (d) {
+      await Store.Questions.update(d.id, { difficulty: Number(d.v) });
+      UI.close();
+      UI.toast('难度已改为 ' + Number(d.v));
+      await render();
     },
 
     'q:point': async function (d) {
