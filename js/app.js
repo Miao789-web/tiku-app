@@ -28,7 +28,11 @@
     dcalc: { showAns: false, t0: null, acc: 0, tick: null, base: '00:00' },  // 每日计算 UI 状态
     dcalcPick: '',        // 每日计算设置里临时选的年级
     dcalcDirty: false,
-    bank: { subject: '全部', grade: '全部', keyword: '', status: '全部', type: '全部', difficulty: '', unit: '', point: '', multiUnit: [], multiPoint: [] },
+    bank: { subject: '全部', grade: '全部', keyword: '', status: '全部', type: '全部', difficulty: '', unit: '', point: '', lesson: '', practice: '', ptype: '', page: '', multiUnit: [], multiPoint: [] },
+    imgSel: {},          // 配图弹层里已勾选的图下标
+    _bf: null,           // 筛选弹层的草稿状态
+    _lassMode: 'q',      // 改课时弹层：q=按题目、point=按考点
+    _lassSel: {},        // 改课时弹层里已勾选的题目 id
     batch: { on: false, set: {} },   // 题库批量选择模式：set 为题目 id 集合
     reviewCfg: { subject: '全部', scope: 'due', limit: 10 },
     review: null
@@ -78,6 +82,7 @@
     const data = {
       subject: s.subject, grade: s.grade, unit: s.unit || '',
       batchName: s.batchName || '', batchDate: s.batchDate || '',
+      practiceType: s.practiceType || '', pageNo: s.pageNo || '',
       pool: (s.imgPool || []).slice(),
       savedAt: Date.now(), drafts: plain
     };
@@ -1273,6 +1278,136 @@
     return out;
   }
 
+  /* ---- 练习名称 / 练习类型 / 页码 ----
+   * 老题目只有 batchName（如「数学练习册P23」）：没显式字段时按关键词推断类型、从名称里取页码，
+   * 这样以前录的题也能直接用新筛选，不用重新录。 */
+  function practiceNameOf(q) { return String((q && q.batchName) || '').trim(); }
+  function practiceTypeOf(q) {
+    if (!q) return '';
+    if (q.practiceType) return q.practiceType;
+    const n = practiceNameOf(q);
+    if (!n) return '';
+    if (/口算/.test(n)) return '口算本';
+    if (/练习册|补充习题|配套|作业本/.test(n)) return '配套练习册';
+    if (/卷|测试|考试|单元/.test(n)) return '单元测试';
+    if (/课本|教材/.test(n)) return '课本习题';
+    return '';
+  }
+  function pageNoOf(q) {
+    if (q && q.pageNo) return String(q.pageNo).replace(/^[Pp]\.?\s*/, '');
+    const m = practiceNameOf(q).match(/[Pp]\.?\s*(\d{1,3})/);
+    return m ? m[1] : '';
+  }
+  /** 中文数字（1-99），单元标题用 */
+  function cnNum(n) {
+    n = Number(n);
+    if (!n || n < 0) return '';
+    const d = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    if (n < 10) return d[n];
+    if (n === 10) return '十';
+    if (n < 20) return '十' + d[n % 10];
+    if (n < 100) return d[Math.floor(n / 10)] + '十' + (n % 10 ? d[n % 10] : '');
+    return String(n);
+  }
+  /** 单元卡标题：「第几单元」用汉字 + 单元名（如 第三单元 · 小数除法）；不在目录里就原样显示 */
+  function unitLabelOf(unit, subject, grade) {
+    if (!unit || unit === '未归类') return unit || '';
+    const sbj = subject || (S.bank && S.bank.subject !== '全部' ? S.bank.subject : S.defaults.subject);
+    const gd = grade || (S.bank && S.bank.grade !== '全部' ? S.bank.grade : S.defaults.grade);
+    const cat = Catalog.get(sbj, gd, S.defaults.term, S.defaults.version);
+    const i = cat.indexOf(unit);
+    return i >= 0 ? '第' + cnNum(i + 1) + '单元 · ' + unit : unit;
+  }
+
+  /* ---- 一键撤销 / 恢复 ----
+   * 只针对题目数据：操作前抓一份原样（before），操作后再抓一份（after）；
+   * 撤销 = 把 before 写回，恢复 = 把 after 写回 —— 删掉的题会整条回来。 */
+  const Undo = (function () {
+    const CAP = 20;
+    const stack = [];
+    let idx = -1;
+    async function snap(ids) {
+      const m = {};
+      for (const id of (ids || [])) m[id] = (await DB.get('questions', id)) || null;
+      return m;
+    }
+    async function begin(ids) { return await snap([].concat(ids || [])); }
+    async function end(label, before) {
+      const ids = Object.keys(before || {});
+      if (!ids.length) return false;
+      const after = await snap(ids);
+      let changed = false;
+      for (const id of ids) {
+        if (JSON.stringify(before[id]) !== JSON.stringify(after[id])) { changed = true; break; }
+      }
+      if (!changed) return false;
+      stack.splice(idx + 1);
+      stack.push({ label: label || '操作', before: before, after: after });
+      if (stack.length > CAP) stack.shift();
+      idx = stack.length - 1;
+      return true;
+    }
+    async function write(map) {
+      for (const id of Object.keys(map)) {
+        if (map[id]) await DB.put('questions', map[id]);
+        else await DB.del('questions', id);
+      }
+      try { await Store.Points.recount(); } catch (e) { /* 计数失败不影响撤销 */ }
+    }
+    async function undo() {
+      if (idx < 0) return false;
+      const e = stack[idx];
+      await write(e.before);
+      idx--;
+      return e.label;
+    }
+    async function redo() {
+      if (idx >= stack.length - 1) return false;
+      const e = stack[idx + 1];
+      await write(e.after);
+      idx++;
+      return e.label;
+    }
+    function state() {
+      return {
+        canUndo: idx >= 0, canRedo: idx < stack.length - 1,
+        undoLabel: idx >= 0 ? stack[idx].label : '',
+        redoLabel: idx < stack.length - 1 ? stack[idx + 1].label : ''
+      };
+    }
+    function clear() { stack.length = 0; idx = -1; }
+    return { begin: begin, end: end, undo: undo, redo: redo, state: state, clear: clear };
+  })();
+
+  /* ---- 筛选条件（练习名称 → 练习类型 / 页码 / 单元 / 课时 / 考点 / 题型 / 难度）
+   * 每项都是「有选就缩小范围，没选就不限」 */
+  function matchFilter(q, f) {
+    f = f || {};
+    if (f.practice && practiceNameOf(q) !== f.practice) return false;
+    if (f.ptype && practiceTypeOf(q) !== f.ptype) return false;
+    if (f.page && pageNoOf(q) !== String(f.page)) return false;
+    if (f.unit && qUnitsOf(q).indexOf(f.unit) < 0) return false;
+    if (f.lesson) {
+      const hit = qUnitsOf(q).some(function (u) {
+        return (!f.unit || u === f.unit) && qLessonOf(q, u) === f.lesson;
+      });
+      if (!hit) return false;
+    }
+    if (f.point && !qPointsOf(q).some(function (p) { return p.name === f.point; })) return false;
+    if (f.type && f.type !== '全部' && q.type !== f.type) return false;
+    if (f.difficulty && String(q.difficulty) !== String(f.difficulty)) return false;
+    return true;
+  }
+  function filterQuestions(qs, f) {
+    return (qs || []).filter(function (q) { return matchFilter(q, f); });
+  }
+  function hasFilter(f) {
+    f = f || {};
+    return !!(f.practice || f.ptype || f.page || f.unit || f.lesson || f.point ||
+      (f.type && f.type !== '全部') || f.difficulty ||
+      (f.multiUnit && f.multiUnit.length) || (f.multiPoint && f.multiPoint.length));
+  }
+
   /* ---- 目录课时 · 自动配对与自动归类 ----
    * 1) syncCatalogLessons：题库里某单元已经用过的课时，自动配对进教材目录（老师可在设置里改）；
    * 2) autoAssignLessons：目录里配好课时后，按「考点名 ↔ 课时名」自动把没课时的题归到课时，
@@ -1433,6 +1568,15 @@
    * ======================================================= */
   const MAIN_PAGES = ['home', 'bank', 'review', 'settings'];
 
+  /** 顶栏的一键撤销 / 恢复（题库、全部题目页共用） */
+  function undoBtnsHtml() {
+    const st = Undo.state();
+    return '<button class="tb-btn mini" data-act="undo:do" aria-label="撤销"' +
+        ' title="' + (st.canUndo ? '撤销：' + esc(st.undoLabel) : '还没有可撤销的操作') + '">↶</button>' +
+      '<button class="tb-btn mini" data-act="undo:redo" aria-label="恢复"' +
+        ' title="' + (st.canRedo ? '恢复：' + esc(st.redoLabel) : '还没有可恢复的操作') + '">↷</button>';
+  }
+
   async function navigate(page, params, replace) {
     // 确认页未入库就离开：先问要不要存草稿
     if (S.page === 'confirm' && page !== 'confirm' && S.session && S.drafts.length) {
@@ -1572,10 +1716,11 @@
     '</article>';
   }
 
-  /** 批量分配 / 修改课时：按考点列出该单元的题。
-   *  还没课时的题（待分配）：点课时（或「无」）一次归入；
-   *  已分好课时的（可修改）：显示当前课时，点别的课时即改过去。 */
+  /** 批量分配 / 修改课时：两种模式
+   *  「按题目」：列出每道题的题干（看得出是哪题），勾选一批后点课时一次改；
+   *  「按考点整批」：还没课时的点课时归入，已分好的点课时可改。 */
   function lessonAssignSheet(unit) {
+    S._lassUnit = unit;
     const unitQs = (S.cache.bankQ || []).filter(function (q) {
       return qUnitsOf(q).indexOf(unit) >= 0;
     });
@@ -1587,6 +1732,51 @@
       return (q.lessons && q.lessons[idx]) || (idx === 0 && q.lesson) || '';
     };
     const pendingQs = unitQs.filter(function (q) { return unassignedOf(q, unit); });
+    const mode = S._lassMode || 'q';
+    const modeChips = '<div class="chips" style="margin-bottom:10px">' +
+      '<button class="tag' + (mode === 'q' ? ' active' : '') + '" data-act="bank:lassMode" data-v="q" data-unit="' + esc(unit) + '">按题目选</button>' +
+      '<button class="tag' + (mode === 'point' ? ' active' : '') + '" data-act="bank:lassMode" data-v="point" data-unit="' + esc(unit) + '">按考点整批</button>' +
+      '</div>';
+
+    /* ---------- 按题目：勾题 → 点课时 ---------- */
+    if (mode === 'q') {
+      const sel = S._lassSel || {};
+      const selIds = Object.keys(sel).filter(function (id) { return sel[id]; });
+      const rows = unitQs.map(function (q) {
+        const cur = lessonOfIn(q);
+        const text = String(q.text || '').replace(/\s+/g, ' ').trim();
+        return '<div class="lass-row' + (sel[q.id] ? ' on' : '') + '" data-act="bank:lassSel" data-id="' + q.id + '">' +
+          '<span class="bcheck' + (sel[q.id] ? ' on' : '') + '"></span>' +
+          '<div class="lass-main">' +
+            '<div class="lass-text">' + esc(text.slice(0, 90)) + (text.length > 90 ? '…' : '') + '</div>' +
+            '<div class="lass-meta">' + esc(qPointsOf(q).map(function (p) { return p.name; }).join('、') || '未分类') +
+              ' · ' + (cur ? '课时 ' + esc(cur) : '<span style="color:var(--warn)">未分课时</span>') + '</div>' +
+          '</div></div>';
+      }).join('');
+      const lessonBtns = lessons.map(function (L) {
+        return '<button class="tag' + (selIds.length ? '' : ' dim') + '" data-act="bank:lassApply" data-unit="' + esc(unit) + '" data-v="' + esc(L) + '">' + esc(L) + '</button>';
+      }).join('') +
+        '<button class="tag' + (selIds.length ? '' : ' dim') + '" data-act="bank:lassApply" data-unit="' + esc(unit) + '" data-v="无">无</button>';
+      const body =
+        '<p class="muted" style="margin-bottom:8px">「' + esc(unitLabelOf(unit)) + '」共 ' + unitQs.length + ' 题，' + pendingQs.length + ' 题还没分课时。' +
+          '勾选要改的题（可以多选），再点下面的课时——一次改完。</p>' +
+        modeChips +
+        (unitQs.length ? rows : '<div class="empty">这个单元还没有题目</div>') +
+        (lessons.length
+          ? '<div class="lass-bar">' +
+              '<div class="row between" style="margin-bottom:8px">' +
+                '<span class="small" style="font-weight:600">已选 ' + selIds.length + ' 题</span>' +
+                '<span class="row" style="gap:8px">' +
+                  '<button class="small" style="color:var(--brand);font-weight:600" data-act="bank:lassAll" data-unit="' + esc(unit) + '" data-v="1">全选</button>' +
+                  '<button class="small" style="color:var(--ink-3)" data-act="bank:lassAll" data-unit="' + esc(unit) + '" data-v="">清空</button>' +
+                '</span>' +
+              '</div>' +
+              '<div class="chips wrapv" style="margin:0">' + lessonBtns + '</div>' +
+            '</div>'
+          : '<div class="empty" style="padding:14px 0">这个单元还没配课时——去「我的 → 设置 → 每单元的课时」里配好，这里就能按课时改了</div>');
+      UI.sheet({ title: '改课时 · ' + unitLabelOf(unit), body: body });
+      return;
+    }
 
     // 待分配：按考点列出
     const byPending = {};
@@ -1637,7 +1827,7 @@
         '<span class="muted" style="font-size:12px">' + e.count + ' 题 · 当前：' + (cur || '未标') + '，点课时改成：</span>' + chips + '</div></div>';
     }).join('');
 
-    let body = '';
+    let body = modeChips;
     if (pendingQs.length) {
       body += '<p class="muted" style="margin-bottom:8px">「' + esc(unit) + '」还有 ' + pendingQs.length + ' 题没分课时。系统按考点判断不出的，在这里按考点批量归：点一个课时，该考点下这些题就都归到那个课时；点「无」表示明确不按课时分。</p>' +
         '<div class="sec-title">待分配</div>' + pendingRows;
@@ -1646,7 +1836,21 @@
     }
     if (doneRows) body += '<div class="sec-title">已分配 · 点课时可改</div>' + doneRows;
     if (!pendingRows && !doneRows) body += '<div class="empty">这个单元还没有题目</div>';
-    UI.sheet({ title: '分配课时 · ' + unit, body: body });
+    UI.sheet({ title: '分配课时 · ' + unitLabelOf(unit), body: body });
+  }
+
+  /** 把一批题在某个单元下的课时统一改成 v（v='无' 表示明确不按课时分） */
+  async function setLessonForQuestions(ids, unit, v) {
+    for (const id of (ids || [])) {
+      const q = await DB.get('questions', id);
+      if (!q) continue;
+      const us = qUnitsOf(q);
+      const i = us.indexOf(unit);
+      if (i < 0) continue;
+      const ls = qLessonsOf(q);
+      ls[i] = v;
+      await Store.Questions.update(id, { lessons: ls, lesson: ls.filter(function (x) { return x && x !== '无'; })[0] || ls[0] || '' });
+    }
   }
 
   /** 编辑某单元的课时列表（设置页「每单元的课时」→ ✎） */
@@ -2223,6 +2427,15 @@
           '<div class="field"><label>练习名称</label>' +
             '<input class="input" id="batchName" placeholder="如：数学练习册P23" value="' + esc(s.batchName || '') + '">' +
           '</div>' +
+          '<div class="field"><label>练习类型（选填，题库按它筛题）</label><div class="chips wrapv">' +
+            CONFIG.practiceTypes.map(function (t) {
+              return '<button class="tag' + (s.practiceType === t ? ' active' : '') + '" data-act="confirm:ptype" data-v="' + esc(t) + '">' + esc(t) + '</button>';
+            }).join('') +
+            '<button class="tag' + (!s.practiceType ? ' active' : '') + '" data-act="confirm:ptype" data-v="">不标注</button>' +
+          '</div></div>' +
+          '<div class="field"><label>页码（选填，如 P23 就填 23）</label>' +
+            '<input class="input" id="batchPage" inputmode="numeric" placeholder="如：23" value="' + esc(s.pageNo || '') + '">' +
+          '</div>' +
         '</section>' +
         (S.aiFallback
           ? '<div class="card flat" style="background:var(--warn-soft);border-color:#ffe3b8;margin-bottom:10px">' +
@@ -2267,6 +2480,13 @@
       if (bl) {
         bl.addEventListener('input', function () {
           if (S.session) S.session.lesson = bl.value.trim();
+        });
+      }
+      // 页码（选填）：输入即写回会话
+      const bp = document.getElementById('batchPage');
+      if (bp) {
+        bp.addEventListener('input', function () {
+          if (S.session) S.session.pageNo = bp.value.replace(/^[Pp]\.?\s*/, '').trim();
         });
       }
     }
@@ -2360,6 +2580,7 @@
       const n = Paper.count();
       return '<div class="tb-title">题库' +
         '<div class="tb-sub">章节 → 考点</div></div>' +
+        undoBtnsHtml() +
         '<button class="tb-btn text" data-act="goto" data-to="paper">组卷' + (n ? '·' + n : '') + '</button>' +
         '<button class="tb-btn text" data-act="bank:batch">' + (S.batch.on ? '退出' : '批量') + '</button>' +
         '<button class="tb-btn" data-act="cap:start" aria-label="录题">' +
@@ -2403,10 +2624,14 @@
           '<button class="tag" data-act="goto" data-to="jp">讲评' + (jpLoad().length ? ' · ' + jpLoad().length : '') + '</button>' +
           '<button class="tag" data-act="bank:filter">更多筛选</button>' +
         '</div>' +
-        ((b.unit || b.point)
+        (hasFilter(b)
           ? '<div class="row between" style="margin:2px 4px 8px">' +
               '<span class="row wrap" style="gap:6px">' +
-                (b.unit ? '<span class="chip brand">章节：' + esc(b.unit) + '</span>' : '') +
+                (b.practice ? '<span class="chip brand">练习：' + esc(b.practice) + '</span>' : '') +
+                (b.ptype ? '<span class="chip brand">类型：' + esc(b.ptype) + '</span>' : '') +
+                (b.page ? '<span class="chip brand">页码：P' + esc(b.page) + '</span>' : '') +
+                (b.unit ? '<span class="chip brand">章节：' + esc(unitLabelOf(b.unit)) + '</span>' : '') +
+                (b.lesson ? '<span class="chip brand">课时：' + esc(b.lesson) + '</span>' : '') +
                 (b.point ? '<span class="chip brand">考点：' + esc(b.point) + '</span>' : '') +
               '</span>' +
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="bank:clear">清除</button>' +
@@ -2436,24 +2661,30 @@
         return [q.text, q.pointName, q.solution, q.answer, q.type, q.unit].join(' ').toLowerCase().indexOf(kw) >= 0;
       });
     }
-    const browsing = !kw && b.status === '全部' && b.type === '全部' && !b.difficulty &&
-      !b.unit && !b.point && !(b.multiUnit && b.multiUnit.length) && !(b.multiPoint && b.multiPoint.length);
+    // 统一走筛选条件（练习名称/类型/页码/单元/课时/考点/题型/难度），每项有选就缩小范围
+    qs = filterQuestions(qs, b);
+    if (b.multiUnit && b.multiUnit.length) qs = qs.filter(q => qUnitsOf(q).some(u => b.multiUnit.indexOf(u) >= 0));
+    if (b.multiPoint && b.multiPoint.length) qs = qs.filter(q => qPointsOf(q).some(p => b.multiPoint.indexOf(p.name) >= 0));
+    const browsing = !kw && !hasFilter(b);
 
     // 1) 搜索 / 筛选 → 题目列表（一题挂多个考点/单元：任一命中即显示）
     if (!browsing) {
-      let list = qs;
-      if (b.multiUnit && b.multiUnit.length) list = list.filter(q => qUnitsOf(q).some(u => b.multiUnit.indexOf(u) >= 0));
-      else if (b.unit) list = list.filter(q => qUnitsOf(q).indexOf(b.unit) >= 0);
-      if (b.multiPoint && b.multiPoint.length) list = list.filter(q => qPointsOf(q).some(p => b.multiPoint.indexOf(p.name) >= 0));
-      else if (b.point) list = list.filter(q => qPointsOf(q).some(p => p.name === b.point));
+      const list = qs;
       S.cache.bankListIds = list.slice(0, 100).map(q => q.id);
       if (!list.length) return '<div class="empty"><b>没有匹配的题目</b>换个条件试试</div>';
       const pickedChips =
         (b.multiUnit && b.multiUnit.length ? b.multiUnit.map(u => '<span class="chip brand">章节：' + esc(u) + '</span>').join('') : '') +
-        (b.unit ? '<span class="chip brand">章节：' + esc(b.unit) + '</span>' : '') +
+        (b.unit ? '<span class="chip brand">章节：' + esc(unitLabelOf(b.unit)) + '</span>' : '') +
+        (b.lesson ? '<span class="chip brand">课时：' + esc(b.lesson) + '</span>' : '') +
         (b.multiPoint && b.multiPoint.length ? b.multiPoint.map(pn => '<span class="chip brand">考点：' + esc(pn) + '</span>').join('') : '') +
-        (b.point ? '<span class="chip brand">考点：' + esc(b.point) + '</span>' : '');
-      const countHtml = '<div class="row between" style="margin:0 4px 8px"><span class="muted">共 ' + list.length + ' 道</span>' +
+        (b.point ? '<span class="chip brand">考点：' + esc(b.point) + '</span>' : '') +
+        (b.practice ? '<span class="chip brand">练习：' + esc(b.practice) + '</span>' : '') +
+        (b.ptype ? '<span class="chip brand">类型：' + esc(b.ptype) + '</span>' : '') +
+        (b.page ? '<span class="chip brand">页码：P' + esc(b.page) + '</span>' : '') +
+        (b.type && b.type !== '全部' ? '<span class="chip brand">题型：' + esc(b.type) + '</span>' : '') +
+        (b.difficulty ? '<span class="chip brand">难度 ' + esc(b.difficulty) + '</span>' : '');
+      const countHtml = '<div class="row between" style="margin:0 4px 8px"><span class="muted">共 ' + list.length + ' 道' +
+        (list.length > 100 ? '（显示前 100 道）' : '') + '</span>' +
         (S.batch.on ? '<span class="chip brand">批量模式 · 已选 ' + Object.keys(S.batch.set).length + ' 题</span>' : '') + '</div>' +
         (pickedChips ? '<div class="row wrap" style="gap:6px;margin:0 4px 8px">' + pickedChips + '</div>' : '');
       return countHtml +
@@ -2517,7 +2748,12 @@
         return '<div class="list-item" data-act="goto" data-to="point" data-id="' + (p.id || '') + '">' +
           '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div></div>' +
           '<span class="li-n">' + p.count + '</span>' + ARROW + '</div>';
-      }).join('');
+      });
+      // 考点多的时候只露 5 行，剩下的上下拖动看（省得把整页撑长、翻单元卡要翻很久）
+      const rowsHtml = rows.length > 5
+        ? '<div class="unit-points">' + rows.join('') + '</div>' +
+          '<p class="muted" style="margin:6px 4px 0;font-size:11.5px">共 ' + rows.length + ' 个考点 · 上下拖动查看全部</p>'
+        : rows.join('');
       const lessonChips = lessonSet.length
         ? '<div class="chips" style="margin:8px 0 2px">' +
             '<button class="tag' + (!lessonSel ? ' active' : '') + '" data-act="bank:lesson" data-unit="' + esc(u) + '" data-v="">全部考点</button>' +
@@ -2526,7 +2762,7 @@
             }).join('') + '</div>'
         : '';
       return '<section class="card">' +
-        '<div class="card-h"><h3>' + esc(u) + '</h3>' +
+        '<div class="card-h"><h3>' + esc(unitLabelOf(u)) + '</h3>' +
           '<div class="row" style="gap:6px"><span class="muted">' + (lessonSel ? effList.length + ' / ' : '') + list.length + ' 题 · ' +
             Object.keys(byPoint).length + ' 考点' + (lessonSet.length ? ' · ' + lessonSet.length + ' 课时' : '') + '</span>' +
           (unassigned
@@ -2537,9 +2773,157 @@
         lessonChips +
         (lessonSel && !effList.length
           ? '<div class="empty" style="padding:14px 0">这个课时下还没有题目</div>'
-          : rows) +
+          : rowsHtml) +
       '</section>';
     }).join('');
+  }
+
+  /* =========================================================
+   * 题库「更多筛选」：一次选完再确认（练习名称 → 类型 / 页码 / 单元 / 课时 / 考点 / 题型 / 难度）
+   * 每项都不是必填；选了上级就把下级选项缩小到对应范围。
+   * ======================================================= */
+  function sheetRedraw(fn) {
+    const old = sheetRoot.querySelector('.sheet-b');
+    const top = old ? old.scrollTop : 0;
+    fn();
+    const now = sheetRoot.querySelector('.sheet-b');
+    if (now) now.scrollTop = top;
+  }
+
+  function distinctVals(qs, fn) {
+    const map = {};
+    (qs || []).forEach(function (q) {
+      [].concat(fn(q) || []).forEach(function (v) {
+        if (v === undefined || v === null || v === '') return;
+        v = String(v);
+        map[v] = (map[v] || 0) + 1;
+      });
+    });
+    return map;
+  }
+
+  function practiceLessonsOf(q, unit) {
+    if (!unit) return qLessonsOf(q);
+    return [qLessonOf(q, unit)].filter(Boolean);
+  }
+
+  function sortByCatalog(list) {
+    const b = S.bank;
+    const sbj = b.subject !== '全部' ? b.subject : S.defaults.subject;
+    const gd = b.grade !== '全部' ? b.grade : S.defaults.grade;
+    const cat = Catalog.get(sbj, gd, S.defaults.term, S.defaults.version);
+    return list.slice().sort(function (x, y) {
+      const ix = cat.indexOf(x), iy = cat.indexOf(y);
+      if (ix >= 0 && iy >= 0) return ix - iy;
+      if (ix >= 0) return -1;
+      if (iy >= 0) return 1;
+      if (x === '未归类') return 1;
+      if (y === '未归类') return -1;
+      return x.localeCompare(y, 'zh');
+    });
+  }
+
+  function sortLessons(list) {
+    return list.slice().sort(function (a, b) {
+      if (a === '无') return 1;
+      if (b === '无') return -1;
+      const na = parseInt(String(a).replace(/\D/g, ''), 10), nb = parseInt(String(b).replace(/\D/g, ''), 10);
+      if (!isNaN(na) && !isNaN(nb) && na !== nb) return na - nb;
+      return a.localeCompare(b, 'zh');
+    });
+  }
+
+  function bankFilterDraft() {
+    const b = S.bank;
+    return {
+      practice: b.practice || '', ptype: b.ptype || '', page: b.page || '',
+      unit: b.unit || '', lesson: b.lesson || '', point: b.point || '',
+      type: b.type || '全部', difficulty: b.difficulty ? String(b.difficulty) : ''
+    };
+  }
+
+  /** 上级条件变了以后，把已经不存在的下级选择清掉（避免出现「选了课时但那个单元没有这个课时」） */
+  function bfClean(f) {
+    const all = S.cache.bankQ || [];
+    const keep = function (k, keys, fn) {
+      if (!f[k]) return;
+      const sub = {};
+      keys.forEach(function (x) { sub[x] = f[x]; });
+      const vals = Object.keys(distinctVals(filterQuestions(all, sub), fn));
+      if (vals.indexOf(String(f[k])) < 0) f[k] = '';
+    };
+    keep('ptype', ['practice'], practiceTypeOf);
+    keep('page', ['practice', 'ptype'], pageNoOf);
+    keep('unit', ['practice', 'ptype', 'page'], function (q) { return qUnitsOf(q); });
+    keep('lesson', ['practice', 'ptype', 'page', 'unit'], function (q) { return practiceLessonsOf(q, f.unit); });
+    keep('point', ['practice', 'ptype', 'page', 'unit', 'lesson'], function (q) {
+      return qPointsOf(q).map(function (p) { return p.name; });
+    });
+  }
+
+  function bankFilterSheet() {
+    const f = S._bf || (S._bf = bankFilterDraft());
+    bfClean(f);
+    const all = S.cache.bankQ || [];
+    const sub = function (keys) {
+      const o = {};
+      keys.forEach(function (k) { o[k] = f[k]; });
+      return filterQuestions(all, o);
+    };
+    const chipRow = function (key, values, labelOf, emptyText) {
+      if (!values.length) return '<p class="muted" style="margin:0 2px 6px">' + esc(emptyText || '没有可选项') + '</p>';
+      return '<div class="chips wrapv">' +
+        '<button class="tag' + (!f[key] ? ' active' : '') + '" data-act="bf:set" data-k="' + key + '" data-v="">不限</button>' +
+        values.map(function (v) {
+          return '<button class="tag' + (String(f[key]) === String(v) ? ' active' : '') + '" data-act="bf:set" data-k="' + key + '" data-v="' + esc(v) + '">' +
+            esc(labelOf ? labelOf(v) : v) + '</button>';
+        }).join('') + '</div>';
+    };
+
+    const praMap = distinctVals(all, practiceNameOf);
+    const practiceVals = Object.keys(praMap).sort(function (a, b) { return praMap[b] - praMap[a]; });
+    const typeVals = Object.keys(distinctVals(sub(['practice']), practiceTypeOf));
+    const pageVals = Object.keys(distinctVals(sub(['practice', 'ptype']), pageNoOf))
+      .sort(function (a, b) { return Number(a) - Number(b); });
+    const unitVals = sortByCatalog(Object.keys(distinctVals(sub(['practice', 'ptype', 'page']), function (q) { return qUnitsOf(q); })));
+    const lessonVals = sortLessons(Object.keys(distinctVals(sub(['practice', 'ptype', 'page', 'unit']), function (q) {
+      return practiceLessonsOf(q, f.unit);
+    })));
+    const pointVals = Object.keys(distinctVals(sub(['practice', 'ptype', 'page', 'unit', 'lesson']), function (q) {
+      return qPointsOf(q).map(function (p) { return p.name; });
+    })).sort(function (a, b) { return a.localeCompare(b, 'zh'); });
+
+    const kw = S.bank.keyword.trim().toLowerCase();
+    const kwList = kw ? all.filter(function (q) {
+      return [q.text, q.pointName, q.solution, q.answer, q.type, q.unit].join(' ').toLowerCase().indexOf(kw) >= 0;
+    }) : all;
+    const hitCount = filterQuestions(kwList, f).length;
+
+    const body =
+      '<p class="muted" style="margin:0 2px 10px">每项都可以不选；选了练习名称，练习类型和页码就只列这份练习的；选了单元，课时和考点就只列这个单元的。选好后点下面「确认筛选」一次性生效。</p>' +
+      '<div class="field"><label>练习名称</label>' + chipRow('practice', practiceVals, null, '题库里的题还没有练习名称') + '</div>' +
+      '<div class="field"><label>练习类型' + (f.practice ? '（' + esc(f.practice) + ' 下）' : '') + '</label>' +
+        chipRow('ptype', typeVals, null, '没有练习类型的题（可在题目「编辑」里补）') + '</div>' +
+      '<div class="field"><label>页码' + (f.practice ? '（' + esc(f.practice) + ' 下）' : '') + '</label>' +
+        chipRow('page', pageVals, function (v) { return 'P' + v; }, '没有页码的题（可在题目「编辑」里补）') + '</div>' +
+      '<div class="field"><label>单元</label>' + chipRow('unit', unitVals, function (v) { return unitLabelOf(v); }, '题库里还没有带单元的题') + '</div>' +
+      '<div class="field"><label>课时' + (f.unit ? '（' + esc(f.unit) + ' 下）' : '') + '</label>' +
+        chipRow('lesson', lessonVals, null, f.unit ? '这个单元的题还没分课时' : '题库里的题还没分课时') + '</div>' +
+      '<div class="field"><label>考点' + (f.unit ? '（' + esc(f.unit) + ' 下）' : '') + '</label>' +
+        chipRow('point', pointVals, null, '题库里还没有题目') + '</div>' +
+      '<div class="field"><label>题型</label><div class="chips wrapv">' +
+        ['全部'].concat(CONFIG.questionTypes).map(function (t) {
+          return '<button class="tag' + ((f.type || '全部') === t ? ' active' : '') + '" data-act="bf:set" data-k="type" data-v="' + esc(t) + '">' + esc(t) + '</button>';
+        }).join('') + '</div></div>' +
+      '<div class="field"><label>难度</label><div class="chips wrapv">' +
+        [['', '不限'], ['1', '难度 1'], ['2', '难度 2'], ['3', '难度 3']].map(function (p) {
+          return '<button class="tag' + (String(f.difficulty) === p[0] ? ' active' : '') + '" data-act="bf:set" data-k="difficulty" data-v="' + p[0] + '">' + p[1] + '</button>';
+        }).join('') + '</div></div>' +
+      '<div class="bf-actions">' +
+        '<button class="btn ghost" data-act="bf:reset">重置</button>' +
+        '<button class="btn primary grow" data-act="bf:apply">确认筛选（' + hitCount + ' 道）</button>' +
+      '</div>';
+    UI.sheet({ title: '筛选题库', body: body });
   }
 
   /* =========================================================
@@ -2549,7 +2933,8 @@
     tab: false,
     topbar() {
       return backBtn() + '<div class="tb-title">全部题目' +
-        '<div class="tb-sub">' + ((S.cache.allq || []).length) + ' 道 · 按录入时间倒序</div></div>';
+        '<div class="tb-sub">' + ((S.cache.allq || []).length) + ' 道 · 按录入时间倒序</div></div>' +
+        undoBtnsHtml();
     },
     async load() {
       const qs = await Store.Questions.list({});
@@ -3082,7 +3467,8 @@
     if (!S.session) {
       S.session = {
         images: [], subject: S.defaults.subject, grade: S.defaults.grade,
-        unit: '', lesson: '', batchName: '', batchDate: '', stage: 'pick'
+        unit: '', lesson: '', batchName: '', batchDate: '', stage: 'pick',
+        practiceType: '', pageNo: ''
       };
     }
     return S.session;
@@ -3448,6 +3834,8 @@
     if (batchInput && batchInput.value.trim()) s.batchName = batchInput.value.trim();
     const dateInput = document.getElementById('batchDate');
     if (dateInput && dateInput.value) s.batchDate = dateInput.value;
+    const pageInput = document.getElementById('batchPage');
+    if (pageInput) s.pageNo = pageInput.value.replace(/^[Pp]\.?\s*/, '').trim();
     for (const d of S.drafts) {
       // 多考点/多单元：一道题可同时挂多个考点、归入多个单元（各考点/单元题库里都能看到）
       const entries = (d.points && d.points.length)
@@ -3492,6 +3880,8 @@
         lessons: lessons,
         batchName: s.batchName || '',
         batchDate: s.batchDate || todayStr(),
+        practiceType: s.practiceType || '',
+        pageNo: s.pageNo || '',
         pointId: resolved[0].id,
         pointName: resolved[0].name,
         points: resolved,
@@ -3953,18 +4343,48 @@
     if (allBtn && s) allBtn.textContent = (s.imgPool.length && selCount === s.imgPool.length) ? '取消全选' : '全选';
   }
 
-  /** 已入库题目的配图弹层：✕ 移除 + 文件选图添加 */
+  /** 已入库题目的配图弹层：点图勾选（可多选批量删）、✕ 单张移除、＋ 添加图片
+   *  删图后原地刷新弹层，不回题卡页面。 */
   function qImgsSheet(q) {
-    const list = (q.images || []).map(function (src, k) {
-      return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
+    S._qImgId = q.id;
+    const imgs = q.images || [];
+    const sel = S.imgSel || {};
+    const selCount = imgs.filter(function (_, k) { return sel[k]; }).length;
+    const list = imgs.map(function (src, k) {
+      return '<div class="dimg-item' + (sel[k] ? ' sel-on' : '') + '" data-act="q:imgPick" data-k="' + k + '">' +
+        '<span class="dimg-pick' + (sel[k] ? ' on' : '') + '">' + (sel[k] ? '✓' : '') + '</span>' +
+        '<img src="' + src + '" alt="题目图形">' +
         '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
     }).join('') || '<div class="empty small" style="padding:14px">这道题还没有图形，点下面按钮添加</div>';
     UI.sheet({
       title: '配图 · ' + (q.pointName || '未分类'),
-      body: '<p class="muted" style="margin-bottom:10px">点 ✕ 移除图形；「添加图形」从相册 / 文件选图（自动压缩后随题保存）。</p>' +
+      body: '<p class="muted" data-sheet="imgs" style="margin-bottom:10px">点图片勾选（可多选），再点「删除所选」一次删掉；点右上角 ✕ 只删这一张。删完停在这里，不会跳回题目卡。</p>' +
         '<div>' + list + '</div>' +
-        '<button class="btn ghost block mt12" data-act="q:imgAdd" data-id="' + q.id + '">＋ 添加图形</button>'
+        (imgs.length
+          ? '<div class="lass-bar">' +
+              '<div class="row between" style="margin-bottom:8px">' +
+                '<span class="small" style="font-weight:600">已选 ' + selCount + ' 张</span>' +
+                '<span class="row" style="gap:8px">' +
+                  '<button class="small" style="color:var(--brand);font-weight:600" data-act="q:imgAll" data-v="1">全选</button>' +
+                  '<button class="small" style="color:var(--ink-3)" data-act="q:imgAll" data-v="">取消全选</button>' +
+                '</span>' +
+              '</div>' +
+              '<div class="row" style="gap:8px">' +
+                '<button class="btn ghost grow" data-act="q:imgAdd" data-id="' + q.id + '">＋ 添加图形</button>' +
+                '<button class="btn danger-soft' + (selCount ? ' grow' : '') + '" data-act="q:imgDelSel"' + (selCount ? '' : ' disabled') + '>删除所选' + (selCount ? '（' + selCount + '）' : '') + '</button>' +
+              '</div>' +
+            '</div>'
+          : '<button class="btn ghost block mt12" data-act="q:imgAdd" data-id="' + q.id + '">＋ 添加图形</button>')
     });
+  }
+
+  /** 配图弹层原地刷新（保持滚动位置；弹层没开就什么都不做） */
+  async function refreshQImgsSheet() {
+    const id = S._qImgId;
+    if (!id || !sheetRoot.classList.contains('show')) return;
+    const fresh = await DB.get('questions', id);
+    if (!fresh) return;
+    sheetRedraw(function () { qImgsSheet(fresh); });
   }
 
   /* =========================================================
@@ -4902,6 +5322,7 @@
       S.session = {
         images: [], subject: d.subject || S.defaults.subject, grade: d.grade || S.defaults.grade,
         unit: d.unit || '', batchName: d.batchName || '', batchDate: d.batchDate || '',
+        practiceType: d.practiceType || '', pageNo: d.pageNo || '',
         stage: 'confirm', mode: 'photo', imgPool: []
       };
       // 先载入草稿保存的图形池，再合并各题配图（保证后续可重新配图）
@@ -5124,6 +5545,11 @@
       S.session.lesson = (S.session.lesson === d.v) ? '' : d.v;
       render();
     },
+    'confirm:ptype': function (d) {
+      if (!S.session) return;
+      S.session.practiceType = (S.session.practiceType === d.v) ? '' : d.v;
+      render();
+    },
 
     /* 复制红笔识别出的答案文本 */
     'confirm:copyRed': async function () {
@@ -5214,8 +5640,8 @@
     },
 
     /* ---- 题库 ---- */
-    'bank:subject': function (d) { S.bank.subject = d.v; S.bank.multiUnit = []; S.bank.multiPoint = []; render(); },
-    'bank:grade': function (d) { S.bank.grade = d.v; S.bank.multiUnit = []; S.bank.multiPoint = []; render(); },
+    'bank:subject': function (d) { S.bank.subject = d.v; S.bank.multiUnit = []; S.bank.multiPoint = []; S.bank.unit = ''; S.bank.lesson = ''; S.bank.point = ''; S._bf = null; render(); },
+    'bank:grade': function (d) { S.bank.grade = d.v; S.bank.multiUnit = []; S.bank.multiPoint = []; S.bank.unit = ''; S.bank.lesson = ''; S.bank.point = ''; S._bf = null; render(); },
     'bank:unit': function (d) {
       const u = d.unit || d.v || '';
       S.bank.unit = u;
@@ -5248,7 +5674,42 @@
     },
 
     /* 批量分配课时（按考点）：点课时或「无」，该考点下未分配的题一次归入 */
-    'bank:lessonAssign': function (d) { lessonAssignSheet(d.unit); },
+    'bank:lessonAssign': function (d) { S._lassSel = {}; lessonAssignSheet(d.unit); },
+
+    /* 改课时弹层：切模式 / 勾题 / 全选 / 对所选题目改课时 */
+    'bank:lassMode': function (d) { S._lassMode = d.v; sheetRedraw(function () { lessonAssignSheet(d.unit); }); },
+    'bank:lassSel': function (d) {
+      S._lassSel = S._lassSel || {};
+      if (S._lassSel[d.id]) delete S._lassSel[d.id]; else S._lassSel[d.id] = 1;
+      sheetRedraw(function () { lessonAssignSheet(S._lassUnit); });
+    },
+    'bank:lassAll': function (d) {
+      const unit = d.unit;
+      const qs = (S.cache.bankQ || []).filter(function (q) { return qUnitsOf(q).indexOf(unit) >= 0; });
+      S._lassSel = {};
+      if (d.v) qs.forEach(function (q) { S._lassSel[q.id] = 1; });
+      sheetRedraw(function () { lessonAssignSheet(unit); });
+    },
+    'bank:lassApply': async function (d) {
+      const unit = d.unit, v = d.v;
+      const sel = S._lassSel || {};
+      const ids = Object.keys(sel).filter(function (id) { return sel[id]; });
+      if (!ids.length) { UI.toast('先勾选要改的题（可多选）'); return; }
+      const before = await Undo.begin(ids);
+      await setLessonForQuestions(ids, unit, v);
+      await Undo.end(ids.length + ' 题改课时', before);
+      S._lassSel = {};
+      UI.toast('已把 ' + ids.length + ' 道题的课时改成「' + (v === '无' ? '无' : v) + '」', 2400);
+      try {
+        await PAGES.bank.load();
+        const fq = (S.cache.bankQ || []).find(function (q) { return qUnitsOf(q).indexOf(unit) >= 0; });
+        if (fq && (S.bank.subject === '全部' || S.bank.grade === '全部')) {
+          await syncCatalogLessons(fq.subject, fq.grade);
+        }
+      } catch (e) { /* 保底不阻断 */ }
+      sheetRedraw(function () { lessonAssignSheet(unit); });
+      await render();
+    },
 
     /* 修改已分配的课时：该考点在这个单元下的题整批改成新课时（覆盖旧的） */
     'bank:reassignLesson': async function (d) {
@@ -5257,14 +5718,9 @@
         return qUnitsOf(q).indexOf(unit) >= 0 &&
           qPointsOf(q).some(function (p) { return p.name === pname; });
       });
-      for (const q of targets) {
-        const us = qUnitsOf(q);
-        const ls = qLessonsOf(q);
-        const i = us.indexOf(unit);
-        if (i < 0) continue;
-        ls[i] = v;
-        await Store.Questions.update(q.id, { lessons: ls, lesson: ls.filter(function (x) { return x && x !== '无'; })[0] || ls[0] || '' });
-      }
+      const before = await Undo.begin(targets.map(function (q) { return q.id; }));
+      await setLessonForQuestions(targets.map(function (q) { return q.id; }), unit, v);
+      await Undo.end(targets.length + ' 题改课时', before);
       UI.toast(targets.length ? '已把 ' + targets.length + ' 道题的课时改成「' + v + '」' : '没有需要处理的题', 2400);
       try {
         await PAGES.bank.load();
@@ -5273,7 +5729,7 @@
           await syncCatalogLessons(fq.subject, fq.grade);
         }
       } catch (e) { /* 保底不阻断 */ }
-      lessonAssignSheet(unit);
+      sheetRedraw(function () { lessonAssignSheet(unit); });
       await render();
     },
 
@@ -5283,14 +5739,9 @@
         return qUnitsOf(q).indexOf(unit) >= 0 && unassignedOf(q, unit) &&
           qPointsOf(q).some(function (p) { return p.name === pname; });
       });
-      for (const q of targets) {
-        const us = qUnitsOf(q);
-        const ls = qLessonsOf(q);
-        const i = us.indexOf(unit);
-        if (i < 0) continue;
-        ls[i] = v;
-        await Store.Questions.update(q.id, { lessons: ls, lesson: ls.filter(function (x) { return x && x !== '无'; })[0] || ls[0] || '' });
-      }
+      const before = await Undo.begin(targets.map(function (q) { return q.id; }));
+      await setLessonForQuestions(targets.map(function (q) { return q.id; }), unit, v);
+      await Undo.end(targets.length + ' 题分配课时', before);
       UI.toast(targets.length ? '已把 ' + targets.length + ' 道题归到「' + v + '」' : '没有需要处理的题', 2400);
       // 刷新题库缓存（顺带把新课时配对进目录）后重开弹层
       try {
@@ -5301,7 +5752,7 @@
           await syncCatalogLessons(fq.subject, fq.grade);
         }
       } catch (e) { /* 保底不阻断 */ }
-      lessonAssignSheet(unit);
+      sheetRedraw(function () { lessonAssignSheet(unit); });
       await render();
     },
     'um:sel': function (d) {
@@ -5330,8 +5781,12 @@
     },
     'bank:status': function (d) { S.bank.status = d.v; render(); },
     'bank:clear': function () {
-      S.bank.keyword = ''; S.bank.unit = ''; S.bank.point = '';
-      S.bank.multiUnit = []; S.bank.multiPoint = [];
+      const b = S.bank;
+      b.keyword = ''; b.unit = ''; b.point = ''; b.lesson = '';
+      b.practice = ''; b.ptype = ''; b.page = '';
+      b.type = '全部'; b.difficulty = '';
+      b.multiUnit = []; b.multiPoint = [];
+      S._bf = null;
       S.batch.on = false; S.batch.set = {};
       render();
     },
@@ -5339,54 +5794,62 @@
       if (S.page !== 'bank') { S.bank.status = 'confirm'; navigate('bank'); return; }
       S.bank.status = S.bank.status === 'confirm' ? '全部' : 'confirm'; render();
     },
-    'bank:filter': async function () {
-      const b = S.bank;
-      const types = ['全部'].concat(CONFIG.questionTypes);
-      // 单元 / 考点筛选项从当前题库已有的题目内容里生成（一题多考点/多单元时取并集）
-      const qs = S.cache.bankQ || [];
-      const unitSet = {}; const pointSet = {};
-      qs.forEach(function (q) {
-        qUnitsOf(q).forEach(u => { unitSet[u] = 1; });
-        qPointsOf(q).forEach(p => { pointSet[p.name] = 1; });
-      });
-      const units = Object.keys(unitSet);
-      const points = Object.keys(pointSet);
-      const all = '<button class="tag' + (!b.unit ? ' active' : '') + '" data-act="bank:setUnit" data-v="">全部</button>';
-      const unitChips = units.length
-        ? '<div class="chips wrapv">' + all + units.map(function (u) {
-            return '<button class="tag' + (b.unit === u ? ' active' : '') + '" data-act="bank:setUnit" data-v="' + esc(u) + '">' + esc(u) + '</button>';
-          }).join('') + '</div>'
-        : '<p class="muted">题库里还没有带单元的题目</p>';
-      const pall = '<button class="tag' + (!b.point ? ' active' : '') + '" data-act="bank:setPoint" data-v="">全部</button>';
-      const pointChips = points.length
-        ? '<div class="chips wrapv">' + pall + points.map(function (pn) {
-            return '<button class="tag' + (b.point === pn ? ' active' : '') + '" data-act="bank:setPoint" data-v="' + esc(pn) + '">' + esc(pn) + '</button>';
-          }).join('') + '</div>'
-        : '<p class="muted">题库里还没有题目</p>';
-      const body = '<div class="field"><label>章节（单元）</label>' + unitChips + '</div>' +
-        '<div class="field"><label>考点</label>' + pointChips + '</div>' +
-        '<div class="field"><label>题型</label><div class="chips">' +
-        types.map(function (t) {
-          return '<button class="tag' + (b.type === t ? ' active' : '') + '" data-act="bank:setType" data-v="' + t + '">' + t + '</button>';
-        }).join('') + '</div></div>' +
-        '<div class="field"><label>难度</label><div class="chips">' +
-        ['', '1', '2', '3'].map(function (n) {
-          return '<button class="tag' + (String(b.difficulty) === n ? ' active' : '') + '" data-act="bank:setDiff" data-v="' + n + '">' + (n ? '难度 ' + n : '不限') + '</button>';
-        }).join('') + '</div></div>' +
-        '<button class="btn ghost block" data-act="bank:resetFilter">重置筛选</button>';
-      UI.sheet({ title: '筛选', body: body });
+    /* 筛选弹层：所有条件先存草稿，点「确认筛选」才一次性生效（选完一个不会退出弹层） */
+    'bank:filter': function () { S._bf = bankFilterDraft(); bankFilterSheet(); },
+    'bf:set': function (d) {
+      if (!S._bf) S._bf = bankFilterDraft();
+      const k = d.k, v = d.v || '';
+      if (k === 'type') S._bf.type = v || '全部';
+      else S._bf[k] = (String(S._bf[k] || '') === String(v)) ? '' : v;
+      bfClean(S._bf);
+      sheetRedraw(function () { bankFilterSheet(); });
     },
-    'bank:setUnit': function (d) { S.bank.unit = d.v; S.bank.multiUnit = []; UI.close(); render(); },
+    'bf:reset': function () {
+      S._bf = { practice: '', ptype: '', page: '', unit: '', lesson: '', point: '', type: '全部', difficulty: '' };
+      sheetRedraw(function () { bankFilterSheet(); });
+    },
+    'bf:apply': function () {
+      const f = S._bf || bankFilterDraft();
+      const b = S.bank;
+      b.practice = f.practice || ''; b.ptype = f.ptype || ''; b.page = f.page || '';
+      b.unit = f.unit || ''; b.lesson = f.lesson || ''; b.point = f.point || '';
+      b.type = f.type || '全部'; b.difficulty = f.difficulty || '';
+      b.multiUnit = []; b.multiPoint = [];
+      S._bf = null;
+      UI.close();
+      render();
+    },
+    /* 旧动作保留（兼容旧测试/脚本）：直接设值并生效 */
+    'bank:setUnit': function (d) { S.bank.unit = d.v; S.bank.lesson = ''; S.bank.point = ''; S.bank.multiUnit = []; UI.close(); render(); },
     'bank:setPoint': function (d) { S.bank.point = d.v; S.bank.multiPoint = []; UI.close(); render(); },
     'bank:setType': function (d) { S.bank.type = d.v; UI.close(); render(); },
     'bank:setDiff': function (d) { S.bank.difficulty = d.v; UI.close(); render(); },
     'bank:resetFilter': function () { S.bank.type = '全部'; S.bank.difficulty = ''; UI.close(); render(); },
 
+    /* ---- 一键撤销 / 恢复 ---- */
+    'undo:do': async function () {
+      const st = Undo.state();
+      if (!st.canUndo) { UI.toast('还没有可撤销的操作'); return; }
+      const label = await Undo.undo();
+      UI.toast('已撤销：' + label, 2400);
+      S.cache.same = {};
+      await render();
+      if (sheetRoot.querySelector('[data-sheet="imgs"]')) await refreshQImgsSheet();
+    },
+    'undo:redo': async function () {
+      const st = Undo.state();
+      if (!st.canRedo) { UI.toast('还没有可恢复的操作'); return; }
+      const label = await Undo.redo();
+      UI.toast('已恢复：' + label, 2400);
+      S.cache.same = {};
+      await render();
+      if (sheetRoot.querySelector('[data-sheet="imgs"]')) await refreshQImgsSheet();
+    },
+
     /* ---- 题库批量选择 ---- */
     'bank:batch': function () {
       const b = S.bank;
-      const browsing = !b.keyword.trim() && b.status === '全部' && b.type === '全部' && !b.difficulty &&
-        !b.unit && !b.point && !(b.multiUnit && b.multiUnit.length) && !(b.multiPoint && b.multiPoint.length);
+      const browsing = !b.keyword.trim() && !hasFilter(b);
       if (!S.batch.on && browsing) { UI.toast('先搜索或筛选出题目列表，再批量操作'); return; }
       S.batch.on = !S.batch.on;
       S.batch.set = {};
@@ -5416,10 +5879,12 @@
     'batch:del': async function () {
       const ids = Object.keys(S.batch.set);
       if (!ids.length) { UI.toast('先勾选题目'); return; }
-      const ok = await UI.confirm('删除选中的 ' + ids.length + ' 道题？删除后无法恢复，建议先导出备份。');
+      const ok = await UI.confirm('删除选中的 ' + ids.length + ' 道题？删错了可以点顶栏 ↶ 撤销。');
       if (!ok) return;
+      const before = await Undo.begin(ids);
       for (const id of ids) await Store.Questions.remove(id);
-      UI.toast('已删除 ' + ids.length + ' 道题');
+      await Undo.end('删除 ' + ids.length + ' 道题', before);
+      UI.toast('已删除 ' + ids.length + ' 道题（可点 ↶ 撤销）', 2600);
       S.batch.on = false; S.batch.set = {};
       render();
     },
@@ -5430,6 +5895,7 @@
       if (!first) return;
       const picked = await pickPoints([], first.subject, first.grade);
       if (!picked || !picked.length) return;
+      const before = await Undo.begin(ids);
       let n = 0;
       for (const id of ids) {
         const q = await DB.get('questions', id);
@@ -5451,6 +5917,7 @@
         n++;
       }
       await Store.Points.recount();
+      await Undo.end(n + ' 题改考点', before);
       UI.toast('已把 ' + n + ' 道题挂上 ' + picked.length + ' 个考点');
       S.batch.on = false; S.batch.set = {};
       render();
@@ -5604,6 +6071,19 @@
           '<div class="field mt8"><label>课时（选填，单元下按课时归类考点）</label>' +
             '<input class="input" id="qeLesson" placeholder="如：第3课时" value="' + esc(curLesson) + '" list="qeLessonList">' +
             '<datalist id="qeLessonList">' + lessonOptsHtml + '</datalist></div>' +
+          '<div class="row mt8" style="gap:8px">' +
+            '<div class="field" style="flex:1.7;margin:0"><label>练习名称（筛题用）</label>' +
+              '<input class="input" id="qeBatch" placeholder="如：数学练习册P23" value="' + esc(q.batchName || '') + '"></div>' +
+            '<div class="field" style="flex:.7;margin:0"><label>页码</label>' +
+              '<input class="input" id="qePage" inputmode="numeric" placeholder="如 23" value="' + esc(pageNoOf(q)) + '"></div>' +
+          '</div>' +
+          '<div class="field mt8"><label>练习类型（筛题用）</label>' +
+            '<select class="select" id="qePType">' +
+              '<option value="">（未标注）</option>' +
+              CONFIG.practiceTypes.map(function (t) {
+                return '<option value="' + esc(t) + '"' + (practiceTypeOf(q) === t ? ' selected' : '') + '>' + esc(t) + '</option>';
+              }).join('') +
+            '</select></div>' +
           '<button class="btn primary block mt12" data-act="q:editSave" data-id="' + q.id + '">保存修改</button>'
       });
     },
@@ -5619,6 +6099,13 @@
         type: document.getElementById('qeType').value,
         difficulty: Number(document.getElementById('qeDiff').value)
       };
+      // 练习名称 / 类型 / 页码（筛题用；老题目按名称推断，这里可改准）
+      const bnEl = document.getElementById('qeBatch');
+      const ptEl = document.getElementById('qePType');
+      const pgEl = document.getElementById('qePage');
+      if (bnEl) patch.batchName = bnEl.value.trim();
+      if (ptEl) patch.practiceType = ptEl.value;
+      if (pgEl) patch.pageNo = pgEl.value.replace(/^[Pp]\.?\s*/, '').trim();
       // 考点 / 单元：原来没设置也能在这里选定；换单元时自动换对应后缀考点；课时与单元对齐
       const unitSel = document.getElementById('qeUnit');
       const pointSel = document.getElementById('qePoint');
@@ -5645,7 +6132,9 @@
         patch.lessons = units.map(function (x) { return x === unit ? lessonVal : qLessonOf(q, x); });
         patch.lesson = lessonVal;
       }
+      const before = await Undo.begin([d.id]);
       await Store.Questions.update(d.id, patch);
+      await Undo.end('编辑题目', before);
       UI.close();
       UI.toast('已保存修改');
       await render();
@@ -5653,15 +6142,52 @@
     'q:imgs': async function (d) {
       const q = await DB.get('questions', d.id);
       if (!q) return;
+      S.imgSel = {};
       qImgsSheet(q);
+    },
+    'q:imgPick': function (d) {
+      const k = +d.k;
+      S.imgSel = S.imgSel || {};
+      if (S.imgSel[k]) delete S.imgSel[k]; else S.imgSel[k] = 1;
+      refreshQImgsSheet();
+    },
+    'q:imgAll': async function (d) {
+      const q = S._qImgId ? await DB.get('questions', S._qImgId) : null;
+      const n = q ? (q.images || []).length : 0;
+      S.imgSel = {};
+      if (d.v) for (let k = 0; k < n; k++) S.imgSel[k] = 1;
+      refreshQImgsSheet();
     },
     'q:imgDel': async function (d) {
       const q = await DB.get('questions', d.id);
       if (!q || !q.images) return;
+      const before = await Undo.begin([q.id]);
       q.images.splice(+d.k, 1);
       await Store.Questions.update(d.id, { images: q.images });
-      UI.close();
-      UI.toast('已移除图形');
+      await Undo.end('移除 1 张配图', before);
+      S.imgSel = {};
+      UI.toast('已移除 1 张图形（可撤销）');
+      await refreshQImgsSheet();
+      await render();
+    },
+    'q:imgDelSel': async function () {
+      const id = S._qImgId;
+      const q = id ? await DB.get('questions', id) : null;
+      if (!q) return;
+      const sel = S.imgSel || {};
+      const idx = Object.keys(sel).filter(function (k) { return sel[k]; }).map(Number).sort(function (a, b) { return b - a; });
+      if (!idx.length) { UI.toast('先点图勾选要删的图形'); return; }
+      const ok = await UI.confirm('删除选中的 ' + idx.length + ' 张图形？（可用顶栏 ↶ 撤销）');
+      if (!ok) { refreshQImgsSheet(); return; }
+      const before = await Undo.begin([q.id]);
+      const imgs = (q.images || []).slice();
+      idx.forEach(function (k) { imgs.splice(k, 1); });
+      await Store.Questions.update(id, { images: imgs });
+      await Undo.end('移除 ' + idx.length + ' 张配图', before);
+      S.imgSel = {};
+      UI.toast('已删除 ' + idx.length + ' 张图形', 2400);
+      const fresh = await DB.get('questions', id);
+      if (fresh) qImgsSheet(fresh);
       await render();
     },
     'q:imgToggle': function (d) {
@@ -5678,6 +6204,7 @@
         if (!files.length) return;
         const q = await DB.get('questions', d.id);
         if (!q) return;
+        const before = await Undo.begin([d.id]);
         const imgs = q.images || [];
         for (const f of files) {
           try {
@@ -5688,6 +6215,7 @@
           }
         }
         await Store.Questions.update(d.id, { images: imgs });
+        await Undo.end('添加配图', before);
         UI.toast('已添加 ' + files.length + ' 张图形');
         const fresh = await DB.get('questions', d.id);
         if (fresh && sheetRoot.classList.contains('show')) qImgsSheet(fresh);
@@ -5708,7 +6236,8 @@
       };
       UI.sheet({
         title: '改课时',
-        body: '<p class="muted" style="margin-bottom:8px">「' + esc(unit || '未归类') + '」下的课时' +
+        body: '<p class="qtext" style="padding:0 0 8px;font-size:13.5px;color:var(--ink-2)">' + esc(String(q.text || '').slice(0, 60)) + (String(q.text || '').length > 60 ? '…' : '') + '</p>' +
+          '<p class="muted" style="margin-bottom:8px">「' + esc(unit || '未归类') + '」下的课时' +
           (choices.length ? '（来自教材目录，可在设置页「每单元的课时」里编辑）' : '还没在目录里配置——去设置页「每单元的课时」编辑后，这里就只列目录课时') + '。当前：' + (cur ? esc(cur) : '未标') + '</p>' +
           '<div class="chips wrapv">' +
           (choices.length ? choices.map(function (L) { return chip(L); }).join('') : '') +
@@ -5724,9 +6253,11 @@
       const idx = us.indexOf(unit);
       const v = (d.v || '').trim();
       const lessons = us.map(function (u, i) { return i === idx ? v : qLessonOf(q, u); });
+      const before = await Undo.begin([d.id]);
       await Store.Questions.update(d.id, { lessons: lessons, lesson: idx === 0 ? v : (q.lesson || '') });
+      await Undo.end('改课时', before);
       UI.close();
-      UI.toast(v ? '课时已改为「' + v + '」' : '已清除课时');
+      UI.toast(v ? '课时已改为「' + v + '」（可撤销）' : '已清除课时（可撤销）');
       await render();
     },
     'q:typeSel': async function (d) {
@@ -5743,7 +6274,9 @@
       });
     },
     'q:typeSet': async function (d) {
+      const before = await Undo.begin([d.id]);
       await Store.Questions.update(d.id, { type: d.v });
+      await Undo.end('改题型', before);
       UI.close();
       UI.toast('题型已改为「' + d.v + '」');
       await render();
@@ -5762,7 +6295,9 @@
       });
     },
     'q:diffSet': async function (d) {
+      const before = await Undo.begin([d.id]);
       await Store.Questions.update(d.id, { difficulty: Number(d.v) });
+      await Undo.end('改难度', before);
       UI.close();
       UI.toast('难度已改为 ' + Number(d.v));
       await render();
@@ -5809,17 +6344,21 @@
           patch.lesson = patch.lessons.filter(Boolean)[0] || q.lesson || '';
         }
       }
+      const before = await Undo.begin([d.id]);
       await Store.Questions.update(d.id, patch);
       await Store.Points.recount();
+      await Undo.end('改考点', before);
       UI.toast('已挂上 ' + pts.length + ' 个考点');
       await render();
     },
     'q:del': async function (d) {
-      const ok = await UI.confirm('删除这道题？原图也会一起删除。');
+      const ok = await UI.confirm('删除这道题？原图也会一起删除。删错了可以点顶栏 ↶ 撤销。');
       if (!ok) return;
+      const before = await Undo.begin([d.id]);
       await Store.Questions.remove(d.id);
+      await Undo.end('删除 1 道题', before);
       delete S.imgUrls[d.id];
-      UI.toast('已删除');
+      UI.toast('已删除（可点 ↶ 撤销）', 2400);
       await render();
     },
     'q:openPoint': function (d) { navigate('point', { id: d.id }); },
@@ -6423,7 +6962,11 @@
     dcOpenDays: dcOpenDays, migrateQuestionTypes: migrateQuestionTypes,
     assignRedAnswers: assignRedAnswers, normCmpText: normCmpText, ppmApplyOrder: ppmApplyOrder,
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
-    knownLessonsOf: knownLessonsOf, pickPoints: pickPoints };
+    knownLessonsOf: knownLessonsOf, pickPoints: pickPoints,
+    Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
+    practiceTypeOf: practiceTypeOf, pageNoOf: pageNoOf, matchFilter: matchFilter,
+    filterQuestions: filterQuestions, hasFilter: hasFilter, bankFilterSheet: bankFilterSheet,
+    qImgsSheet: qImgsSheet };
 
   /* =========================================================
    * 启动
