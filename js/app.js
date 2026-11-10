@@ -36,6 +36,7 @@
     batch: { on: false, set: {} },   // 题库批量选择模式：set 为题目 id 集合
     jpSel: { on: false, set: {} },   // 讲评页批量选择（标为已讲评）
     jpLast: null,                    // 上一次「标为已讲评」的一批（供撤回）
+    jpTags: false,                   // 讲评页是否显示题卡标签（默认不显示，观课时页面更干净）
     reviewCfg: { subject: '全部', scope: 'due', limit: 10 },
     review: null
   };
@@ -46,6 +47,7 @@
       if (d && d.subject) S.defaults = Object.assign(S.defaults, d);
       const r = JSON.parse(localStorage.getItem('tiku.reviewCfg') || 'null');
       if (r) S.reviewCfg = Object.assign(S.reviewCfg, r);
+      S.jpTags = localStorage.getItem('tiku.jp.tags') === '1';
     } catch (e) {}
   })();
 
@@ -1663,12 +1665,14 @@
     const selSet = opts.selSet || S.batch.set;
     const selAct = opts.selAct || 'batch:sel';
     const sel = batch && !!selSet[q.id];
+    const clean = !!opts.clean;          // 讲评观课模式：不显示标签、不显示编辑类按钮
     // 标签 = 考点（主考点，多考点显示 +N） + 单元名 + 课时名
     const pts = qPointsOf(q);
     const mainUnit = qUnitsOf(q)[0] || '';
     const mainLesson = qLessonOf(q, mainUnit);
     // 卡片标签随时点都能直接编辑（批量模式除外——点卡片是勾选题目）
     return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="' + selAct + '"' : '') + '>' +
+      (clean && !batch ? '' :
       '<div class="row between wrap" style="gap:6px;margin-bottom:8px">' +
         '<div class="row wrap" style="gap:6px">' +
           (batch ? '<span class="bcheck' + (sel ? ' on' : '') + '"></span>' : '') +
@@ -1678,21 +1682,25 @@
           '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:typeSel" data-id="' + q.id + '" title="点击修改题型"') + '>' + esc(q.type) + '</span>' +
           '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:diffSel" data-id="' + q.id + '" title="点击修改难度"') + '>难度 ' + q.difficulty + '</span>' +
         '</div>' +
-      '</div>' +
+      '</div>') +
       '<p class="qtext" style="padding:0">' + esc(q.text) + '</p>' +
       optionsHtml(q) +
-      /* 配图区：有配图的题默认打开（可收起），不随思路展开状态 */
-      ((q.images && q.images.length && S.openImg[q.id] !== false)
-        ? '<div class="dimg-list mt8">' + q.images.map(function (src, k) {
-            return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
-              '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
-          }).join('') +
-          '<div class="row between" style="margin-top:4px"><p class="muted" style="font-size:12px">↑ 题目图形（点 ✕ 移除，点「配图」可增删）</p>' +
-          '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">收起配图</button></div></div>'
-        : ((q.images && q.images.length)
-          ? '<div class="row between mt8"><span class="chip gray">📐 ' + q.images.length + ' 张配图</span>' +
-            '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">展开配图</button></div>'
-          : '')) +
+      /* 配图区：有配图的题默认打开（可收起），不随思路展开状态；观课模式纯展示 */
+      (!(q.images && q.images.length)
+        ? ''
+        : (clean
+          ? '<div class="dimg-list mt8">' + q.images.map(function (src) {
+              return '<div class="dimg-item"><img src="' + src + '" alt="题目图形"></div>';
+            }).join('') + '</div>'
+          : (S.openImg[q.id] !== false
+            ? '<div class="dimg-list mt8">' + q.images.map(function (src, k) {
+                return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
+                  '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
+              }).join('') +
+              '<div class="row between" style="margin-top:4px"><p class="muted" style="font-size:12px">↑ 题目图形（点 ✕ 移除，点「配图」可增删）</p>' +
+              '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">收起配图</button></div></div>'
+            : '<div class="row between mt8"><span class="chip gray">📐 ' + q.images.length + ' 张配图</span>' +
+              '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">展开配图</button></div>'))) +
       (open
         ? '<div class="solution-box" style="margin:10px 0 0">' +
             '<b>解题思路</b>' + esc(q.solution || '（暂无，可手动补充）') +
@@ -1708,14 +1716,14 @@
         : '') +
       (batch ? '' :
       '<div class="qops" style="padding:10px 0 0">' +
-        '<button data-act="q:toggle" data-id="' + q.id + '">' + (open ? '收起' : '展开思路/原图') + '</button>' +
-        '<button data-act="q:edit" data-id="' + q.id + '">编辑</button>' +
-        '<button data-act="q:imgs" data-id="' + q.id + '">配图</button>' +
-        '<button data-act="q:basket" data-id="' + q.id + '">' + (Paper.has(q.id) ? '✓ 已入卷' : '加入组卷') + '</button>' +
-        '<button data-act="q:point" data-id="' + q.id + '">改考点</button>' +
-        '<button data-act="q:jp" data-id="' + q.id + '">' + (jpHas(q.id) ? '✓ 在讲评单' : '讲评') + '</button>' +
+        '<button data-act="q:toggle" data-id="' + q.id + '">' + (open ? '收起' : (clean ? '看答案 / 思路' : '展开思路/原图')) + '</button>' +
+        (clean ? '' : '<button data-act="q:edit" data-id="' + q.id + '">编辑</button>') +
+        (clean ? '' : '<button data-act="q:imgs" data-id="' + q.id + '">配图</button>') +
+        (clean ? '' : '<button data-act="q:basket" data-id="' + q.id + '">' + (Paper.has(q.id) ? '✓ 已入卷' : '加入组卷') + '</button>') +
+        (clean ? '' : '<button data-act="q:point" data-id="' + q.id + '">改考点</button>') +
+        (clean ? '' : '<button data-act="q:jp" data-id="' + q.id + '">' + (jpHas(q.id) ? '✓ 在讲评单' : '讲评') + '</button>') +
         (opts.extraOps || '') +
-        '<button class="del" data-act="q:del" data-id="' + q.id + '">删除</button>' +
+        (clean ? '' : '<button class="del" data-act="q:del" data-id="' + q.id + '">删除</button>') +
       '</div>') +
     '</article>';
   }
@@ -2201,10 +2209,11 @@
       const batch = S.jpSel.on;
       return (batch
           ? '<p class="muted" style="margin:2px 4px 10px">勾选这一课已经讲完的题（可多选），点底部「标为已讲评」一次移出讲评单。</p>'
-          : '<p class="muted" style="margin:2px 4px 10px">课上讲评：点每题的「同类对比」，从题库调出同考点 / 类似考点 / 同题型的题并排对比分析。</p>') +
+          : '') +
         qs.map(function (q) {
           return questionCard(q, {
             batch: batch, selSet: S.jpSel.set, selAct: 'jp:sel',
+            clean: !batch && !S.jpTags,
             extraOps: '<button data-act="jp:cmp" data-id="' + q.id + '">同类对比</button>' +
               '<button class="del" data-act="jp:rm" data-id="' + q.id + '">移出讲评</button>'
           });
@@ -2216,8 +2225,11 @@
                 (qs.length && qs.every(function (q) { return S.jpSel.set[q.id]; }) ? '取消全选' : '全选') + '</button>' +
               '<button class="btn primary sm" data-act="jp:markDone"' + (Object.keys(S.jpSel.set).length ? '' : ' disabled') + '>标为已讲评</button>' +
             '</div>'
-          : '<div class="row between" style="margin:16px 4px 0"><span class="muted" style="font-size:12.5px">共 ' + qs.length + ' 道待讲评</span>' +
-              '<button class="small" style="color:var(--ink-3)" data-act="jp:clear">清空讲评单</button></div>' + last);
+          : '<div class="row between wrap" style="margin:16px 4px 0;gap:8px"><span class="muted" style="font-size:12.5px">共 ' + qs.length + ' 道待讲评</span>' +
+              '<span class="row" style="gap:10px">' +
+                '<button class="small" style="color:var(--ink-3)" data-act="jp:tags">' + (S.jpTags ? '隐藏标签' : '显示标签') + '</button>' +
+                '<button class="small" style="color:var(--ink-3)" data-act="jp:clear">清空讲评单</button>' +
+              '</span></div>' + last);
     }
   };
 
@@ -6207,6 +6219,11 @@
       if (i >= 0) { ids.splice(i, 1); UI.toast('已移出讲评'); }
       else { ids.push(d.id); UI.toast('已加入讲评（' + ids.length + ' 题）'); }
       jpSave(ids);
+      render();
+    },
+    'jp:tags': function () {
+      S.jpTags = !S.jpTags;
+      try { localStorage.setItem('tiku.jp.tags', S.jpTags ? '1' : '0'); } catch (e) {}
       render();
     },
     'jp:batch': function () {
