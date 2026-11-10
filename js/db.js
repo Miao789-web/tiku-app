@@ -408,6 +408,12 @@ const Store = (function () {
     if (toAdd.length) await DB.bulkPut('points', toAdd);
     const qs = data.questions.map(function (q) {
       if (remap[q.pointId]) q.pointId = remap[q.pointId];
+      // 多考点数组里的 id 也要跟着归并后的真实 id 走
+      if (Array.isArray(q.points)) {
+        q.points = q.points.map(function (p) {
+          return p && remap[p.id] ? Object.assign({}, p, { id: remap[p.id] }) : p;
+        });
+      }
       if (!q.id) q.id = Util.uid('q');
       return q;
     });

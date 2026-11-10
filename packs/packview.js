@@ -86,6 +86,7 @@
       'body.fs5 .pv-ans,body.fs5 .pv-sol{font-size:21px}',
       'body.fs1 .pv-text,body.fs2 .pv-text,body.fs3 .pv-text,body.fs4 .pv-text,body.fs5 .pv-text{line-height:1.85}',
       'body.hide-ans .pv-ans,body.hide-ans .pv-sol{display:none}',
+      'body.hide-tags .pv-tag{display:none}',
       '@media print{.pv-bar{display:none}.pv-card{break-inside:avoid;box-shadow:none;border:1px solid var(--line)}}'
     ].join('');
   }
@@ -150,6 +151,7 @@
         '</header>' +
         '<div class="pv-bar">' +
           '<button data-pv="ans" class="on">显示答案</button>' +
+          '<button data-pv="tags">标签</button>' +
           '<div class="pv-fs">' +
             '<button data-pv="minus" aria-label="缩小字号">A−</button>' +
             '<span id="pvFs">1/6</span>' +
@@ -187,6 +189,17 @@
     }
     applyFs();
 
+    // 标签开关：默认隐藏（观课简洁模式），记在本机，下次打开保持
+    var tagsBtn = root.querySelector('[data-pv="tags"]');
+    var showTags = false;
+    try { showTags = localStorage.getItem('pv.tags') === '1'; } catch (e) { showTags = false; }
+    function applyTags() {
+      document.body.classList.toggle('hide-tags', !showTags);
+      if (tagsBtn) tagsBtn.classList.toggle('on', showTags);
+      try { localStorage.setItem('pv.tags', showTags ? '1' : '0'); } catch (e) {}
+    }
+    applyTags();
+
     root.addEventListener('click', function (e) {
       var btn = e.target.closest('[data-pv]');
       if (btn) {
@@ -195,6 +208,9 @@
           document.body.classList.toggle('hide-ans');
           btn.classList.toggle('on', !document.body.classList.contains('hide-ans'));
           btn.textContent = document.body.classList.contains('hide-ans') ? '显示答案' : '隐藏答案';
+        } else if (k === 'tags') {
+          showTags = !showTags;
+          applyTags();
         } else if (k === 'plus') {
           if (fsLv < FS_MAX) { fsLv++; applyFs(); }
         } else if (k === 'minus') {

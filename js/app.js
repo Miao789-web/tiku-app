@@ -2170,6 +2170,73 @@
     UI.toast('已导出，用微信发到教室电脑双击打开', 3000);
   }
 
+  /* =========================================================
+   * 数据码同步（手机 ↔ 电脑，免同一 Wi-Fi）
+   * 一端把题库（含考点/组卷/配图）压成一串文字码，微信发给自己，
+   * 另一端粘贴导入合并。数据只存各自本机；只有讲评包上云。
+   * ======================================================= */
+  const DCODE_PREFIX = 'TK1.';
+
+  function dcodeEncode(data) {
+    return DCODE_PREFIX + LZString.compressToEncodedURIComponent(JSON.stringify(data));
+  }
+
+  function dcodeDecode(text) {
+    let s = String(text || '').trim();
+    if (!s) throw new Error('请先粘贴数据码');
+    if (s[0] === '{') {   // 兼容直接粘贴 JSON 备份
+      const d = JSON.parse(s);
+      if (!d || !Array.isArray(d.questions)) throw new Error('不是题点的数据');
+      return d;
+    }
+    const i = s.indexOf(DCODE_PREFIX);
+    if (i < 0) throw new Error('不是有效的数据码（应以 TK1. 开头）');
+    s = s.slice(i + DCODE_PREFIX.length).replace(/\s+/g, '');
+    const json = LZString.decompressFromEncodedURIComponent(s);
+    if (!json) throw new Error('数据码不完整：发送时可能被折断，重新复制粘贴试试');
+    const d = JSON.parse(json);
+    if (!d || !Array.isArray(d.questions)) throw new Error('数据码内容不正确');
+    return d;
+  }
+
+  function dcodeGenDraw() {
+    const st = S._dc;
+    const daysChips = [{ v: 0, l: '全部' }, { v: 3, l: '最近 3 天' }, { v: 7, l: '最近 7 天' }].map(function (o) {
+      return '<button class="tag' + (st.days === o.v ? ' active' : '') + '" data-act="dcode:opt" data-k="days" data-v="' + o.v + '">' + o.l + '</button>';
+    }).join('');
+    let result = '';
+    if (st.code) {
+      const kb = Math.round(st.code.length / 1024);
+      result = '<div class="field" style="margin-top:12px"><label>数据码（' + st.n + ' 题 · 配图 ' + st.imgs + ' 张 · 约 ' +
+        (kb >= 1024 ? (kb / 1024).toFixed(1) + ' MB' : kb + ' KB') + '）</label>' +
+        '<textarea class="input" id="dcodeOut" readonly rows="7" style="word-break:break-all" onclick="this.select()">' + esc(st.code) + '</textarea></div>' +
+        '<button class="btn primary block" data-act="dcode:copy">📋 复制数据码</button>' +
+        (st.code.length > 300000
+          ? '<p class="muted" style="margin:6px 0 0">码比较长，微信发长文本可能被折断。建议改成「只传文字」重新生成，或改用「导出全部数据（JSON）」发文件。</p>'
+          : '<p class="muted" style="margin:6px 0 0">复制后用微信/QQ 发给自己（或文件传输助手），另一台设备在「粘贴数据码导入」里粘贴即可。</p>');
+    }
+    UI.sheet({ title: '生成数据码', body:
+      '<p class="muted" style="margin-bottom:10px">把题库打包成一串文字，另一台设备粘贴导入即合并，不用连同一 Wi-Fi、不用上传云端。</p>' +
+      '<div class="field"><label>范围</label><div class="chips">' + daysChips + '</div></div>' +
+      '<div class="field"><label>配图</label><div class="chips">' +
+        '<button class="tag' + (st.withImg ? ' active' : '') + '" data-act="dcode:opt" data-k="withImg" data-v="1">含配图（码大）</button>' +
+        '<button class="tag' + (!st.withImg ? ' active' : '') + '" data-act="dcode:opt" data-k="withImg" data-v="0">只传文字（码小）</button></div></div>' +
+      '<button class="btn ghost block mt8" data-act="dcode:make">生成数据码</button>' + result });
+  }
+
+  async function dcodeGenSheet() {
+    S._dc = { withImg: true, days: 0, code: '', n: 0, imgs: 0 };
+    dcodeGenDraw();
+  }
+
+  function dcodeImportSheet() {
+    UI.sheet({ title: '粘贴数据码导入', body:
+      '<p class="muted" style="margin-bottom:10px">把另一台设备生成的数据码整段粘贴到下面（微信里长按 → 复制，到这里长按 → 粘贴），点「检查并导入」确认合并。</p>' +
+      '<textarea class="input" id="dcodeIn" rows="8" placeholder="粘贴 TK1. 开头的数据码（也支持直接粘贴备份 JSON）"></textarea>' +
+      '<button class="btn primary block mt8" data-act="dcode:doImport">检查并导入</button>' +
+      '<p class="muted" style="margin:6px 0 0">合并规则：考点按名字归到本机已有考点；题目按编号，新的加入、已有的用码里的版本覆盖。导入的数据只存在本机浏览器里，不上云。</p>' });
+  }
+
   PAGES.jp = {
     tab: false,
     topbar() {
@@ -2180,6 +2247,7 @@
           (on ? '批量选择 · 已选 ' + sel + ' 题' : n + ' 道待讲评') + '</div></div>' +
         (on ? '<button class="tb-btn text" data-act="jp:batch">退出</button>' : '') +
         (!on && n ? '<button class="tb-btn text" data-act="jp:batch">批量</button>' : '') +
+        (!on && n ? '<button class="tb-btn text" data-act="jp:tags">' + (S.jpTags ? '隐藏标签' : '显示标签') + '</button>' : '') +
         (!on && n ? '<button class="tb-btn text" data-act="pack:open">生成包</button>' : '');
     },
     async load() {
@@ -2227,7 +2295,6 @@
             '</div>'
           : '<div class="row between wrap" style="margin:16px 4px 0;gap:8px"><span class="muted" style="font-size:12.5px">共 ' + qs.length + ' 道待讲评</span>' +
               '<span class="row" style="gap:10px">' +
-                '<button class="small" style="color:var(--ink-3)" data-act="jp:tags">' + (S.jpTags ? '隐藏标签' : '显示标签') + '</button>' +
                 '<button class="small" style="color:var(--ink-3)" data-act="jp:clear">清空讲评单</button>' +
               '</span></div>' + last);
     }
@@ -3542,6 +3609,12 @@
           '<button class="btn ghost block mt8" data-act="data:syncDown">从电脑恢复 / 合并到本机</button>' +
           '<p class="muted mt8">需与电脑连同一 Wi-Fi 且电脑上的服务在运行。恢复采用合并方式：相同题目覆盖为电脑版本，本机新增的题目保留。</p>' +
           '<p class="muted mt8" id="syncSizeLine">数据体积估算中…</p>' +
+        '</section>' +
+        '<section class="card">' +
+          '<div class="card-h"><h3>数据码同步（不用连同一 Wi-Fi）</h3></div>' +
+          '<button class="btn ghost block" data-act="dcode:gen">📤 生成数据码</button>' +
+          '<button class="btn ghost block mt8" data-act="dcode:import">📥 粘贴数据码导入</button>' +
+          '<p class="muted mt8">手机拍照录的题、电脑导入的题，用一串文字码互相搬：一端生成 → 微信发给自己 → 另一端粘贴导入。适合随时把两端题库合并成一样。同步后的数据都存在各自本机浏览器里，不上云；只有讲评包才上传云端。</p>' +
         '</section>' +
         '<section class="card">' +
           '<button class="btn ghost block" data-act="data:export">导出全部数据（JSON）</button>' +
@@ -7104,6 +7177,72 @@
       };
       input.click();
     },
+    /* ---- 数据码同步 ---- */
+    'dcode:gen': function () { dcodeGenSheet(); },
+    'dcode:opt': function (d) {
+      const st = S._dc;
+      if (!st) return;
+      if (d.k === 'days') st.days = parseInt(d.v, 10) || 0;
+      else st.withImg = d.v === '1';
+      st.code = '';
+      sheetRedraw(function () { dcodeGenDraw(); });
+    },
+    'dcode:make': async function () {
+      const st = S._dc;
+      if (!st) return;
+      const all = await DB.all('questions');
+      const cut = st.days ? Date.now() - st.days * 86400000 : 0;
+      const picked = cut ? all.filter(function (q) { return (q.createdAt || 0) >= cut; }) : all.slice();
+      if (!picked.length) { UI.toast('这个范围里没有题目'); return; }
+      const need = {};
+      picked.forEach(function (q) {
+        (q.points || []).forEach(function (p) { if (p && p.id) need[p.id] = 1; });
+        if (q.pointId) need[q.pointId] = 1;
+      });
+      const points = (await DB.all('points')).filter(function (p) { return need[p.id]; });
+      let imgs = 0;
+      const questions = picked.map(function (q) {
+        imgs += (q.images || []).length;
+        return st.withImg ? q : Object.assign({}, q, { images: [] });
+      });
+      const papers = st.days ? [] : (await DB.all('papers'));
+      const code = dcodeEncode({ app: '题点', version: 2, exportedAt: new Date().toISOString(), questions: questions, points: points, papers: papers });
+      st.code = code;
+      st.n = questions.length;
+      st.imgs = st.withImg ? imgs : 0;
+      dcodeGenDraw();
+    },
+    'dcode:copy': async function () {
+      const el = document.getElementById('dcodeOut');
+      if (!el) return;
+      await copyText(el.value);
+      UI.toast('已复制，去微信发给另一台设备', 3000);
+    },
+    'dcode:import': function () { dcodeImportSheet(); },
+    'dcode:doImport': async function () {
+      const ta = document.getElementById('dcodeIn');
+      if (!ta) return;
+      let data;
+      try { data = dcodeDecode(ta.value); }
+      catch (e) { UI.toast(e.message, 3200); return; }
+      const existed = await DB.all('questions');
+      const exIds = {};
+      existed.forEach(function (q) { exIds[q.id] = 1; });
+      let add = 0, upd = 0, imgs = 0;
+      data.questions.forEach(function (q) {
+        if (exIds[q.id]) upd++; else add++;
+        imgs += (q.images || []).length;
+      });
+      const ok = await UI.confirm('码里共 ' + data.questions.length + ' 道题：新增 ' + add + '、更新 ' + upd + '，配图 ' + imgs + ' 张。\n合并到本机题库？（相同编号的题会被码里的版本覆盖，本机其他题不动）');
+      if (!ok) return;
+      try {
+        await Store.importAll(data);
+      } catch (e) { UI.toast('导入失败：' + (e.message || e), 3000); return; }
+      UI.close();
+      UI.toast('已合并：新增 ' + add + ' 题、更新 ' + upd + ' 题', 3200);
+      await render();
+    },
+
     'data:clear': async function () {
       const ok = await UI.confirm('清空所有题目和考点？此操作不可恢复，建议先导出备份。');
       if (!ok) return;
@@ -7276,6 +7415,7 @@
 
   /* 调试钩子（控制台可用：__tiku.S、__tiku.navigate(...) 等） */
   window.__tiku = { S: S, navigate: navigate, UI: UI, ACTIONS: ACTIONS,
+    dcodeEncode: dcodeEncode, dcodeDecode: dcodeDecode,
     ensureSession: ensureSession, buildDrafts: buildDrafts, classifyDrafts: classifyDrafts,
     seedDemo: seedDemo, Store: Store, resolveUnitPoint: resolveUnitPoint, unitSuffixOf: unitSuffixOf,
     dcDaySet: dcDaySet, dcWeightedPool: dcWeightedPool, dcNextMonday: dcNextMonday,
