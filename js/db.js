@@ -114,6 +114,29 @@ const DB = (function () {
  * Store — 业务语义层（题目 / 考点 / 图片）
  * ========================================================= */
 const Store = (function () {
+  /* 写入通知：数据一变就回调（云端文字快照同步用，避免每处动作都手动补一次） */
+  let changeHook = null;
+  function onChange(fn) { changeHook = fn; }
+  function notifyChange() {
+    if (!changeHook) return;
+    try { changeHook(); } catch (e) { /* 同步失败不影响本地操作 */ }
+  }
+
+  /* 删除记录（只记 id，供另一台设备同步时把同样的题删掉；最多留 300 条） */
+  const DEL_KEY = 'tiku.sync.del';
+  function readDeleted() {
+    try { return JSON.parse(localStorage.getItem(DEL_KEY) || '[]'); } catch (e) { return []; }
+  }
+  function addDeleted(id) {
+    if (!id) return;
+    const a = readDeleted();
+    if (a.indexOf(id) < 0) a.push(id);
+    while (a.length > 300) a.shift();
+    try { localStorage.setItem(DEL_KEY, JSON.stringify(a)); } catch (e) {}
+  }
+  function clearDeletions() {
+    try { localStorage.removeItem(DEL_KEY); } catch (e) {}
+  }
 
   /* ---------- 图片 ---------- */
   const urlCache = new Map();
@@ -176,6 +199,7 @@ const Store = (function () {
         updatedAt: now
       }, data);
       await DB.put('questions', q);
+      notifyChange();
       return q;
     },
 
@@ -184,6 +208,7 @@ const Store = (function () {
       if (!q) return null;
       const next = Object.assign(q, patch, { updatedAt: Date.now() });
       await DB.put('questions', next);
+      notifyChange();
       return next;
     },
 
@@ -196,6 +221,8 @@ const Store = (function () {
         if (!rest.some(x => x.assetId === q.assetId)) await Assets.remove(q.assetId);
       }
       await Points.recount();
+      addDeleted(id);
+      notifyChange();
     },
 
     async list(filter) {
@@ -420,8 +447,10 @@ const Store = (function () {
     await DB.bulkPut('questions', qs);
     if (Array.isArray(data.papers) && data.papers.length) await DB.bulkPut('papers', data.papers);
     await Points.recount();
+    notifyChange();
     return { questions: qs.length, points: toAdd.length };
   }
 
-  return { Assets, Questions, Points, Papers, Mastery, stats, exportAll, importAll };
+  return { Assets, Questions, Points, Papers, Mastery, stats, exportAll, importAll, onChange,
+    deletions: readDeleted, clearDeletions: clearDeletions };
 })();

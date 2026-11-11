@@ -1201,30 +1201,78 @@
    *  - 有章节时考点名带「·第N单元」后缀，同单元同考点自动归到一起；
    *  - 已带后缀的先按精确匹配复用，避免被模糊规则并回无后缀考点。
    */
+  /** 从「·第N单元」后缀反推单元名（不在目录返回 ''） */
+  function unitSuffixToUnit(name, subject, grade) {
+    const m = String(name || '').match(/·第(\d+)单元$/);
+    if (!m) return '';
+    const cat = Catalog.get(subject, grade, S.defaults.term, S.defaults.version);
+    const i = Number(m[1]) - 1;
+    return (i >= 0 && i < cat.length) ? cat[i] : '';
+  }
+
   async function resolveUnitPoint(rawName, unit, subject, grade) {
     const base = Normalize.pretty(rawName || '') || '未分类';
     const suf = unitSuffixOf(unit, subject, grade);
     const suffixed = (base !== '未分类' && suf && !/第\d+单元$/.test(base)) ? base + suf : base;
-    if (suffixed === base) return Normalize.resolve(base, { subject: subject, grade: grade });
-
-    const fixed = Normalize.canonicalOf(base) || base;      // 先走同义词表
-    const target = Normalize.pretty(fixed) + suf;
-    const n = Normalize.norm(target);
     const pts = (await DB.all('points')).filter(function (p) {
       return p.subject === subject && p.grade === grade;
     });
-    const hit = pts.find(function (p) { return p.norm === n; });
-    if (hit) return { point: hit, isNew: false, matched: 'exact', score: 1 };
 
-    // 新建带后缀的考点（别名记下无后缀叫法，方便下次联想）
-    const point = {
-      id: Util.uid('p'), name: target, norm: n,
-      subject: subject, grade: grade,
-      aliases: Array.from(new Set([base].concat(fixed !== base ? [fixed] : []))),
-      count: 0, createdAt: Date.now()
-    };
-    await DB.put('points', point);
-    return { point: point, isNew: true, matched: 'unit-new', score: 1 };
+    // 1) 单元在目录里：考点名带「·第N单元」后缀，只在同后缀考点里精确匹配，
+    //    匹配不到就新建——绝不合并到其他单元的同名考点
+    //    也不套用全局同义词表：老师在这个单元写「轴对称图形」就该是「轴对称图形」，
+    //    改写成「平面图形的认识」正是分类被改乱的原因
+    if (suffixed !== base) {
+      const target = base + suf;
+      const n = Normalize.norm(target);
+      const hit = pts.find(function (p) { return p.norm === n; });
+      if (hit) {
+        if (unit && (hit.units || []).indexOf(unit) < 0) {
+          hit.units = (hit.units || []).concat([unit]);
+          await DB.put('points', hit);
+        }
+        return { point: hit, isNew: false, matched: 'exact', score: 1 };
+      }
+      // 新建带后缀的考点（别名记下无后缀叫法，方便下次联想）
+      const point = {
+        id: Util.uid('p'), name: target, norm: n,
+        subject: subject, grade: grade, units: unit ? [unit] : [],
+        aliases: [base],
+        count: 0, createdAt: Date.now()
+      };
+      await DB.put('points', point);
+      return { point: point, isNew: true, matched: 'unit-new', score: 1 };
+    }
+
+    // 2) 选了单元但单元不在目录（没有「第N单元」后缀可用）：
+    //    只在「同单元」的考点里按名字/别名找，找不到就新建——不做跨单元归并
+    if (unit) {
+      const nb = Normalize.norm(base);
+      const sameUnit = pts.filter(function (p) {
+        return (p.units || []).indexOf(unit) >= 0 || unitSuffixToUnit(p.name, subject, grade) === unit;
+      });
+      const hit = sameUnit.find(function (p) {
+        return p.norm === nb || Normalize.pretty(pointBaseName(p.name)) === base ||
+          (p.aliases || []).some(function (a) { return Normalize.pretty(a) === base; });
+      });
+      if (hit) {
+        if ((hit.units || []).indexOf(unit) < 0) {
+          hit.units = (hit.units || []).concat([unit]);
+          await DB.put('points', hit);
+        }
+        return { point: hit, isNew: false, matched: 'unit-exact', score: 1 };
+      }
+      const point = {
+        id: Util.uid('p'), name: base, norm: nb,
+        subject: subject, grade: grade, units: [unit],
+        aliases: [base], count: 0, createdAt: Date.now()
+      };
+      await DB.put('points', point);
+      return { point: point, isNew: true, matched: 'unit-new', score: 1 };
+    }
+
+    // 3) 没选单元：按原来的全局同义规则解析
+    return Normalize.resolve(base, { subject: subject, grade: grade });
   }
 
   /* ---- 一题挂多个考点 / 多个单元 ----
@@ -1625,6 +1673,12 @@
     topbar.classList.toggle('hidden', !page.topbar);
     view.innerHTML = page.html(S.params);
     if (page.after) page.after(S.params);
+    // 删除/编辑后回到原位置：S._scrollAnchor 记录的是操作前那张卡的页面纵坐标
+    if (typeof S._scrollAnchor === 'number') {
+      const maxY = document.documentElement.scrollHeight - window.innerHeight;
+      window.scrollTo(0, Math.max(0, Math.min(S._scrollAnchor, maxY)));
+      S._scrollAnchor = null;
+    }
     // 确认页内容有变化时自动存草稿（编辑中随时可恢复）
     if (S.page === 'confirm' && S.session && S.drafts.length) storeDraft();
     document.querySelectorAll('.tab').forEach(function (b) {
@@ -2229,12 +2283,230 @@
     dcodeGenDraw();
   }
 
+  /* ---- 导出分版本（新增/全部）+ 草稿随包 ---- */
+  function draftForExport(stripImgs) {
+    const d = readDraftStore();
+    if (!d || !(d.drafts || []).length) return null;
+    if (!stripImgs) return d;
+    const c = JSON.parse(JSON.stringify(d));
+    (c.drafts || []).forEach(function (x) { x.images = []; });
+    c.pool = [];
+    return c;
+  }
+
+  /** 导入时合并草稿：本机没草稿直接用；都有则把导入的接在后面（按文本+答案去重） */
+  function mergeImportedDraft(dr) {
+    if (!dr || !Array.isArray(dr.drafts) || !dr.drafts.length) return 0;
+    const local = readDraftStore();
+    if (!local || !Array.isArray(local.drafts) || !local.drafts.length) {
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify(dr)); } catch (e) { return 0; }
+      return dr.drafts.length;
+    }
+    const seen = {};
+    local.drafts.forEach(function (x) { seen[(x.text || '').slice(0, 60) + '|' + (x.answer || '')] = 1; });
+    let n = 0, nextNo = local.drafts.length + 1;
+    dr.drafts.forEach(function (x) {
+      const k = (x.text || '').slice(0, 60) + '|' + (x.answer || '');
+      if (seen[k]) return;
+      seen[k] = 1;
+      x.no = nextNo++;
+      local.drafts.push(x);
+      n++;
+    });
+    local.savedAt = Date.now();
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify(local)); } catch (e) { return 0; }
+    return n;
+  }
+
+  async function exportSheet() {
+    const data = await Store.exportAll();
+    const last = Number(localStorage.getItem('tiku.lastExportAt') || 0);
+    const imgs = data.questions.reduce(function (n, q) { return n + (q.images || []).length; }, 0);
+    const newQs = last ? data.questions.filter(function (q) { return (q.createdAt || 0) > last; }) : [];
+    S._exp = { data: data, last: last };
+    const when = last
+      ? new Date(last).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      : '';
+    const draftN = (function () { const d = readDraftStore(); return d && d.drafts ? d.drafts.length : 0; })();
+    let body = '<p class="muted" style="margin-bottom:10px">本机现有 <b>' + data.questions.length + '</b> 道题 · <b>' +
+      data.points.length + '</b> 个考点 · 配图 <b>' + imgs + '</b> 张' +
+      (draftN ? ' · 未入库草稿 <b>' + draftN + '</b> 道' : '') +
+      (last ? '<br>上次导出：' + esc(when) + '，之后新增 <b>' + newQs.length + '</b> 道题' : '<br>还没有导出过') + '</p>';
+    if (last && newQs.length) {
+      body += '<button class="btn primary block" data-act="data:doExport" data-mode="inc">只导出上次之后新增的（' + newQs.length + ' 题）</button>' +
+        '<p class="muted" style="margin:6px 0 10px">推荐：另一端导入时相同的题不会重复进。</p>';
+    }
+    body += '<button class="btn ' + (last && newQs.length ? 'ghost' : 'primary') + ' block" data-act="data:doExport" data-mode="all">导出全部（' + data.questions.length + ' 题）</button>' +
+      '<p class="muted" style="margin:6px 0 0">导出文件里带上草稿（另一端导入后可在首页继续编辑入库）。导出后会记录「本次导出时间」，下次默认只导新增。</p>';
+    UI.sheet({ title: '导出数据', body: body });
+  }
+
   function dcodeImportSheet() {
     UI.sheet({ title: '粘贴数据码导入', body:
       '<p class="muted" style="margin-bottom:10px">把另一台设备生成的数据码整段粘贴到下面（微信里长按 → 复制，到这里长按 → 粘贴），点「检查并导入」确认合并。</p>' +
       '<textarea class="input" id="dcodeIn" rows="8" placeholder="粘贴 TK1. 开头的数据码（也支持直接粘贴备份 JSON）"></textarea>' +
       '<button class="btn primary block mt8" data-act="dcode:doImport">检查并导入</button>' +
       '<p class="muted" style="margin:6px 0 0">合并规则：考点按名字归到本机已有考点；题目按编号，新的加入、已有的用码里的版本覆盖。导入的数据只存在本机浏览器里，不上云。</p>' });
+  }
+
+  /* =========================================================
+   * 云端文字快照同步（只同步文字/考点/删除记录，配图不同步）
+   * ======================================================= */
+  const SYNC_CURSOR_KEY = 'tiku.sync.cursor';
+  const SYNC_HASH_KEY = 'tiku.sync.hash';
+
+  function syncReady() { return !!(window.CloudSync && window.CloudSync.originOk()); }
+  function readSyncCursor() {
+    try { return JSON.parse(localStorage.getItem(SYNC_CURSOR_KEY) || '{}'); } catch (e) { return {}; }
+  }
+  function writeSyncCursor(c) {
+    try { localStorage.setItem(SYNC_CURSOR_KEY, JSON.stringify(c)); } catch (e) {}
+  }
+
+  async function buildSyncPayload() {
+    const data = await Store.exportAll();
+    const qs = data.questions.map(function (q) {
+      const c = Object.assign({}, q);
+      delete c.images;      // 配图不进云端
+      delete c.assetId;
+      return c;
+    });
+    return { questions: qs, points: data.points, papers: data.papers, deleted: Store.deletions(), savedAt: Date.now() };
+  }
+
+  let syncPushTimer = null, syncBusy = false;
+  function scheduleSyncPush(delay) {
+    if (!syncReady()) return;
+    clearTimeout(syncPushTimer);
+    syncPushTimer = setTimeout(function () { syncPushNow(); }, delay == null ? 2500 : delay);
+  }
+
+  async function syncPushNow() {
+    if (!syncReady() || syncBusy) return false;
+    syncBusy = true;
+    try {
+      const payload = await buildSyncPayload();
+      const h = window.CloudSync.hashOf(JSON.stringify(payload));
+      if (localStorage.getItem(SYNC_HASH_KEY) === h) { S.syncMsg = '内容没变化'; return true; }
+      await window.CloudSync.push(payload, h);
+      localStorage.setItem(SYNC_HASH_KEY, h);
+      if ((payload.deleted || []).length) Store.clearDeletions();
+      S.syncMsg = '已上传 ' + payload.questions.length + ' 题（' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '）';
+      return true;
+    } catch (e) {
+      S.syncMsg = '上传失败：' + (e.message || e);
+      return false;
+    } finally {
+      syncBusy = false;
+    }
+  }
+
+  /** 把另一台设备的文字快照并到本机：文字覆盖，配图保留本机的 */
+  async function applySyncDoc(doc) {
+    const payload = doc && doc.payload;
+    if (!payload || !Array.isArray(payload.questions)) return 0;
+    const remoteAt = doc.updated_at || 0;
+
+    // 1) 考点：同 norm 复用本机，不重复建
+    const localPts = await DB.all('points');
+    const byNorm = {};
+    localPts.forEach(function (p) { byNorm[p.subject + '|' + p.grade + '|' + (p.norm || p.name)] = p; });
+    const remap = {};
+    const toAdd = [];
+    (payload.points || []).forEach(function (p) {
+      if (!p || !p.id) return;
+      const key = p.subject + '|' + p.grade + '|' + (p.norm || p.name);
+      if (byNorm[key]) remap[p.id] = byNorm[key].id;
+      else { byNorm[key] = p; toAdd.push(p); }
+    });
+    if (toAdd.length) await DB.bulkPut('points', toAdd);
+
+    // 2) 题目：本机更新过的不动；其余用远端文字覆盖，配图保留
+    const local = await DB.all('questions');
+    const byId = {};
+    local.forEach(function (q) { byId[q.id] = q; });
+    let n = 0;
+    for (const rq of payload.questions) {
+      if (!rq || !rq.id) continue;
+      const lq = byId[rq.id];
+      if (lq && (lq.updatedAt || 0) > (rq.updatedAt || 0)) continue;   // 本机的新，别覆盖
+      const next = Object.assign({}, rq);
+      if (next.pointId && remap[next.pointId]) next.pointId = remap[next.pointId];
+      if (Array.isArray(next.points)) {
+        next.points = next.points.map(function (p) {
+          return p && remap[p.id] ? Object.assign({}, p, { id: remap[p.id] }) : p;
+        });
+      }
+      next.images = (lq && lq.images) || [];        // 图只认本机的
+      next.assetId = (lq && lq.assetId) || '';
+      next.fromSync = true;                          // 标记：配图没跟着来
+      await DB.put('questions', next);
+      n++;
+    }
+
+    // 3) 删除记录：另一台删掉的题，本机也删（本机改得更晚的保留）
+    for (const id of (payload.deleted || [])) {
+      const lq = byId[id];
+      if (!lq) continue;
+      if ((lq.updatedAt || 0) > remoteAt) continue;
+      await DB.del('questions', id);
+      n++;
+    }
+    await Store.Points.recount();
+    return n;
+  }
+
+  async function syncPullNow(silent) {
+    if (!syncReady()) return 0;
+    if (syncBusy) return 0;
+    let docs;
+    syncBusy = true;
+    try {
+      docs = await window.CloudSync.pull();
+    } catch (e) {
+      S.syncMsg = '拉取失败：' + (e.message || e);
+      return 0;
+    } finally {
+      syncBusy = false;
+    }
+    const cursor = readSyncCursor();
+    const me = window.CloudSync.deviceId();
+    let applied = 0, newest = 0;
+    for (const doc of docs) {
+      if (!doc || doc.device === me) continue;
+      if ((doc.updated_at || 0) <= (cursor[doc.device] || 0)) continue;
+      try {
+        applied += await applySyncDoc(doc);
+        cursor[doc.device] = doc.updated_at || 0;
+        newest = Math.max(newest, doc.updated_at || 0);
+      } catch (e) {
+        S.syncMsg = '合并失败：' + (e.message || e);
+      }
+    }
+    writeSyncCursor(cursor);
+    if (newest) S.syncMsg = '已从另一台设备同步（' + new Date(newest).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '）';
+    if (applied) {
+      if (!silent) UI.toast('已同步 ' + applied + ' 处改动', 2600);
+      S.cache.homeDraft = null;
+      await render();
+    }
+    return applied;
+  }
+
+  function syncStatusHtml() {
+    const cs = window.CloudSync;
+    if (!cs) return '<p class="muted">同步组件没加载</p>';
+    if (!cs.originOk()) {
+      return '<p class="small" style="color:var(--warn);line-height:1.7;margin:0 0 8px">' +
+        '自动同步需要联网、并从线上地址打开题库（当前是从本地文件打开的，浏览器不允许跨域请求）。<br>' +
+        '改用平时打开题库的那个线上链接即可自动同步。</p>';
+    }
+    const st = cs.status || {};
+    return '<p class="small" style="line-height:1.9;margin:0 0 8px">' +
+      '设备：<b>' + esc(cs.deviceName()) + '</b>' +
+      (st.lastPush ? '<br>上次上传：' + esc(new Date(st.lastPush).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : '') +
+      (st.lastPull ? '<br>上次拉取：' + esc(new Date(st.lastPull).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : '') +
+      (S.syncMsg ? '<br>' + esc(S.syncMsg) : '') + '</p>';
   }
 
   PAGES.jp = {
@@ -2650,13 +2922,18 @@
         '<button class="tag" data-act="confirm:addUnit">＋ 新增章节</button>' +
         '</div>';
 
-      // 课时（选填）：已选章节时给出该单元下用过的课时，方便点选
-      const knownLs = s.unit ? knownLessonsOf(s.unit) : knownLessonsOf('');
-      const lessonChips = knownLs.length
-        ? '<div class="chips mt8">' + knownLs.map(function (L) {
-            return '<button class="tag' + (s.lesson === L ? ' active' : '') + '" data-act="confirm:lesson" data-v="' + esc(L) + '">' + esc(L) + '</button>';
-          }).join('') + '</div>'
-        : '';
+      // 课时（选填）：必须先选章节；选定后只列「该章节」的课时，绝不混入其他章节的课时
+      let lessonChips;
+      if (!s.unit) {
+        lessonChips = '<p class="muted" style="font-size:12px;margin-top:6px">先在上面选章节，再选课时（只列这个章节配好的课时）</p>';
+      } else {
+        const knownLs = knownLessonsOf(s.unit, s.subject, s.grade);
+        lessonChips = knownLs.length
+          ? '<div class="chips mt8">' + knownLs.map(function (L) {
+              return '<button class="tag' + (s.lesson === L ? ' active' : '') + '" data-act="confirm:lesson" data-v="' + esc(L) + '">' + esc(L) + '</button>';
+            }).join('') + '</div>'
+          : '<p class="muted" style="font-size:12px;margin-top:6px">「' + esc(s.unit) + '」还没配课时——去「我的 → 设置 → 每单元的课时」里配好，这里就只显示这个章节的课时；也可以直接在框里手填。</p>';
+      }
 
       // 红笔答案检测：红字一般就是这道题的答案，已按位置填到对应题答案框（手写识别仅供参考）
       const redLines = [];
@@ -2703,6 +2980,7 @@
             ? '<div class="solution-box"><b>解题思路</b>' + esc(d.solution) + '</div>'
             : '') +
           '<div class="qops">' +
+            '<button data-act="draft:saveOne" data-i="' + i + '">✓ 保存并入库</button>' +
             '<button data-act="draft:edit" data-i="' + i + '">编辑</button>' +
             ((S.session.imgPool && S.session.imgPool.length)
               ? '<button data-act="draft:imgs" data-i="' + i + '">配图</button>' : '') +
@@ -3169,9 +3447,7 @@
     keep('page', ['practice', 'ptype'], pageNoOf);
     keep('unit', ['practice', 'ptype', 'page'], function (q) { return qUnitsOf(q); });
     keep('lesson', ['practice', 'ptype', 'page', 'unit'], function (q) { return practiceLessonsOf(q, f.unit); });
-    keep('point', ['practice', 'ptype', 'page', 'unit', 'lesson'], function (q) {
-      return qPointsOf(q).map(function (p) { return p.name; });
-    });
+    // 考点列的是全库考点，不做下级清理
   }
 
   function bankFilterSheet() {
@@ -3202,7 +3478,8 @@
     const lessonVals = sortLessons(Object.keys(distinctVals(sub(['practice', 'ptype', 'page', 'unit']), function (q) {
       return practiceLessonsOf(q, f.unit);
     })));
-    const pointVals = Object.keys(distinctVals(sub(['practice', 'ptype', 'page', 'unit', 'lesson']), function (q) {
+    // 考点列全部（不受上面条件缩小），保证任何状态下都能选到任意考点
+    const pointVals = Object.keys(distinctVals(all, function (q) {
       return qPointsOf(q).map(function (p) { return p.name; });
     })).sort(function (a, b) { return a.localeCompare(b, 'zh'); });
 
@@ -3222,7 +3499,7 @@
       '<div class="field"><label>单元</label>' + chipRow('unit', unitVals, function (v) { return unitLabelOf(v); }, '题库里还没有带单元的题') + '</div>' +
       '<div class="field"><label>课时' + (f.unit ? '（' + esc(f.unit) + ' 下）' : '') + '</label>' +
         chipRow('lesson', lessonVals, null, f.unit ? '这个单元的题还没分课时' : '题库里的题还没分课时') + '</div>' +
-      '<div class="field"><label>考点' + (f.unit ? '（' + esc(f.unit) + ' 下）' : '') + '</label>' +
+      '<div class="field"><label>考点（全部考点）<button class="small" style="color:var(--brand);font-weight:600;margin-left:8px" data-act="bf:pointMgr">管理 / 合并 / 删除</button></label>' +
         chipRow('point', pointVals, null, '题库里还没有题目') + '</div>' +
       '<div class="field"><label>题型</label><div class="chips wrapv">' +
         ['全部'].concat(CONFIG.questionTypes).map(function (t) {
@@ -3237,6 +3514,40 @@
         '<button class="btn primary grow" data-act="bf:apply">确认筛选（' + hitCount + ' 道）</button>' +
       '</div>';
     UI.sheet({ title: '筛选题库', body: body });
+  }
+
+  /* ---- 考点管理：全库考点列表，勾选后批量合并 / 批量删除 ---- */
+  async function pointMgrSheet() {
+    const sbj = S.bank.subject !== '全部' ? S.bank.subject : S.defaults.subject;
+    const gd = S.bank.grade !== '全部' ? S.bank.grade : S.defaults.grade;
+    const pts = (await DB.all('points')).filter(function (p) { return p.subject === sbj && p.grade === gd; })
+      .sort(function (a, b) { return (b.count || 0) - (a.count || 0) || a.name.localeCompare(b.name, 'zh'); });
+    S._pm = { pts: pts, sel: {} };
+    pointMgrDraw();
+  }
+
+  function pointMgrDraw() {
+    const st = S._pm;
+    if (!st) return;
+    const sel = st.sel;
+    const n = Object.keys(sel).length;
+    const rows = st.pts.map(function (p) {
+      const on = !!sel[p.id];
+      return '<div class="list-item" data-act="pm:sel" data-id="' + p.id + '">' +
+        '<span class="qno" style="' + (on ? 'background:var(--brand);color:#fff' : '') + ';flex-shrink:0">' + (on ? '✓' : '') + '</span>' +
+        '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
+        '<div class="li-s">' + (p.count || 0) + ' 题</div></div></div>';
+    }).join('');
+    const body =
+      '<p class="muted" style="margin-bottom:8px">勾选考点后可批量合并（把相近的几个并成一个）或删除（题目一起删，删错不可恢复）。共 ' + st.pts.length + ' 个考点。</p>' +
+      '<div style="max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:4px">' +
+        (rows || '<div class="empty small" style="padding:16px">这个教材还没有考点</div>') + '</div>' +
+      '<div class="row" style="gap:8px;margin-top:10px">' +
+        '<button class="btn ghost" data-act="pm:all">' + (n && n === st.pts.length ? '清空' : '全选') + '</button>' +
+        '<button class="btn soft grow" data-act="pm:merge"' + (n >= 2 ? '' : ' disabled') + '>合并所选（' + n + '）</button>' +
+        '<button class="btn danger-soft grow" data-act="pm:del"' + (n ? '' : ' disabled') + '>删除所选（' + n + '）</button>' +
+      '</div>';
+    UI.sheet({ title: '考点管理', body: body });
   }
 
   /* =========================================================
@@ -3609,6 +3920,16 @@
           '<button class="btn ghost block mt8" data-act="data:syncDown">从电脑恢复 / 合并到本机</button>' +
           '<p class="muted mt8">需与电脑连同一 Wi-Fi 且电脑上的服务在运行。恢复采用合并方式：相同题目覆盖为电脑版本，本机新增的题目保留。</p>' +
           '<p class="muted mt8" id="syncSizeLine">数据体积估算中…</p>' +
+        '</section>' +
+        '<section class="card">' +
+          '<div class="card-h"><h3>自动同步（只同步文字，不同步配图）</h3></div>' +
+          syncStatusHtml() +
+          '<button class="btn ghost block" data-act="sync:now">立即同步一次</button>' +
+          '<div class="row mt8" style="gap:8px;align-items:center">' +
+            '<input class="input" id="syncDevName" value="' + esc((window.CloudSync && window.CloudSync.deviceName()) || '') + '" style="flex:1" placeholder="这台设备叫什么（如 手机 / 办公室电脑）">' +
+            '<button class="btn soft" data-act="sync:rename" style="white-space:nowrap">改名</button>' +
+          '</div>' +
+          '<p class="muted mt8">保存题库后自动把题目文字（含考点、答案、删除记录）写到云端，另一台设备打开就自动并过来；配图体积太大不上云——要看图时，回原来那台设备点「导出数据」，在这台「导入 JSON」把图带过来。</p>' +
         '</section>' +
         '<section class="card">' +
           '<div class="card-h"><h3>数据码同步（不用连同一 Wi-Fi）</h3></div>' +
@@ -4138,6 +4459,71 @@
     await render();
   }
 
+  /** 单题入库（整批「确认入库」和单题「保存并入库」共用） */
+  async function saveDraftOne(d, s, assetId) {
+    // 多考点/多单元：一道题可同时挂多个考点、归入多个单元（各考点/单元题库里都能看到）
+    const entries = (d.points && d.points.length)
+      ? d.points
+      : [{ id: d.pointId || '', name: d.point || '未分类', units: d.pointUnit ? [d.pointUnit] : [] }];
+    const resolved = [];
+    const unitSet = [];
+    let primaryUnit = s.unit || '';   // 练习选了章节：这份练习的题默认都归那个单元
+    const addUnit = function (u) { if (u && unitSet.indexOf(u) < 0) unitSet.push(u); };
+    for (const e of entries) {
+      if (e.id) { resolved.push({ id: e.id, name: e.name }); continue; }
+      const u0 = (e.units && e.units[0]) || s.unit || '';
+      if (!primaryUnit && u0) primaryUnit = u0;
+      let pt = { id: '', name: e.name };
+      try {
+        const r = await resolveUnitPoint(e.name || '未分类', u0, s.subject, s.grade);
+        pt = { id: r.point.id, name: r.point.name };
+      } catch (err) { /* 解析失败按原名入库 */ }
+      resolved.push(pt);
+    }
+    if (!resolved.length) resolved.push({ id: '', name: '未分类' });
+    if (!primaryUnit) primaryUnit = s.unit || '';
+    addUnit(primaryUnit);
+    addUnit(s.unit);
+    entries.forEach(function (e) { (e.units || []).forEach(addUnit); });
+    // 课时：确认页填的课时作用于整批练习的主单元；新建考点时选的课时写到对应单元位置
+    const batchLesson = (s.lesson || '').trim();
+    const lessons = unitSet.map(function (u) { return u === primaryUnit ? batchLesson : ''; });
+    entries.forEach(function (e) {
+      if (!e.lesson) return;
+      (e.units || []).forEach(function (u) {
+        const i = unitSet.indexOf(u);
+        if (i >= 0 && !lessons[i]) lessons[i] = e.lesson;
+      });
+    });
+    await Store.Questions.create({
+      subject: s.subject,
+      grade: s.grade,
+      unit: primaryUnit,
+      units: unitSet,
+      lesson: lessons.filter(Boolean)[0] || '',
+      lessons: lessons,
+      batchName: s.batchName || '',
+      batchDate: s.batchDate || todayStr(),
+      practiceType: s.practiceType || '',
+      pageNo: s.pageNo || '',
+      pointId: resolved[0].id,
+      pointName: resolved[0].name,
+      points: resolved,
+      type: d.type,
+      difficulty: d.difficulty,
+      text: d.text,
+      options: d.options || [],
+      subs: d.subs || [],
+      answer: d.answer || '',
+      solution: d.solution || '',
+      images: (d.images && d.images.length) ? d.images : [],
+      assetId: assetId || '',
+      confidence: d.confidence,
+      needsConfirm: !!d.needsConfirm,
+      source: 'ocr'
+    });
+  }
+
   async function saveDrafts() {
     const s = S.session;
     if (!s || !S.drafts.length) return;
@@ -4155,68 +4541,10 @@
     if (dateInput && dateInput.value) s.batchDate = dateInput.value;
     const pageInput = document.getElementById('batchPage');
     if (pageInput) s.pageNo = pageInput.value.replace(/^[Pp]\.?\s*/, '').trim();
+    const lessonInput0 = document.getElementById('batchLesson');
+    if (lessonInput0) s.lesson = lessonInput0.value.trim();
     for (const d of S.drafts) {
-      // 多考点/多单元：一道题可同时挂多个考点、归入多个单元（各考点/单元题库里都能看到）
-      const entries = (d.points && d.points.length)
-        ? d.points
-        : [{ id: d.pointId || '', name: d.point || '未分类', units: d.pointUnit ? [d.pointUnit] : [] }];
-      const resolved = [];
-      const unitSet = [];
-      let primaryUnit = s.unit || '';   // 练习选了章节：这份练习的题默认都归那个单元
-      const addUnit = function (u) { if (u && unitSet.indexOf(u) < 0) unitSet.push(u); };
-      for (const e of entries) {
-        if (e.id) { resolved.push({ id: e.id, name: e.name }); continue; }
-        const u0 = (e.units && e.units[0]) || s.unit || '';
-        if (!primaryUnit && u0) primaryUnit = u0;
-        let pt = { id: '', name: e.name };
-        try {
-          const r = await resolveUnitPoint(e.name || '未分类', u0, s.subject, s.grade);
-          pt = { id: r.point.id, name: r.point.name };
-        } catch (err) { /* 解析失败按原名入库 */ }
-        resolved.push(pt);
-      }
-      if (!resolved.length) resolved.push({ id: '', name: '未分类' });
-      if (!primaryUnit) primaryUnit = s.unit || '';
-      addUnit(primaryUnit);
-      addUnit(s.unit);
-      entries.forEach(function (e) { (e.units || []).forEach(addUnit); });
-      // 课时：确认页填的课时作用于整批练习的主单元；新建考点时选的课时写到对应单元位置
-      const batchLesson = (s.lesson || '').trim();
-      const lessons = unitSet.map(function (u) { return u === primaryUnit ? batchLesson : ''; });
-      entries.forEach(function (e) {
-        if (!e.lesson) return;
-        (e.units || []).forEach(function (u) {
-          const i = unitSet.indexOf(u);
-          if (i >= 0 && !lessons[i]) lessons[i] = e.lesson;
-        });
-      });
-      await Store.Questions.create({
-        subject: s.subject,
-        grade: s.grade,
-        unit: primaryUnit,
-        units: unitSet,
-        lesson: lessons.filter(Boolean)[0] || '',
-        lessons: lessons,
-        batchName: s.batchName || '',
-        batchDate: s.batchDate || todayStr(),
-        practiceType: s.practiceType || '',
-        pageNo: s.pageNo || '',
-        pointId: resolved[0].id,
-        pointName: resolved[0].name,
-        points: resolved,
-        type: d.type,
-        difficulty: d.difficulty,
-        text: d.text,
-        options: d.options || [],
-        subs: d.subs || [],
-        answer: d.answer || '',
-        solution: d.solution || '',
-        images: (d.images && d.images.length) ? d.images : [],
-        assetId: assetIds[d.imgIndex] || '',
-        confidence: d.confidence,
-        needsConfirm: !!d.needsConfirm,
-        source: 'ocr'
-      });
+      await saveDraftOne(d, s, assetIds[d.imgIndex] || '');
       n++;
     }
     await Store.Points.recount();
@@ -4305,11 +4633,12 @@
               return n !== kw && n.indexOf(kw) >= 0;
             }).slice(0, 8);
             sugBox.innerHTML = hits.length
-              ? '<p class="muted" style="margin:8px 2px 4px">已有类似考点，点一下直接选用：</p>' +
+              ? '<p class="muted" style="margin:8px 2px 4px">已有类似考点（注意所属单元，点一下直接选用）：</p>' +
                 '<div class="pp-sug">' + hits.map(function (p) {
+                  const pu = (p.units && p.units[0]) || unitSuffixToUnit(p.name, subject, grade);
                   return '<div class="list-item" data-act="pp:pick" data-name="' + esc(p.name) + '" data-id="' + p.id + '">' +
                     '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
-                    '<div class="li-s">' + (p.count || 0) + ' 题</div></div>' + ARROW + '</div>';
+                    '<div class="li-s">' + (p.count || 0) + ' 题' + (pu ? ' · 属于「' + esc(pu) + '」' : '') + '</div></div>' + ARROW + '</div>';
                 }).join('') + '</div>'
               : '';
           });
@@ -4677,7 +5006,10 @@
     }).join('') || '<div class="empty small" style="padding:14px">这道题还没有图形，点下面按钮添加</div>';
     UI.sheet({
       title: '配图 · ' + (q.pointName || '未分类'),
-      body: '<p class="muted" data-sheet="imgs" style="margin-bottom:10px">点图片勾选（可多选），再点「删除所选」一次删掉；点右上角 ✕ 只删这一张。删完停在这里，不会跳回题目卡。</p>' +
+      body: (q.fromSync && !imgs.length
+          ? '<p class="small" style="background:var(--warn-soft,#fff7ed);color:#8a5300;border-radius:8px;padding:8px 10px;line-height:1.7;margin-bottom:8px">这道题是从另一台设备自动同步来的，<b>配图不随自动同步走</b>。要看原图：回原来那台设备点「导出数据」，再到这台设备「导入 JSON」把图带过来。</p>'
+          : '') +
+        '<p class="muted" data-sheet="imgs" style="margin-bottom:10px">点图片勾选（可多选），再点「删除所选」一次删掉；点右上角 ✕ 只删这一张。删完停在这里，不会跳回题目卡。</p>' +
         '<div>' + list + '</div>' +
         (imgs.length
           ? '<div class="lass-bar">' +
@@ -5184,6 +5516,41 @@
     },
     'draft:del': async function (d) {
       S.drafts.splice(+d.i, 1);
+      await render();
+    },
+    /* 单题「保存并入库」：这一题立刻入库并从草稿里移除，其余草稿继续编辑 */
+    'draft:saveOne': async function (d) {
+      const s = S.session;
+      if (!s) return;
+      const draft = S.drafts[+d.i];
+      if (!draft) return;
+      const batchInput = document.getElementById('batchName');
+      if (batchInput && batchInput.value.trim()) s.batchName = batchInput.value.trim();
+      const dateInput = document.getElementById('batchDate');
+      if (dateInput && dateInput.value) s.batchDate = dateInput.value;
+      const pageInput = document.getElementById('batchPage');
+      if (pageInput) s.pageNo = pageInput.value.replace(/^[Pp]\.?\s*/, '').trim();
+      const lessonInput = document.getElementById('batchLesson');
+      if (lessonInput) s.lesson = lessonInput.value.trim();
+      UI.toast('正在入库…');
+      const im = s.images[draft.imgIndex];
+      let assetId = '';
+      if (im && im.blob) { try { assetId = await Store.Assets.save(im.blob); } catch (e) { /* 存图失败不挡入库 */ } }
+      await saveDraftOne(draft, s, assetId);
+      const idx = S.drafts.indexOf(draft);
+      if (idx >= 0) S.drafts.splice(idx, 1);
+      await Store.Points.recount();
+      S.defaults.subject = s.subject; S.defaults.grade = s.grade; saveDefaults();
+      if (!S.drafts.length) {
+        clearSession();
+        clearDraftStore();
+        S.cache.homeDraft = null;
+        UI.toast('已入库，这批题全部完成');
+        await navigate('bank');
+        return;
+      }
+      storeDraft();
+      UI.toast('已入库 1 道，剩余 ' + S.drafts.length + ' 道继续编辑', 2600);
       await render();
     },
 
@@ -6138,6 +6505,62 @@
       UI.close();
       render();
     },
+    'bf:pointMgr': function () { pointMgrSheet(); },
+    'pm:sel': function (d) {
+      const st = S._pm;
+      if (!st) return;
+      if (st.sel[d.id]) delete st.sel[d.id]; else st.sel[d.id] = 1;
+      sheetRedraw(function () { pointMgrDraw(); });
+    },
+    'pm:all': function () {
+      const st = S._pm;
+      if (!st) return;
+      const n = Object.keys(st.sel).length;
+      st.sel = {};
+      if (n !== st.pts.length) st.pts.forEach(function (p) { st.sel[p.id] = 1; });
+      sheetRedraw(function () { pointMgrDraw(); });
+    },
+    'pm:merge': async function () {
+      const st = S._pm;
+      if (!st) return;
+      const ids = Object.keys(st.sel);
+      if (ids.length < 2) { UI.toast('至少勾选 2 个考点'); return; }
+      const first = await DB.get('points', ids[0]);
+      if (!first) return;
+      const picked = await pickPoint('', first.subject, first.grade);
+      if (!picked) return;
+      if (!picked.id) { UI.toast('请选择一个已存在的考点作为合并目标'); return; }
+      let m = 0;
+      for (const id of ids) {
+        if (id === picked.id) continue;
+        await Store.Points.merge(id, picked.id);
+        m++;
+      }
+      await Store.Points.recount();
+      UI.toast('已把 ' + m + ' 个考点合并到「' + picked.name + '」', 3000);
+      S.cache.bankQ = null;
+      await pointMgrSheet();
+    },
+    'pm:del': async function () {
+      const st = S._pm;
+      if (!st) return;
+      const ids = Object.keys(st.sel);
+      if (!ids.length) { UI.toast('先勾选考点'); return; }
+      const names = st.pts.filter(function (p) { return st.sel[p.id]; }).map(function (p) { return p.name; }).join('、');
+      const ok = await UI.confirm('删除选中的 ' + ids.length + ' 个考点（' + names.slice(0, 40) + (names.length > 40 ? '…' : '') + '）及其下所有题目？不可恢复。');
+      if (!ok) return;
+      const qs = await DB.all('questions');
+      let nq = 0;
+      for (const q of qs) {
+        if (!qPointsOf(q).some(function (p) { return p.id && st.sel[p.id]; })) continue;
+        await Store.Questions.remove(q.id);
+        nq++;
+      }
+      for (const id of ids) await DB.del('points', id);
+      UI.toast('已删除 ' + ids.length + ' 个考点、' + nq + ' 道题', 3000);
+      S.cache.bankQ = null;
+      await pointMgrSheet();
+    },
     /* 旧动作保留（兼容旧测试/脚本）：直接设值并生效 */
     'bank:setUnit': function (d) { S.bank.unit = d.v; S.bank.lesson = ''; S.bank.point = ''; S.bank.multiUnit = []; UI.close(); render(); },
     'bank:setPoint': function (d) { S.bank.point = d.v; S.bank.multiPoint = []; UI.close(); render(); },
@@ -6200,6 +6623,8 @@
       if (!ids.length) { UI.toast('先勾选题目'); return; }
       const ok = await UI.confirm('删除选中的 ' + ids.length + ' 道题？删错了可以点顶栏 ↶ 撤销。');
       if (!ok) return;
+      const firstCard = document.querySelector('.view [data-id="' + ids[0] + '"]');
+      if (firstCard) S._scrollAnchor = Math.max(0, firstCard.getBoundingClientRect().top + window.scrollY);
       const before = await Undo.begin(ids);
       for (const id of ids) await Store.Questions.remove(id);
       await Undo.end('删除 ' + ids.length + ' 道题', before);
@@ -6540,6 +6965,8 @@
       await Undo.end('编辑题目', before);
       UI.close();
       UI.toast('已保存修改');
+      const editCard = document.querySelector('.view [data-id="' + d.id + '"]');
+      if (editCard) S._scrollAnchor = Math.max(0, editCard.getBoundingClientRect().top + window.scrollY);
       await render();
     },
     'q:imgs': async function (d) {
@@ -6757,6 +7184,8 @@
     'q:del': async function (d) {
       const ok = await UI.confirm('删除这道题？原图也会一起删除。删错了可以点顶栏 ↶ 撤销。');
       if (!ok) return;
+      const card = document.querySelector('.view [data-id="' + d.id + '"]');
+      if (card) S._scrollAnchor = Math.max(0, card.getBoundingClientRect().top + window.scrollY);
       const before = await Undo.begin([d.id]);
       await Store.Questions.remove(d.id);
       await Undo.end('删除 1 道题', before);
@@ -7117,10 +7546,31 @@
 
     /* ---- 数据 ---- */
     'data:seed': async function () { await seedDemo(); },
-    'data:export': async function () {
-      const data = await Store.exportAll();
-      Util.download('tiku-backup-' + Util.fmtDate(Date.now()) + '.json', JSON.stringify(data, null, 2));
-      UI.toast('已导出');
+    'data:export': async function () { await exportSheet(); },
+    'data:doExport': async function (d) {
+      const st = S._exp;
+      if (!st) { UI.toast('请重新打开导出'); return; }
+      let out;
+      const now = new Date().toISOString();
+      if (d.mode === 'inc' && st.last) {
+        const qs = st.data.questions.filter(function (q) { return (q.createdAt || 0) > st.last; });
+        const need = {};
+        qs.forEach(function (q) {
+          (q.points || []).forEach(function (p) { if (p && p.id) need[p.id] = 1; });
+          if (q.pointId) need[q.pointId] = 1;
+        });
+        out = { app: '题点', version: 2, exportedAt: now, exportMode: '新增',
+          questions: qs, points: st.data.points.filter(function (p) { return need[p.id]; }), papers: [],
+          draft: draftForExport(true) };
+      } else {
+        out = { app: '题点', version: 2, exportedAt: now, exportMode: '全部',
+          questions: st.data.questions, points: st.data.points, papers: st.data.papers,
+          draft: draftForExport(false) };
+      }
+      localStorage.setItem('tiku.lastExportAt', String(Date.now()));
+      Util.download('tiku-backup-' + Util.fmtDate(Date.now()) + '-' + out.exportMode + '.json', JSON.stringify(out, null, 2));
+      UI.close();
+      UI.toast('已导出 ' + out.questions.length + ' 题（' + out.exportMode + '）');
     },
     'data:syncUp': async function () {
       const ok = await UI.confirm('把本机全部数据备份到电脑？（会覆盖电脑上的上次备份）');
@@ -7168,8 +7618,10 @@
         if (!f) return;
         try {
           const text = await f.text();
-          const res = await Store.importAll(JSON.parse(text));
-          UI.toast('导入 ' + res.questions + ' 题');
+          const parsed = JSON.parse(text);
+          const res = await Store.importAll(parsed);
+          const dn = mergeImportedDraft(parsed.draft);
+          UI.toast('导入 ' + res.questions + ' 题' + (dn ? '；草稿并入 ' + dn + ' 道（回首页继续编辑）' : ''), 3000);
           await render();
         } catch (e) {
           UI.toast('导入失败：' + e.message, 2600);
@@ -7177,6 +7629,26 @@
       };
       input.click();
     },
+    /* ---- 自动同步（云端文字快照） ---- */
+    'sync:now': async function () {
+      if (!syncReady()) {
+        UI.toast('自动同步要用 WorkBuddy 链接打开题库（见本页提示）', 3200);
+        return;
+      }
+      UI.toast('同步中…');
+      await syncPushNow();
+      const n = await syncPullNow(true);
+      await render();
+      UI.toast(n ? '已合并 ' + n + ' 处改动' : '已是最新', 2400);
+    },
+    'sync:rename': function () {
+      const el = document.getElementById('syncDevName');
+      if (!el) return;
+      if (window.CloudSync) window.CloudSync.setDeviceName(el.value);
+      UI.toast('设备名已保存（下次上传生效）');
+      render();
+    },
+
     /* ---- 数据码同步 ---- */
     'dcode:gen': function () { dcodeGenSheet(); },
     'dcode:opt': function (d) {
@@ -7206,7 +7678,7 @@
         return st.withImg ? q : Object.assign({}, q, { images: [] });
       });
       const papers = st.days ? [] : (await DB.all('papers'));
-      const code = dcodeEncode({ app: '题点', version: 2, exportedAt: new Date().toISOString(), questions: questions, points: points, papers: papers });
+      const code = dcodeEncode({ app: '题点', version: 2, exportedAt: new Date().toISOString(), questions: questions, points: points, papers: papers, draft: draftForExport(true) });
       st.code = code;
       st.n = questions.length;
       st.imgs = st.withImg ? imgs : 0;
@@ -7238,8 +7710,9 @@
       try {
         await Store.importAll(data);
       } catch (e) { UI.toast('导入失败：' + (e.message || e), 3000); return; }
+      const dn = mergeImportedDraft(data.draft);
       UI.close();
-      UI.toast('已合并：新增 ' + add + ' 题、更新 ' + upd + ' 题', 3200);
+      UI.toast('已合并：新增 ' + add + ' 题、更新 ' + upd + ' 题' + (dn ? '；草稿并入 ' + dn + ' 道（回首页继续编辑）' : ''), 3400);
       await render();
     },
 
@@ -7462,5 +7935,16 @@
     // 支持 #bank / #review 等 hash 直达
     const initial = (location.hash || '').replace(/^#\/?/, '');
     await navigate(PAGES[initial] ? initial : 'home', {}, true);
+
+    // 任何写库动作（入库/编辑/删除/导入）都在 2.5 秒后自动上传文字快照
+    try { Store.onChange(function () { scheduleSyncPush(); }); } catch (e) {}
+    // 云端文字同步：打开时拉一次，之后每 60 秒 / 每次切回页面看一次
+    if (syncReady()) {
+      setTimeout(function () { syncPullNow(true); }, 2500);
+      setInterval(function () { if (!document.hidden) syncPullNow(true); }, 60000);
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden && syncReady()) syncPullNow(true);
+      });
+    }
   })();
 })();
