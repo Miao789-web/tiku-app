@@ -22,9 +22,10 @@
     endpoint: 'https://tidian-tiku.app.workbuddy.host',
     publishableKey: 'wbpk_ffY2Rxnge4LNcRPmllEWDB_ecqR1cE73utSvHmDdCnTpZuHIs49g7Jt',
     table: 'tiku_sync',
-    bridge: '/bridge.html'
+    bridge: '/bridge.html?sharecode=WTMDTYLV46'   // 云域名下的站点要带 sharecode 才能访问
   };
-  var SDK_URL = 'https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js';
+  // SDK 放本地 vendor（71KB），不依赖外网 CDN
+  var SDK_URL = 'js/vendor/wbcloud.js';
   var CH = 'tiku-sync';
 
   var client = null;
