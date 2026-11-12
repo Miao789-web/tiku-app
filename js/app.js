@@ -1776,7 +1776,7 @@
     const mainUnit = qUnitsOf(q)[0] || '';
     // 课时按「这道题实际所属的单元」取：题目单元没有时用考点自带的单元（考点名后缀「·第N单元」）
     const lessonUnit = lessonUnitOf(q) || mainUnit;
-    const mainLesson = qLessonOf(q, lessonUnit);
+    const mainLesson = qLessonOf(q, lessonUnit) || (q.lesson || '');
     // 卡片标签随时点都能直接编辑（批量模式除外——点卡片是勾选题目）
     return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="' + selAct + '"' : '') + '>' +
       (clean && !batch ? '' :
@@ -2069,12 +2069,19 @@
     }
     const q = await DB.get('questions', st.id);
     if (!q) { UI.close(); return; }
-    const unit = st.unit || lessonUnitOf(q) || qUnitsOf(q)[0] || '';
-    const us = qUnitsOf(q);
+    const unit = st.unit || lessonUnitOf(q) || '';
+    // 「未归类」不算真单元：题没单元时把课时连同单元一起补上（否则课时没地方落、标签也显示不出来）
+    const us = qUnitsOf(q).filter(function (u) { return u && u !== '未归类'; });
     const idx = us.indexOf(unit);
-    const lessons = us.map(function (u, i) { return i === idx ? val : qLessonOf(q, u); });
     const before = await Undo.begin([q.id]);
-    await Store.Questions.update(q.id, { lessons: lessons, lesson: idx === 0 ? val : (q.lesson || '') });
+    if (!us.length || idx < 0) {
+      const patch = { lesson: val, lessons: val ? [val] : [] };
+      if (val && unit) { patch.unit = unit; patch.units = us.concat([unit]); }
+      await Store.Questions.update(q.id, patch);
+    } else {
+      const lessons = us.map(function (u, i) { return i === idx ? val : qLessonOf(q, u); });
+      await Store.Questions.update(q.id, { lessons: lessons, lesson: idx === 0 ? val : (q.lesson || '') });
+    }
     await Undo.end('改课时', before);
     UI.close();
     UI.toast(val ? '课时已改为「' + val + '」（可撤销）' : '已清除课时（可撤销）');
