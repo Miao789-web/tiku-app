@@ -80,6 +80,7 @@
         type: d.type, difficulty: d.difficulty,
         images: d.images || [], point: d.point || '', pointId: d.pointId || '',
         pointUnit: d.pointUnit || '', points: d.points || [],
+        lesson: d.lesson || '',
         confidence: d.confidence || 0, needsConfirm: !!d.needsConfirm
       };
     });
@@ -1330,6 +1331,56 @@
     return out;
   }
 
+  /* ---- 课时：按「这道题所属的单元」给选项（v1.18.0） ---- */
+  /** 这道题该按哪个单元选课时：题目单元 → 考点自带单元 → 考点名「·第N单元」后缀 */
+  function lessonUnitOf(q, subject, grade) {
+    if (!q) return '';
+    const us = qUnitsOf(q).filter(function (u) { return u && u !== '未归类'; });
+    if (us.length) return us[0];
+    const sbj = subject || q.subject || S.defaults.subject;
+    const gd = grade || q.grade || S.defaults.grade;
+    const pts = qPointsOf(q);
+    for (let i = 0; i < pts.length; i++) {
+      const u = unitSuffixToUnit(pts[i].name, sbj, gd);
+      if (u) return u;
+    }
+    return '';
+  }
+  /** 草稿（还没入库）该按哪个单元选课时 */
+  function lessonUnitOfDraft(d, s) {
+    if (!d || !s) return '';
+    if (s.unit) return s.unit;
+    const pts = (d.points && d.points.length) ? d.points : (d.point ? [{ name: d.point, units: d.pointUnit ? [d.pointUnit] : [] }] : []);
+    for (let i = 0; i < pts.length; i++) {
+      const u = (pts[i].units && pts[i].units[0]) || unitSuffixToUnit(pts[i].name, s.subject, s.grade);
+      if (u) return u;
+    }
+    return '';
+  }
+  /** 某单元在题库里已经用过的课时（不看目录） */
+  function usedLessonsOf(unit, subject, grade) {
+    const out = [];
+    (S.cache.bankQ || []).forEach(function (q) {
+      const us = qUnitsOf(q);
+      us.forEach(function (u, i) {
+        if (unit && u !== unit) return;
+        if (!unit && i > 0) return;
+        const L = (q.lessons && q.lessons[i]) || (i === 0 && q.lesson) || '';
+        if (L && L !== '无' && out.indexOf(L) < 0) out.push(L);
+      });
+    });
+    return out;
+  }
+  /** 选课时能看到的全部课时：目录课时 + 题库里用过的（两者取并集，谁也不藏） */
+  function lessonChoices(unit, subject, grade) {
+    const out = [];
+    const push = function (L) { if (L && L !== '无' && out.indexOf(L) < 0) out.push(L); };
+    const sbj = subject || S.defaults.subject, gd = grade || S.defaults.grade;
+    Catalog.lessonsOf(sbj, gd, S.defaults.term, S.defaults.version, unit || '').forEach(push);
+    usedLessonsOf(unit, subject, grade).forEach(push);
+    return out;
+  }
+
   /* ---- 练习名称 / 练习类型 / 页码 ----
    * 老题目只有 batchName（如「数学练习册P23」）：没显式字段时按关键词推断类型、从名称里取页码，
    * 这样以前录的题也能直接用新筛选，不用重新录。 */
@@ -1723,7 +1774,9 @@
     // 标签 = 考点（主考点，多考点显示 +N） + 单元名 + 课时名
     const pts = qPointsOf(q);
     const mainUnit = qUnitsOf(q)[0] || '';
-    const mainLesson = qLessonOf(q, mainUnit);
+    // 课时按「这道题实际所属的单元」取：题目单元没有时用考点自带的单元（考点名后缀「·第N单元」）
+    const lessonUnit = lessonUnitOf(q) || mainUnit;
+    const mainLesson = qLessonOf(q, lessonUnit);
     // 卡片标签随时点都能直接编辑（批量模式除外——点卡片是勾选题目）
     return '<article class="card" data-id="' + q.id + '"' + (batch ? ' data-act="' + selAct + '"' : '') + '>' +
       (clean && !batch ? '' :
@@ -1732,7 +1785,10 @@
           (batch ? '<span class="bcheck' + (sel ? ' on' : '') + '"></span>' : '') +
           (opts.hidePoint ? '' : '<span' + (batch ? ' class="chip brand"' : ' class="chip tap" data-act="q:point" data-id="' + q.id + '" title="点击修改考点"') + '>' + esc(pts[0].name || '未分类') + (pts.length > 1 ? ' +' + (pts.length - 1) : '') + '</span>') +
           (mainUnit && mainUnit !== '未归类' ? '<span class="chip gray">📖 ' + esc(mainUnit) + '</span>' : '') +
-          (mainLesson ? '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:lessonSel" data-id="' + q.id + '" title="点击修改课时"') + '>⏱ ' + esc(mainLesson) + '</span>' : '') +
+          (batch
+            ? (mainLesson ? '<span class="chip gray">⏱ ' + esc(mainLesson) + '</span>' : '')
+            : '<span class="chip gray tap" data-act="q:lessonSel" data-id="' + q.id + '" title="点击选课时">⏱ ' +
+              (mainLesson ? esc(mainLesson) : '<span style="color:var(--warn)">课时待确认</span>') + '</span>') +
           '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:typeSel" data-id="' + q.id + '" title="点击修改题型"') + '>' + esc(q.type) + '</span>' +
           '<span' + (batch ? ' class="chip gray"' : ' class="chip gray tap" data-act="q:diffSel" data-id="' + q.id + '" title="点击修改难度"') + '>难度 ' + q.difficulty + '</span>' +
         '</div>' +
@@ -1790,7 +1846,7 @@
     const unitQs = (S.cache.bankQ || []).filter(function (q) {
       return qUnitsOf(q).indexOf(unit) >= 0;
     });
-    const lessons = knownLessonsOf(unit);
+    const lessons = lessonChoices(unit);
     const lessonOfIn = function (q) {
       const us = qUnitsOf(q);
       const idx = us.indexOf(unit);
@@ -1839,7 +1895,8 @@
               '</div>' +
               '<div class="chips wrapv" style="margin:0">' + lessonBtns + '</div>' +
             '</div>'
-          : '<div class="empty" style="padding:14px 0">这个单元还没配课时——去「我的 → 设置 → 每单元的课时」里配好，这里就能按课时改了</div>');
+          : '<div class="empty" style="padding:14px 0">这个单元还没配课时——去「我的 → 设置 → 每单元的课时」里配好，这里就能按课时改了<br>' +
+            '<button class="btn soft sm" style="margin-top:10px" data-act="bank:lessonEdit" data-unit="' + esc(unit) + '">＋ 现在给这个单元加课时</button></div>');
       UI.sheet({ title: '改课时 · ' + unitLabelOf(unit), body: body });
       return;
     }
@@ -1917,6 +1974,111 @@
       ls[i] = v;
       await Store.Questions.update(id, { lessons: ls, lesson: ls.filter(function (x) { return x && x !== '无'; })[0] || ls[0] || '' });
     }
+  }
+
+  /* =========================================================
+   * 课时选择弹层（题库题卡 / 录入草稿通用）
+   * 选项来源 = 这道题所属单元的课时（教材目录 + 题库里用过的）
+   * 没有单元时按关键字新建；有关键字也能直接新建到该单元下
+   * ======================================================= */
+  function lessonChipsHtml() {
+    const st = S._lp;
+    if (!st) return '';
+    const unit = st.unit || '';
+    const kwRaw = String(st.kw || '').trim();
+    const kw = kwRaw.toLowerCase();
+    const sbj = st.subject || S.defaults.subject;
+    const gd = st.grade || S.defaults.grade;
+    const catAll = unit ? Catalog.lessonsOf(sbj, gd, S.defaults.term, S.defaults.version, unit) : [];
+    const all = lessonChoices(unit, sbj, gd);
+    const usedOnly = all.filter(function (L) { return catAll.indexOf(L) < 0; });
+    const hit = function (L) { return !kw || String(L).toLowerCase().indexOf(kw) >= 0; };
+    const chip = function (v) {
+      return '<button class="tag' + (String(st.cur || '') === v ? ' active' : '') +
+        '" data-act="lesson:pick" data-v="' + esc(v) + '">' + esc(v) + '</button>';
+    };
+    let html = '';
+    const catHit = catAll.filter(hit);
+    const usedHit = usedOnly.filter(hit);
+    if (catHit.length) html += '<div class="sec-title">本单元课时</div><div class="chips wrapv">' + catHit.map(chip).join('') + '</div>';
+    if (usedHit.length) html += '<div class="sec-title">题库里用过的</div><div class="chips wrapv">' + usedHit.map(chip).join('') + '</div>';
+    if (!catHit.length && !usedHit.length) {
+      html += '<p class="muted" style="margin:2px 0 8px">' +
+        (kwRaw ? '没有匹配「' + esc(kwRaw) + '」的课时。' : (unit ? '这个单元还没配课时。' : '这道题还没归单元，也就没有现成课时。')) +
+        '直接在下面的框里输入课时名，点「新建」就能用。</p>';
+    }
+    if (kwRaw) {
+      const exists = all.some(function (L) { return String(L).toLowerCase() === kw; });
+      if (!exists) {
+        html += '<button class="btn soft block mt12" data-act="lesson:new" data-v="' + esc(kwRaw) + '">＋ 新建课时「' + esc(kwRaw) + '」' +
+          (unit ? '（记到「' + esc(unit) + '」下）' : '（先当课时名用）') + '</button>';
+      }
+    }
+    html += '<div class="chips" style="margin-top:14px"><button class="tag" data-act="lesson:pick" data-v="">' +
+      (st.cur ? '清除课时' : '暂不标课时') + '</button></div>';
+    return html;
+  }
+
+  function lessonPickBody() {
+    const st = S._lp;
+    if (!st) return '';
+    const unit = st.unit || '';
+    const preview = String(st.text || '').replace(/\s+/g, ' ').trim();
+    return '<p class="qtext" style="padding:0 0 8px;font-size:13.5px;color:var(--ink-2)">' +
+        esc(preview.slice(0, 70)) + (preview.length > 70 ? '…' : '') + '</p>' +
+      '<p class="muted" style="margin-bottom:8px">' +
+        (unit
+          ? '单元：<b>' + esc(unitLabelOf(unit, st.subject, st.grade)) + '</b>' + (st.unitFrom ? '（按考点「' + esc(st.unitFrom) + '」所属单元）' : '')
+          : '这道题还没归单元，所以没有现成课时——可以直接输入课时名；想以后自动列课时，先在题目考点里选好单元。') +
+        (st.cur ? '　当前：<b>' + esc(st.cur) + '</b>' : '') + '</p>' +
+      '<div class="field"><label>找课时 / 新建（输入关键字过滤）</label>' +
+        '<input class="input" id="lpKw" placeholder="如：三角形、第2课时" value="' + esc(st.kw || '') + '" autocomplete="off"></div>' +
+      '<div id="lpChips">' + lessonChipsHtml() + '</div>';
+  }
+
+  function lessonPickSheet(opt) {
+    S._lp = Object.assign({ kw: '' }, opt || {});
+    UI.sheet({
+      title: opt && opt.mode === 'draft' ? '给这道题选课时' : '改课时',
+      body: lessonPickBody(),
+      onMount: function (root) {
+        const inp = root.querySelector('#lpKw');
+        if (!inp) return;
+        inp.addEventListener('input', function () {
+          if (S._lp) S._lp.kw = inp.value;
+          const box = document.getElementById('lpChips');
+          if (box) box.innerHTML = lessonChipsHtml();
+        });
+        if (window.innerWidth > 520) setTimeout(function () { try { inp.focus(); } catch (e) {} }, 80);
+      }
+    });
+  }
+
+  /** 落地：把课时写到题（题库）或草稿（确认页） */
+  async function applyLessonChoice(v) {
+    const st = S._lp;
+    if (!st) return;
+    const val = String(v || '').trim();
+    if (st.mode === 'draft') {
+      const d = S.drafts[st.i];
+      if (d) d.lesson = val;
+      UI.close();
+      UI.toast(val ? '课时改为「' + val + '」' : '已清除课时');
+      await render();
+      return;
+    }
+    const q = await DB.get('questions', st.id);
+    if (!q) { UI.close(); return; }
+    const unit = st.unit || lessonUnitOf(q) || qUnitsOf(q)[0] || '';
+    const us = qUnitsOf(q);
+    const idx = us.indexOf(unit);
+    const lessons = us.map(function (u, i) { return i === idx ? val : qLessonOf(q, u); });
+    const before = await Undo.begin([q.id]);
+    await Store.Questions.update(q.id, { lessons: lessons, lesson: idx === 0 ? val : (q.lesson || '') });
+    await Undo.end('改课时', before);
+    UI.close();
+    UI.toast(val ? '课时已改为「' + val + '」（可撤销）' : '已清除课时（可撤销）');
+    await render();
   }
 
   /** 编辑某单元的课时列表（设置页「每单元的课时」→ ✎） */
@@ -2922,17 +3084,25 @@
         '<button class="tag" data-act="confirm:addUnit">＋ 新增章节</button>' +
         '</div>';
 
-      // 课时（选填）：必须先选章节；选定后只列「该章节」的课时，绝不混入其他章节的课时
+      // 课时（选填）：先用练习选的章节；没选章节就按题目考点自带的单元列（v1.18.0）
       let lessonChips;
-      if (!s.unit) {
-        lessonChips = '<p class="muted" style="font-size:12px;margin-top:6px">先在上面选章节，再选课时（只列这个章节配好的课时）</p>';
+      const guessUnit = s.unit || (function () {
+        for (let gi = 0; gi < S.drafts.length; gi++) {
+          const u = lessonUnitOfDraft(S.drafts[gi], s);
+          if (u) return u;
+        }
+        return '';
+      })();
+      if (!guessUnit) {
+        lessonChips = '<p class="muted" style="font-size:12px;margin-top:6px">还没选章节，也没有考点带单元：课时可以先在上面框里直接写（如「第2课时」）；题卡的考点选好单元后，这里会自动列出该单元的课时。</p>';
       } else {
-        const knownLs = knownLessonsOf(s.unit, s.subject, s.grade);
-        lessonChips = knownLs.length
+        const knownLs = lessonChoices(guessUnit, s.subject, s.grade);
+        const fromPoint = !s.unit ? '<p class="muted" style="font-size:12px;margin-top:2px">按考点所属单元「' + esc(guessUnit) + '」列课时</p>' : '';
+        lessonChips = fromPoint + (knownLs.length
           ? '<div class="chips mt8">' + knownLs.map(function (L) {
               return '<button class="tag' + (s.lesson === L ? ' active' : '') + '" data-act="confirm:lesson" data-v="' + esc(L) + '">' + esc(L) + '</button>';
             }).join('') + '</div>'
-          : '<p class="muted" style="font-size:12px;margin-top:6px">「' + esc(s.unit) + '」还没配课时——去「我的 → 设置 → 每单元的课时」里配好，这里就只显示这个章节的课时；也可以直接在框里手填。</p>';
+          : '<p class="muted" style="font-size:12px;margin-top:6px">「' + esc(guessUnit) + '」还没配课时——在上面框里直接写课时名即可；也可以在题卡课时标签里点一下新建，或去「我的 → 设置 → 每单元的课时」配好。</p>');
       }
 
       // 红笔答案检测：红字一般就是这道题的答案，已按位置填到对应题答案框（手写识别仅供参考）
@@ -2959,10 +3129,14 @@
         const chipWarn = (!d.aiPending && d.needsConfirm)
           ? '<span class="chip warn">待确认</span>' : '';
         const chipRed = d.answerFromRed ? '<span class="chip gray">✍ 红笔</span>' : '';
+        // 课时（v1.18.0）：点一下就按这道题（或整批）的单元列课时，没单元就按关键字新建
+        const dLesson = d.lesson || s.lesson || '';
+        const chipLesson = '<span class="chip gray tap" data-act="draft:lesson" data-i="' + i + '" title="点击选课时">⏱ ' +
+          (dLesson ? esc(dLesson) : '<span style="color:var(--warn)">课时待确认</span>') + '</span>';
         const body = [d.text].concat(d.subs || [], d.options || []).join('\n');
         return '<article class="qcard' + (d.needsConfirm && !d.aiPending ? ' needs' : '') + '">' +
           '<div class="qcard-h">' +
-            '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipWarn + chipRed +
+            '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipWarn + chipRed + chipLesson +
             '<span class="chip gray">' + esc(d.type) + '</span>' +
             '<span class="chip gray">难度 ' + d.difficulty + '</span>' +
           '</div>' +
@@ -3313,6 +3487,12 @@
       const lessonSet = [];
       list.forEach(function (q) {
         const L = lessonOf(q);
+        if (L && lessonSet.indexOf(L) < 0) lessonSet.push(L);
+      });
+      // 目录里给这个单元配好的课时也列出来（还没题的课时点进去是空的，方便对照教学进度）
+      Catalog.lessonsOf(S.bank.subject !== '全部' ? S.bank.subject : S.defaults.subject,
+        S.bank.grade !== '全部' ? S.bank.grade : S.defaults.grade,
+        S.defaults.term, S.defaults.version, u).forEach(function (L) {
         if (L && lessonSet.indexOf(L) < 0) lessonSet.push(L);
       });
       // 排序：数字课时在前（第2 < 第10），「无」排最后
@@ -4209,13 +4389,18 @@
     if (bar) bar.style.width = Math.round(((done + (running ? (running.pct || 0) : 0)) / s.images.length) * 100) + '%';
   }
 
-  /** 把文字里的【图N】占位替换掉，并把对应的图收集起来归属到该题 */
-  function stripImageMarkers(it, imgs) {
-    const found = [];
+  /** 把文字里的【图N】占位替换掉，并把对应的图收集起来归属到该题
+   *  used：按图片序号标记「已被哪道题占用」——同一张图重复出现（Word 里常复制同一个图形）
+   *  也各自独立，不会被「去重」判掉（v1.18.0 修的就是这个漏图问题） */
+  function stripImageMarkers(it, imgs, used) {
+    const foundIdx = [];
     function clean(s) {
       return String(s || '').replace(/【图(\d+)】/g, function (m, n) {
         const idx = parseInt(n, 10) - 1;
-        if (imgs[idx]) { if (found.indexOf(imgs[idx]) < 0) found.push(imgs[idx]); return ''; }
+        if (idx >= 0 && idx < imgs.length) {
+          if (!used[idx]) { used[idx] = 1; foundIdx.push(idx); }
+          return '';
+        }
         return m;
       });
     }
@@ -4225,16 +4410,15 @@
     // 答案 / 思路里也可能残留占位符（图形印在答案附近时），同样清洗归属
     if (it.answer && it.answer.indexOf('【图') >= 0) it.answer = clean(it.answer).trim();
     if (it.solution && it.solution.indexOf('【图') >= 0) it.solution = clean(it.solution).trim();
-    return found;
+    return foundIdx.map(function (i) { return imgs[i]; });
   }
 
   /** 兜底：没被任何占位符标注的图形，按原文位置配到相邻的题目（防止配图漏掉） */
-  function sweepLostImages(rawText, docImgs, drafts) {
+  function sweepLostImages(rawText, docImgs, drafts, used) {
     if (!drafts.length) return 0;
     let swept = 0;
     docImgs.forEach(function (src, gi) {
-      const taken = drafts.some(function (d) { return (d.images || []).indexOf(src) >= 0; });
-      if (taken) return;
+      if (used && used[gi]) return;
       const marker = '【图' + (gi + 1) + '】';
       const pos = String(rawText || '').indexOf(marker);
       let target = null;
@@ -4255,6 +4439,7 @@
       if (!target) target = drafts[0];
       target.images = target.images || [];
       if (target.images.indexOf(src) < 0) { target.images.push(src); swept++; }
+      else if (used) used[gi] = 1;
     });
     return swept;
   }
@@ -4322,7 +4507,7 @@
       });
     });
     s.imgPool = pool;
-    const assigned = {};   // 已归属的图形：一张图只归一道题（防止不同题的配图同时增删）
+    const usedImg = {};    // 图片序号 → 已归属（一张图只归一道题；同内容的另一张仍可归别的题）
     s.images.forEach(function (im, idx) {
       if (!im.text) return;
       // 手动粘贴路径没有经过 OCR.tidy，这里统一清洗（幂等，重复调用无副作用）
@@ -4331,13 +4516,7 @@
       // 红笔答案按位置归到对应题（没识别出答案的题留空，等老师填）
       const redAt = assignRedAnswers(im, items);
       items.forEach(function (it, k) {
-        const found = docImgs.length ? stripImageMarkers(it, docImgs) : [];
-        // 同一张图被多道题的占位符引用时，只归第一道题，其余题不再挂这张图
-        const mine = found.filter(function (src) {
-          if (assigned[src]) return false;
-          assigned[src] = 1;
-          return true;
-        });
+        const mine = docImgs.length ? stripImageMarkers(it, docImgs, usedImg) : [];
         const redTxt = redAt[k] || '';
         drafts.push({
           key: Util.uid('d'), imgIndex: idx, no: it.no,
@@ -4351,7 +4530,7 @@
       });
       // 兜底：被切题流程漏掉的图形按原文位置配到相邻题，确保不漏图
       if (docImgs.length && drafts.length) {
-        const swept = sweepLostImages(OCR.tidy ? OCR.tidy(im.text) : im.text, docImgs, drafts);
+        const swept = sweepLostImages(OCR.tidy ? OCR.tidy(im.text) : im.text, docImgs, drafts, usedImg);
         if (swept) UI.toast(swept + ' 张图形没标到具体题号，已自动配到相邻题目，可在「配图」里调整', 3200);
       }
     });
@@ -4482,6 +4661,13 @@
     }
     if (!resolved.length) resolved.push({ id: '', name: '未分类' });
     if (!primaryUnit) primaryUnit = s.unit || '';
+    // 没选章节、考点也没带单元信息时，按考点名后缀「·第N单元」把单元补上（课时才有地方落）
+    if (!primaryUnit) {
+      for (const e of entries) {
+        const u0 = (e.units && e.units[0]) || unitSuffixToUnit(e.name, s.subject, s.grade);
+        if (u0) { primaryUnit = u0; break; }
+      }
+    }
     addUnit(primaryUnit);
     addUnit(s.unit);
     entries.forEach(function (e) { (e.units || []).forEach(addUnit); });
@@ -4495,6 +4681,11 @@
         if (i >= 0 && !lessons[i]) lessons[i] = e.lesson;
       });
     });
+    // 单题改过的课时（确认页题卡上的 ⏱ 标签）优先于整批课时
+    if (d.lesson) {
+      const i0 = unitSet.indexOf(primaryUnit);
+      if (i0 >= 0) lessons[i0] = d.lesson;
+    }
     await Store.Questions.create({
       subject: s.subject,
       grade: s.grade,
@@ -5409,6 +5600,20 @@
       setTimeout(function () {
         ACTIONS['draft:edit']({ i: String(S.drafts.length - 1) });
       }, 60);
+    },
+    'draft:lesson': function (d) {
+      const i = +d.i;
+      const draft = S.drafts[i];
+      const s = S.session;
+      if (!draft || !s) return;
+      const unit = lessonUnitOfDraft(draft, s);
+      lessonPickSheet({
+        mode: 'draft', i: i, unit: unit,
+        unitFrom: (!s.unit && unit) ? (draft.point || '') : '',
+        subject: s.subject, grade: s.grade,
+        cur: draft.lesson || s.lesson || '',
+        text: draft.text
+      });
     },
     'draft:edit': function (d) {
       const i = +d.i;
@@ -6361,6 +6566,7 @@
 
     /* 批量分配课时（按考点）：点课时或「无」，该考点下未分配的题一次归入 */
     'bank:lessonAssign': function (d) { S._lassSel = {}; lessonAssignSheet(d.unit); },
+    'bank:lessonEdit': function (d) { lessonEditSheet(d.unit); },
 
     /* 改课时弹层：切模式 / 勾题 / 全选 / 对所选题目改课时 */
     'bank:lassMode': function (d) { S._lassMode = d.v; sheetRedraw(function () { lessonAssignSheet(d.unit); }); },
@@ -7058,22 +7264,31 @@
     'q:lessonSel': async function (d) {
       const q = await DB.get('questions', d.id);
       if (!q) return;
-      const unit = qUnitsOf(q)[0] || q.unit || '';
-      const cur = qLessonOf(q, unit);
-      const choices = knownLessonsOf(unit, q.subject, q.grade); // 目录里配的课时优先（没配目录回退题库已用）
-      const chip = function (v, label) {
-        return '<button class="tag' + (cur === v ? ' active' : '') + '" data-act="q:lessonSet" data-id="' + q.id + '" data-v="' + esc(v) + '">' + esc(label || (v || '无')) + '</button>';
-      };
-      UI.sheet({
-        title: '改课时',
-        body: '<p class="qtext" style="padding:0 0 8px;font-size:13.5px;color:var(--ink-2)">' + esc(String(q.text || '').slice(0, 60)) + (String(q.text || '').length > 60 ? '…' : '') + '</p>' +
-          '<p class="muted" style="margin-bottom:8px">「' + esc(unit || '未归类') + '」下的课时' +
-          (choices.length ? '（来自教材目录，可在设置页「每单元的课时」里编辑）' : '还没在目录里配置——去设置页「每单元的课时」编辑后，这里就只列目录课时') + '。当前：' + (cur ? esc(cur) : '未标') + '</p>' +
-          '<div class="chips wrapv">' +
-          (choices.length ? choices.map(function (L) { return chip(L); }).join('') : '') +
-          chip('', cur ? '清除课时' : '无') +
-          '</div>'
+      const unit = lessonUnitOf(q);
+      const unitFrom = !qUnitsOf(q)[0] && unit ? qPointsOf(q)[0].name : '';
+      lessonPickSheet({
+        mode: 'q', id: q.id, unit: unit, unitFrom: unitFrom,
+        subject: q.subject, grade: q.grade,
+        cur: qLessonOf(q, unit || qUnitsOf(q)[0] || ''),
+        text: q.text
       });
+    },
+    'lesson:pick': function (d) { return applyLessonChoice(d.v || ''); },
+    'lesson:new': async function (d) {
+      const st = S._lp;
+      if (!st) return;
+      const v = String(d.v || '').trim();
+      if (!v) return;
+      if (st.unit) {
+        const sbj = st.subject || S.defaults.subject;
+        const gd = st.grade || S.defaults.grade;
+        const cur = Catalog.lessonsOf(sbj, gd, S.defaults.term, S.defaults.version, st.unit);
+        if (cur.indexOf(v) < 0) {
+          cur.push(v);
+          Catalog.setLessons(sbj, gd, S.defaults.term, S.defaults.version, st.unit, cur);
+        }
+      }
+      await applyLessonChoice(v);
     },
     'q:lessonSet': async function (d) {
       const q = await DB.get('questions', d.id);
@@ -7842,6 +8057,13 @@
       }
       if (!s.batchName) s.batchName = file.name.replace(/\.[a-z0-9]+$/i, '');
       buildDrafts();
+      const imgN = (res.images || []).length;
+      const draftImgN = S.drafts.reduce(function (n, d) { return n + (d.images || []).length; }, 0);
+      if (res.warn) UI.toast(res.warn, 6000);
+      else if (imgN) UI.toast('文件里有 ' + imgN + ' 张图，已配到题目上 ' + draftImgN + ' 张', 3200);
+      else if (/\.pdf$/i.test(file.name) && /看图|如图|下图|上图|图形|阴影|图意/.test(text.slice(0, 4000))) {
+        UI.toast('这份 PDF 没读到图片（可能是用线条画的图形，或整页扫描）。这类题的图请用「拍照」补一张', 5200);
+      }
       s.stage = 'confirm';
       await navigate('confirm');
       await classifyDrafts();
@@ -7906,6 +8128,9 @@
     assignRedAnswers: assignRedAnswers, normCmpText: normCmpText, ppmApplyOrder: ppmApplyOrder,
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints,
+    lessonUnitOf: lessonUnitOf, lessonUnitOfDraft: lessonUnitOfDraft, lessonChoices: lessonChoices,
+    usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,
+    lessonChipsHtml: lessonChipsHtml, sweepLostImages: sweepLostImages,
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
     practiceTypeOf: practiceTypeOf, pageNoOf: pageNoOf, matchFilter: matchFilter,
     filterQuestions: filterQuestions, hasFilter: hasFilter, bankFilterSheet: bankFilterSheet,
