@@ -86,6 +86,7 @@
     });
     const data = {
       subject: s.subject, grade: s.grade, unit: s.unit || '',
+      reviewOf: s.reviewOf || '',
       batchName: s.batchName || '', batchDate: s.batchDate || '',
       practiceType: s.practiceType || '', pageNo: s.pageNo || '',
       pool: (s.imgPool || []).slice(),
@@ -1211,6 +1212,9 @@
     return (i >= 0 && i < cat.length) ? cat[i] : '';
   }
 
+  /** 复习章节：章节名带「复习」的（期中复习 / 整理与复习 / 自定义的期末专项复习等） */
+  function isReviewUnit(u) { return /复习/.test(u || ''); }
+
   async function resolveUnitPoint(rawName, unit, subject, grade) {
     const base = Normalize.pretty(rawName || '') || '未分类';
     const suf = unitSuffixOf(unit, subject, grade);
@@ -1783,6 +1787,7 @@
       '<div class="row between wrap" style="gap:6px;margin-bottom:8px">' +
         '<div class="row wrap" style="gap:6px">' +
           (batch ? '<span class="bcheck' + (sel ? ' on' : '') + '"></span>' : '') +
+          (opts.showNo && q.no ? '<span class="chip gray">第' + esc(q.no) + '题</span>' : '') +
           (opts.hidePoint ? '' : '<span' + (batch ? ' class="chip brand"' : ' class="chip tap" data-act="q:point" data-id="' + q.id + '" title="点击修改考点"') + '>' + esc(pts[0].name || '未分类') + (pts.length > 1 ? ' +' + (pts.length - 1) : '') + '</span>') +
           (mainUnit && mainUnit !== '未归类' ? '<span class="chip gray">📖 ' + esc(mainUnit) + '</span>' : '') +
           (batch
@@ -3091,15 +3096,42 @@
         '<button class="tag" data-act="confirm:addUnit">＋ 新增章节</button>' +
         '</div>';
 
-      // 课时（选填）：先用练习选的章节；没选章节就按题目考点自带的单元列（v1.18.0）
+      // 课时（选填）：先用练习选的章节；复习章节按「是哪个单元的复习」列（v1.19.0）；没选章节就按考点自带的单元列
       let lessonChips;
-      const guessUnit = s.unit || (function () {
+      const draftUnitGuess = function () {
         for (let gi = 0; gi < S.drafts.length; gi++) {
           const u = lessonUnitOfDraft(S.drafts[gi], s);
           if (u) return u;
         }
         return '';
-      })();
+      };
+      let guessUnit;
+      if (isReviewUnit(s.unit)) {
+        // 复习章节自己的课时没意义：优先按「是哪个单元的复习」列，还没选就按考点的单元列
+        guessUnit = s.reviewOf || (function () {
+          for (let gi = 0; gi < S.drafts.length; gi++) {
+            const dd = S.drafts[gi];
+            const nm = dd.point || (dd.points && dd.points[0] && dd.points[0].name) || '';
+            const u = unitSuffixToUnit(nm, s.subject, s.grade) ||
+              (dd.points && dd.points[0] && dd.points[0].units && dd.points[0].units[0]) || '';
+            if (u) return u;
+          }
+          return '';
+        })();
+      } else guessUnit = s.unit || draftUnitGuess();
+      // 复习章节（v1.19.0）：章节名带「复习」时先选「是哪个单元的复习」，课时按那个单元列、题也同时归到那个单元
+      let reviewHtml = '';
+      if (isReviewUnit(s.unit)) {
+        const rv = s.reviewOf || '';
+        reviewHtml = '<div class="field mt8" style="margin-bottom:0"><label>「' + esc(s.unit) +
+          '」是哪个单元的复习？（选了课时就同时归到那个单元的课时题库）</label>' +
+          '<div class="chips">' +
+          cat.map(function (u) {
+            return '<button class="tag' + (rv === u ? ' active' : '') + '" data-act="confirm:reviewOf" data-v="' + esc(u) + '">' + esc(u) + '</button>';
+          }).join('') +
+          '<button class="tag' + (!rv ? ' active' : '') + '" data-act="confirm:reviewOf" data-v="">不确定</button>' +
+          '</div></div>';
+      }
       if (!guessUnit) {
         lessonChips = '<p class="muted" style="font-size:12px;margin-top:6px">还没选章节，也没有考点带单元：课时可以先在上面框里直接写（如「第2课时」）；题卡的考点选好单元后，这里会自动列出该单元的课时。</p>';
       } else {
@@ -3144,8 +3176,8 @@
         return '<article class="qcard' + (d.needsConfirm && !d.aiPending ? ' needs' : '') + '">' +
           '<div class="qcard-h">' +
             '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipWarn + chipRed + chipLesson +
-            '<span class="chip gray">' + esc(d.type) + '</span>' +
-            '<span class="chip gray">难度 ' + d.difficulty + '</span>' +
+            '<span class="chip gray tap" data-act="draft:type" data-i="' + i + '" title="点击改题型">' + esc(d.type) + '</span>' +
+            '<span class="chip gray tap" data-act="draft:diff" data-i="' + i + '" title="点击改难度">难度 ' + esc(d.difficulty) + '</span>' +
           '</div>' +
           '<p class="qtext">' + esc(body) + '</p>' +
           '<div class="field mt8" style="margin-bottom:0"><label>答案（选填' + (d.answerFromRed ? ' · 红笔识别，请核对' : '') + '）</label>' +
@@ -3189,6 +3221,7 @@
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:unitMgr">删除章节</button>' +
             '</span></div>' +
           unitChips +
+          reviewHtml +
           '<div class="field mt8"><label>课时（选填，该单元下会按课时归类考点）</label>' +
             '<input class="input" id="batchLesson" placeholder="如：第3课时" value="' + esc(s.lesson || '') + '">' +
           '</div>' +
@@ -3435,6 +3468,14 @@
     }
     // 统一走筛选条件（练习名称/类型/页码/单元/课时/考点/题型/难度），每项有选就缩小范围
     qs = filterQuestions(qs, b);
+    // 按练习名看题库：按导入时的题号排序（第1题在前），不按录入时间倒序（v1.19.0）
+    if (b.practice) {
+      qs.sort(function (x, y) {
+        const nx = Number(x.no), ny = Number(y.no);
+        if (!isNaN(nx) && !isNaN(ny) && nx !== ny) return nx - ny;
+        return (x.createdAt || 0) - (y.createdAt || 0);
+      });
+    }
     if (b.multiUnit && b.multiUnit.length) qs = qs.filter(q => qUnitsOf(q).some(u => b.multiUnit.indexOf(u) >= 0));
     if (b.multiPoint && b.multiPoint.length) qs = qs.filter(q => qPointsOf(q).some(p => b.multiPoint.indexOf(p.name) >= 0));
     const browsing = !kw && !hasFilter(b);
@@ -3460,7 +3501,7 @@
         (S.batch.on ? '<span class="chip brand">批量模式 · 已选 ' + Object.keys(S.batch.set).length + ' 题</span>' : '') + '</div>' +
         (pickedChips ? '<div class="row wrap" style="gap:6px;margin:0 4px 8px">' + pickedChips + '</div>' : '');
       return countHtml +
-        list.slice(0, 100).map(function (q) { return questionCard(q, S.batch.on ? { batch: true } : {}); }).join('');
+        list.slice(0, 100).map(function (q) { return questionCard(q, S.batch.on ? { batch: true } : { showNo: !!b.practice }); }).join('');
     }
 
     // 2) 浏览模式：章节 → 考点（章节顺序按教材目录）；一题挂多个单元时在多个章节下都出现
@@ -3723,10 +3764,11 @@
       return '<div class="list-item" data-act="pm:sel" data-id="' + p.id + '">' +
         '<span class="qno" style="' + (on ? 'background:var(--brand);color:#fff' : '') + ';flex-shrink:0">' + (on ? '✓' : '') + '</span>' +
         '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
-        '<div class="li-s">' + (p.count || 0) + ' 题</div></div></div>';
+        '<div class="li-s">' + (p.count || 0) + ' 题' + ((p.units || []).length ? ' · ' + esc(p.units.join('、')) : '') + '</div></div>' +
+        '<button class="small" style="color:var(--brand);flex-shrink:0;font-weight:600;padding:6px 10px" data-act="pm:edit" data-id="' + p.id + '">改</button></div>';
     }).join('');
     const body =
-      '<p class="muted" style="margin-bottom:8px">勾选考点后可批量合并（把相近的几个并成一个）或删除（题目一起删，删错不可恢复）。共 ' + st.pts.length + ' 个考点。</p>' +
+      '<p class="muted" style="margin-bottom:8px">勾选考点后可批量合并（把相近的几个并成一个）或删除（题目一起删，删错不可恢复）；点右侧「改」可单独改考点名字和所属单元。共 ' + st.pts.length + ' 个考点。</p>' +
       '<div style="max-height:46vh;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:4px">' +
         (rows || '<div class="empty small" style="padding:16px">这个教材还没有考点</div>') + '</div>' +
       '<div class="row" style="gap:8px;margin-top:10px">' +
@@ -4656,7 +4698,13 @@
     let primaryUnit = s.unit || '';   // 练习选了章节：这份练习的题默认都归那个单元
     const addUnit = function (u) { if (u && unitSet.indexOf(u) < 0) unitSet.push(u); };
     for (const e of entries) {
-      if (e.id) { resolved.push({ id: e.id, name: e.name }); continue; }
+      if (e.id) {
+        resolved.push({ id: e.id, name: e.name });
+        // 考点名已带「·第N单元」后缀（AI 归类/以前存的）：题同时归到那个单元——复习章节的题不用再挑一遍
+        const up = unitSuffixToUnit(e.name, s.subject, s.grade);
+        if (up) addUnit(up);
+        continue;
+      }
       const u0 = (e.units && e.units[0]) || s.unit || '';
       if (!primaryUnit && u0) primaryUnit = u0;
       let pt = { id: '', name: e.name };
@@ -4678,9 +4726,13 @@
     addUnit(primaryUnit);
     addUnit(s.unit);
     entries.forEach(function (e) { (e.units || []).forEach(addUnit); });
-    // 课时：确认页填的课时作用于整批练习的主单元；新建考点时选的课时写到对应单元位置
+    // 复习章节（v1.19.0）：选了「是哪个单元的复习」→ 题同时归复习章节和那个单元，两边题库都能看到
+    if (isReviewUnit(primaryUnit) && s.reviewOf) addUnit(s.reviewOf);
+    // 课时：确认页填的课时作用于整批练习的主单元（复习章节则同时作用到所选单元）；新建考点时选的课时写到对应单元位置
     const batchLesson = (s.lesson || '').trim();
-    const lessons = unitSet.map(function (u) { return u === primaryUnit ? batchLesson : ''; });
+    const lessons = unitSet.map(function (u) {
+      return (u === primaryUnit || (s.reviewOf && u === s.reviewOf)) ? batchLesson : '';
+    });
     entries.forEach(function (e) {
       if (!e.lesson) return;
       (e.units || []).forEach(function (u) {
@@ -4692,6 +4744,8 @@
     if (d.lesson) {
       const i0 = unitSet.indexOf(primaryUnit);
       if (i0 >= 0) lessons[i0] = d.lesson;
+      const ir = unitSet.indexOf(s.reviewOf);
+      if (ir >= 0 && !lessons[ir]) lessons[ir] = d.lesson;
     }
     await Store.Questions.create({
       subject: s.subject,
@@ -5608,6 +5662,46 @@
         ACTIONS['draft:edit']({ i: String(S.drafts.length - 1) });
       }, 60);
     },
+    /* 草稿卡题型 / 难度标签：点一下直接改（v1.19.0） */
+    'draft:type': function (d) {
+      const i = +d.i, dd = S.drafts[i];
+      if (!dd) return;
+      UI.sheet({
+        title: '改题型（草稿）',
+        body: '<p class="muted" style="margin-bottom:8px">当前：' + esc(dd.type) + '。点一个就改过去。</p>' +
+          '<div class="chips wrapv">' +
+          CONFIG.questionTypes.map(function (t) {
+            return '<button class="tag' + (dd.type === t ? ' active' : '') + '" data-act="draft:typeSet" data-i="' + i + '" data-v="' + esc(t) + '">' + esc(t) + '</button>';
+          }).join('') + '</div>'
+      });
+    },
+    'draft:typeSet': function (d) {
+      const dd = S.drafts[+d.i];
+      if (!dd) return;
+      dd.type = d.v;
+      UI.close();
+      render();
+    },
+    'draft:diff': function (d) {
+      const i = +d.i, dd = S.drafts[i];
+      if (!dd) return;
+      UI.sheet({
+        title: '改难度（草稿）',
+        body: '<p class="muted" style="margin-bottom:8px">当前：难度 ' + Number(dd.difficulty) + '。点一档就改过去。</p>' +
+          '<div class="chips wrapv">' +
+          [1, 2, 3].map(function (n) {
+            return '<button class="tag' + (Number(dd.difficulty) === n ? ' active' : '') + '" data-act="draft:diffSet" data-i="' + i + '" data-v="' + n + '">难度 ' + n + '</button>';
+          }).join('') + '</div>'
+      });
+    },
+    'draft:diffSet': function (d) {
+      const dd = S.drafts[+d.i];
+      if (!dd) return;
+      dd.difficulty = Number(d.v);
+      UI.close();
+      render();
+    },
+
     'draft:lesson': function (d) {
       const i = +d.i;
       const draft = S.drafts[i];
@@ -6219,7 +6313,7 @@
       if (!d || !d.drafts || !d.drafts.length) return;
       S.session = {
         images: [], subject: d.subject || S.defaults.subject, grade: d.grade || S.defaults.grade,
-        unit: d.unit || '', batchName: d.batchName || '', batchDate: d.batchDate || '',
+        unit: d.unit || '', reviewOf: d.reviewOf || '', batchName: d.batchName || '', batchDate: d.batchDate || '',
         practiceType: d.practiceType || '', pageNo: d.pageNo || '',
         stage: 'confirm', mode: 'photo', imgPool: []
       };
@@ -6428,12 +6522,20 @@
     'confirm:unit': function (d, el) {
       if (!S.session) return;
       S.session.unit = (S.session.unit === d.v) ? '' : d.v;
+      if (!isReviewUnit(S.session.unit)) S.session.reviewOf = '';
       document.querySelectorAll('[data-act="confirm:unit"]').forEach(function (b) {
         b.classList.toggle('active', b.dataset.v === S.session.unit);
       });
       const picked = document.getElementById('unitPicked');
       if (picked) picked.textContent = S.session.unit || '未选择';
       // 换章节后课时联想跟着变：重建整个确认页（草稿内容已实时写回，不丢）
+      render();
+    },
+
+    /* 复习章节：选「是哪个单元的复习」 */
+    'confirm:reviewOf': function (d) {
+      if (!S.session) return;
+      S.session.reviewOf = (S.session.reviewOf === d.v) ? '' : d.v;
       render();
     },
 
@@ -6469,6 +6571,7 @@
       if (!clean) return;
       Catalog.addUnit(s.subject, s.grade, S.defaults.term, S.defaults.version, clean);
       s.unit = clean;
+      if (!isReviewUnit(clean)) s.reviewOf = '';
       UI.toast('已添加并选中：' + clean);
       await render();
     },
@@ -6771,6 +6874,43 @@
       }
       for (const id of ids) await DB.del('points', id);
       UI.toast('已删除 ' + ids.length + ' 个考点、' + nq + ' 道题', 3000);
+      S.cache.bankQ = null;
+      await pointMgrSheet();
+    },
+    /* 编辑单个考点：改名字 + 改所属单元（引用它的题同步改） */
+    'pm:edit': async function (d) {
+      const p = await DB.get('points', d.id);
+      if (!p) return;
+      const v = await UI.prompt({ title: '改考点「' + Util.cut(p.name, 18) + '」', value: p.name, rows: 2, placeholder: '改成什么名字？确认后还可以改所属单元' });
+      const newName = (v || '').trim();
+      if (!newName) return;
+      const ru = await pickUnitsForPointMulti(newName, p.subject, p.grade, p.units);
+      if (!ru) return;
+      p.name = newName;
+      p.norm = Normalize.norm(newName);
+      p.units = (ru.units || []).slice();
+      // 第一个单元在目录里且名字没带后缀 → 补上「·第N单元」，以后录题才能自动对上同一个考点
+      const suf = unitSuffixOf(p.units[0], p.subject, p.grade);
+      if (suf && !/·第\d+单元$/.test(p.name)) p.name = p.name + suf;
+      await DB.put('points', p);
+      const qs = (await DB.all('questions')).filter(function (q) {
+        return q.pointId === p.id || (q.points || []).some(function (x) { return x.id === p.id; });
+      });
+      for (const q of qs) {
+        if (q.pointId === p.id) q.pointName = p.name;
+        if (q.points && q.points.length) q.points.forEach(function (x) { if (x.id === p.id) x.name = p.name; });
+        // 新单元补进题的章节里（旧章节不删——可能还有别的考点挂在上面）
+        (p.units || []).forEach(function (u) {
+          const us = qUnitsOf(q);
+          if (us.indexOf(u) < 0) {
+            q.units = (q.units || (q.unit ? [q.unit] : [])).concat([u]);
+            if (!q.unit) q.unit = u;
+          }
+        });
+        await DB.put('questions', q);
+      }
+      await Store.Points.recount();
+      UI.toast('已更新「' + p.name + '」' + (qs.length ? '，' + qs.length + ' 道题同步改' : ''), 3000);
       S.cache.bankQ = null;
       await pointMgrSheet();
     },
@@ -8136,6 +8276,7 @@
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints,
     lessonUnitOf: lessonUnitOf, lessonUnitOfDraft: lessonUnitOfDraft, lessonChoices: lessonChoices,
+    isReviewUnit: isReviewUnit,
     usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,
     lessonChipsHtml: lessonChipsHtml, sweepLostImages: sweepLostImages,
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
