@@ -2123,16 +2123,117 @@
     await render();
   }
 
-  /** 编辑某单元的课时列表（设置页「每单元的课时」→ ✎） */
+  /** 编辑某单元的课时列表（设置页「每单元的课时」→ ✎）：一行一个，可拖动排序 / 改名 / 删 / 加 */
+  function lessonRowHtml(name, i) {
+    return '<div class="row between" data-les="' + esc(name) + '" style="padding:7px 2px;border-bottom:0.5px solid var(--line);align-items:center;gap:6px">' +
+      '<span class="drag-h" title="按住拖动排序">⋮⋮</span>' +
+      '<span class="pt-idx muted" style="flex:none;width:15px;font-size:12px;text-align:right">' + (i + 1) + '</span>' +
+      '<input class="input ls-name" value="' + esc(name) + '" style="flex:1;font-size:14px;padding:6px 8px">' +
+      '<button class="small" style="color:#b3261e;font-weight:600" data-act="lesson:del">删除</button></div>';
+  }
+
+  function lessonRenumber(box) {
+    if (!box) return;
+    Array.prototype.slice.call(box.querySelectorAll('[data-les] .pt-idx')).forEach(function (sp, i) {
+      sp.textContent = String(i + 1);
+    });
+    const empty = box.querySelector('.lesson-empty');
+    if (empty && box.querySelector('[data-les]')) empty.remove();
+    if (!box.querySelector('[data-les]') && !box.querySelector('.lesson-empty')) {
+      box.insertAdjacentHTML('beforeend', '<div class="empty small lesson-empty" style="padding:12px">这个单元还没有课时，在下面添加</div>');
+    }
+  }
+
+  function lessonWireDrag(root) {
+    const box = root && root.querySelector('#lessonRows');
+    if (!box) return;
+    box.querySelectorAll('.drag-h').forEach(function (h) {
+      h.addEventListener('pointerdown', function (ev) {
+        if (ev.button != null && ev.button !== 0) return;
+        ev.preventDefault();
+        const row = h.closest('[data-les]');
+        if (!row) return;
+        const sb = root.querySelector('.sheet-b');
+        const startScroll = sb ? sb.scrollTop : 0;
+        row.classList.add('dragging');
+        try { h.setPointerCapture(ev.pointerId); } catch (e) { /* 老浏览器忽略 */ }
+        const move = function (e) {
+          e.preventDefault();
+          const rows = Array.prototype.slice.call(box.querySelectorAll('[data-les]')).filter(function (r) { return r !== row; });
+          let target = null;
+          for (let i = 0; i < rows.length; i++) {
+            const r = rows[i].getBoundingClientRect();
+            if (e.clientY < r.top + r.height / 2) { target = rows[i]; break; }
+          }
+          if (target) { if (row.nextSibling !== target) box.insertBefore(row, target); }
+          else if (box.lastElementChild !== row) box.appendChild(row);
+        };
+        const up = function () {
+          document.removeEventListener('pointermove', move);
+          document.removeEventListener('pointerup', up);
+          document.removeEventListener('pointercancel', up);
+          row.classList.remove('dragging');
+          lessonRenumber(box);
+          if (sb) sb.scrollTop = startScroll;
+          UI.toast('顺序已调整，点「保存并自动归类」生效', 2000);
+        };
+        document.addEventListener('pointermove', move, { passive: false });
+        document.addEventListener('pointerup', up);
+        document.addEventListener('pointercancel', up);
+      });
+    });
+  }
+
+  /** 弹层里当前课时顺序（列表模式读输入框，批量粘贴模式读 textarea）；去空去重，保持顺序 */
+  function lessonNamesFromSheet() {
+    const box = document.getElementById('lessonRows');
+    let arr = null;
+    if (box) {
+      arr = Array.prototype.slice.call(box.querySelectorAll('[data-les] .ls-name')).map(function (inp) { return inp.value; });
+    } else {
+      const t = document.getElementById('unitLessonText');
+      arr = Catalog.fromText(t ? t.value : '');
+    }
+    const out = [];
+    (arr || []).forEach(function (v) {
+      v = String(v || '').trim();
+      if (v && out.indexOf(v) < 0) out.push(v);
+    });
+    return out;
+  }
+
   function lessonEditSheet(unit) {
     const cv2 = S._catVersion || S.defaults.version;
     const ls = Catalog.lessonsOf(S.defaults.subject, S.defaults.grade, S.defaults.term, cv2, unit);
     UI.sheet({
       title: '「' + unit + '」的课时',
-      body: '<p class="muted" style="margin-bottom:8px">每行一个课时（如：第1课时、三角形的面积）。保存后系统会按考点自动把该单元没课时的题归到对应课时，判断不出的去题库该单元卡「分配课时」批量归；清空表示这个单元不按课时分。</p>' +
-        '<textarea class="textarea" id="unitLessonText" style="min-height:140px" placeholder="第1课时&#10;第2课时">' + esc(Catalog.toText(ls)) + '</textarea>' +
+      body: '<p class="muted" style="margin-bottom:8px">一行一个课时（如：第1课时、三角形的面积）。<b>按住 ⋮⋮ 上下拖可自定义顺序</b>（录题时的课时选项、题库的课时筛选都按这个顺序）；名字直接点进去改，右侧可删。保存后系统会按考点自动把该单元没课时的题归到对应课时；全部删空表示这个单元不按课时分。</p>' +
+        '<div id="lessonRows">' +
+          (ls.length ? ls.map(lessonRowHtml).join('')
+                     : '<div class="empty small lesson-empty" style="padding:12px">这个单元还没有课时，在下面添加</div>') +
+        '</div>' +
         '<div class="row mt12" style="gap:8px">' +
+          '<input class="input" id="lessonNew" placeholder="新课时名，如：第3课时" style="flex:1">' +
+          '<button class="btn primary" data-act="lesson:add" style="white-space:nowrap">＋ 添加</button>' +
+        '</div>' +
+        '<button class="btn ghost block mt8" data-act="lesson:bulk" data-unit="' + esc(unit) + '">批量粘贴（一行一个）</button>' +
+        '<div class="row mt8" style="gap:8px">' +
           '<button class="btn ghost grow" data-act="sheet:close">取消</button>' +
+          '<button class="btn primary grow" data-act="settings:lessonsSave" data-unit="' + esc(unit) + '">保存并自动归类</button></div>',
+      onMount: function (root) { lessonWireDrag(root); }
+    });
+  }
+
+  /** 批量粘贴课时（保留原来的文本框方式，一次贴多行） */
+  function lessonBulkSheet(unit) {
+    const cv2 = S._catVersion || S.defaults.version;
+    const ls = Catalog.lessonsOf(S.defaults.subject, S.defaults.grade, S.defaults.term, cv2, unit);
+    UI.sheet({
+      title: '「' + unit + '」的课时 · 批量粘贴',
+      body: '<p class="muted" style="margin-bottom:8px">每行一个课时，粘贴后保存；顺序就是这里从上到下的顺序（之后想调顺序可在列表里拖）。清空表示这个单元不按课时分。</p>' +
+        '<textarea class="textarea" id="unitLessonText" style="min-height:150px" placeholder="第1课时&#10;第2课时">' + esc(Catalog.toText(ls)) + '</textarea>' +
+        '<div class="row mt12" style="gap:8px">' +
+          '<button class="btn ghost grow" data-act="lesson:back" data-unit="' + esc(unit) + '">返回列表</button>' +
           '<button class="btn primary grow" data-act="settings:lessonsSave" data-unit="' + esc(unit) + '">保存并自动归类</button></div>'
     });
   }
@@ -3802,23 +3903,83 @@
   }
 
   /* ---- 练习类型管理：增 / 改名 / 删（v1.20.0） ---- */
+  /** 练习类型拖动排序：按住 ⋮⋮ 上下拖，松手即保存；漏掉的旧类型自动补到末尾，不会丢 */
+  function ptypeApplyOrder(names) {
+    const list = PracticeTypes.list();
+    const out = [];
+    (names || []).forEach(function (n) {
+      if (list.indexOf(n) >= 0 && out.indexOf(n) < 0) out.push(n);
+    });
+    list.forEach(function (n) { if (out.indexOf(n) < 0) out.push(n); });
+    PracticeTypes.save(out);
+    return out;
+  }
+
+  function ptypeWireDrag(root) {
+    const box = root && root.querySelector('#ptypeList');
+    if (!box) return;
+    box.querySelectorAll('.drag-h').forEach(function (h) {
+      h.addEventListener('pointerdown', function (ev) {
+        if (ev.button != null && ev.button !== 0) return;
+        ev.preventDefault();
+        const row = h.closest('[data-ptype]');
+        if (!row) return;
+        const sb = root.querySelector('.sheet-b');
+        const startScroll = sb ? sb.scrollTop : 0;
+        row.classList.add('dragging');
+        try { h.setPointerCapture(ev.pointerId); } catch (e) { /* 老浏览器忽略 */ }
+        const move = function (e) {
+          e.preventDefault();
+          const rows = Array.prototype.slice.call(box.querySelectorAll('[data-ptype]')).filter(function (r) { return r !== row; });
+          let target = null;
+          for (let i = 0; i < rows.length; i++) {
+            const r = rows[i].getBoundingClientRect();
+            if (e.clientY < r.top + r.height / 2) { target = rows[i]; break; }
+          }
+          if (target) { if (row.nextSibling !== target) box.insertBefore(row, target); }
+          else if (box.lastElementChild !== row) box.appendChild(row);
+        };
+        const up = function () {
+          document.removeEventListener('pointermove', move);
+          document.removeEventListener('pointerup', up);
+          document.removeEventListener('pointercancel', up);
+          row.classList.remove('dragging');
+          const names = Array.prototype.slice.call(box.querySelectorAll('[data-ptype]')).map(function (r) { return r.dataset.ptype; });
+          ptypeApplyOrder(names);
+          // 序号按新顺序刷新（不重建弹层，滚动位置不跳）
+          Array.prototype.slice.call(box.querySelectorAll('[data-ptype] .pt-idx')).forEach(function (sp, i) {
+            sp.textContent = String(i + 1);
+          });
+          if (sb) sb.scrollTop = startScroll;
+          UI.toast('顺序已保存：录题选项、题库筛选都按这个顺序', 2000);
+        };
+        document.addEventListener('pointermove', move, { passive: false });
+        document.addEventListener('pointerup', up);
+        document.addEventListener('pointercancel', up);
+      });
+    });
+  }
+
   function ptypeMgrSheet() {
     const list = PracticeTypes.list();
-    const rows = list.map(function (t) {
-      return '<div class="row between" style="padding:9px 2px;border-bottom:0.5px solid var(--line);align-items:center;gap:8px">' +
+    const rows = list.map(function (t, i) {
+      return '<div class="row between" data-ptype="' + esc(t) + '" style="padding:7px 2px;border-bottom:0.5px solid var(--line);align-items:center;gap:6px">' +
+        '<span class="drag-h" title="按住拖动排序">⋮⋮</span>' +
+        '<span class="pt-idx muted" style="flex:none;width:15px;font-size:12px;text-align:right">' + (i + 1) + '</span>' +
         '<span style="font-size:14px;font-weight:600;flex:1">' + esc(t) + '</span>' +
         '<button class="small" style="color:var(--brand);font-weight:600" data-act="ptype:rename" data-v="' + esc(t) + '">改名</button>' +
         '<button class="small" style="color:#b3261e;font-weight:600" data-act="ptype:del" data-v="' + esc(t) + '">删除</button></div>';
     }).join('');
     UI.sheet({
       title: '练习类型（' + list.length + ' 个）',
-      body: '<p class="muted" style="margin-bottom:8px">录题时的「练习类型」选项和题库筛选都用这份列表；改名会同步改已标这个类型的题。</p>' +
-        (rows || '<div class="empty small" style="padding:14px">还没有练习类型，先在下面加一个</div>') +
+      body: '<p class="muted" style="margin-bottom:8px">录题时的「练习类型」选项和题库筛选都用这份列表；改名会同步改已标这个类型的题。<b>按住左侧 ⋮⋮ 上下拖，可以自定义顺序</b>（第 1 个排最前）。</p>' +
+        (rows ? '<div id="ptypeList">' + rows + '</div>' : '<div class="empty small" style="padding:14px">还没有练习类型，先在下面加一个</div>') +
         '<div class="row mt12" style="gap:8px">' +
           '<input class="input" id="ptypeNew" placeholder="新类型名，如：周周练" style="flex:1">' +
           '<button class="btn primary" data-act="ptype:add" style="white-space:nowrap">＋ 添加</button>' +
         '</div>' +
-        '<button class="btn ghost block mt8" data-act="ptype:reset">恢复默认 5 个</button>'
+        '<button class="btn ghost block mt8" data-act="ptype:reset">恢复默认 5 个</button>',
+      onMount: function (root) { ptypeWireDrag(root); }
     });
   }
   /* ---- 考点管理：全库考点列表，勾选后批量合并 / 批量删除 ---- */
@@ -8018,10 +8179,33 @@
     },
 
     'settings:lessonsEdit': function (d) { lessonEditSheet(d.unit); },
+    'lesson:add': function () {
+      const inp = document.getElementById('lessonNew');
+      const name = inp ? inp.value.trim() : '';
+      const box = document.getElementById('lessonRows');
+      if (!box) return;
+      if (!name) { UI.toast('先输入课时名'); return; }
+      const has = Array.prototype.slice.call(box.querySelectorAll('[data-les]')).some(function (r) { return r.dataset.les === name; });
+      if (has) { UI.toast('已经有这个课时了'); return; }
+      const i = box.querySelectorAll('[data-les]').length;
+      const tmp = document.createElement('div');
+      tmp.innerHTML = lessonRowHtml(name, i);
+      box.appendChild(tmp.firstElementChild);
+      lessonRenumber(box);
+      if (inp) { inp.value = ''; inp.focus(); }
+    },
+    'lesson:del': function (d, el) {
+      const row = el && el.closest ? el.closest('[data-les]') : null;
+      if (!row) return;
+      const box = document.getElementById('lessonRows');
+      row.remove();
+      lessonRenumber(box);
+    },
+    'lesson:bulk': function (d) { lessonBulkSheet(d.unit); },
+    'lesson:back': function (d) { lessonEditSheet(d.unit); },
     'settings:lessonsSave': async function (d) {
       const cv2 = S._catVersion || S.defaults.version;
-      const t = document.getElementById('unitLessonText');
-      Catalog.setLessons(S.defaults.subject, S.defaults.grade, S.defaults.term, cv2, d.unit, Catalog.fromText(t ? t.value : ''));
+      Catalog.setLessons(S.defaults.subject, S.defaults.grade, S.defaults.term, cv2, d.unit, lessonNamesFromSheet());
       UI.close();
       try {
         const r = await autoAssignLessons(S.defaults.subject, S.defaults.grade);
@@ -8420,14 +8604,14 @@
     dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs, dcEditSheet: dcEditSheet, dcEditApply: dcEditApply,
     dcSolveFixes: dcSolveFixes, dcSameNum: dcSameNum,
     autoAssignLessons: autoAssignLessons, syncCatalogLessons: syncCatalogLessons, pointBaseName: pointBaseName,
-    lessonAssignSheet: lessonAssignSheet, lessonEditSheet: lessonEditSheet,
+    lessonAssignSheet: lessonAssignSheet, lessonEditSheet: lessonEditSheet, lessonNamesFromSheet: lessonNamesFromSheet,
     jpLoad: jpLoad, jpSave: jpSave, jpHas: jpHas, jpCmpSheet: jpCmpSheet, jpCmpBox: jpCmpBox,
     dcOpenDays: dcOpenDays, migrateQuestionTypes: migrateQuestionTypes,
     assignRedAnswers: assignRedAnswers, normCmpText: normCmpText, ppmApplyOrder: ppmApplyOrder,
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints,
     lessonUnitOf: lessonUnitOf, lessonUnitOfDraft: lessonUnitOfDraft, lessonChoices: lessonChoices,
-    isReviewUnit: isReviewUnit,
+    isReviewUnit: isReviewUnit, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,
     PracticeTypes: PracticeTypes,
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
     usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,

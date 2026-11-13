@@ -645,6 +645,17 @@ body[data-tab="off"] .tabbar { display: none; }
   box-shadow: 0 4px 12px rgba(0,0,0,.10);
   border-radius: 10px;
 }
+/* 练习类型拖动排序（我的 → 练习类型） */
+#ptypeList [data-ptype] { background: var(--panel, #fff); }
+#lessonRows [data-les] { background: var(--panel, #fff); }
+#lessonRows [data-les].dragging,
+#ptypeList [data-ptype].dragging {
+  background: var(--brand-soft);
+  box-shadow: 0 4px 12px rgba(0,0,0,.12);
+  border-radius: 10px;
+  position: relative;
+  z-index: 2;
+}
 
 /* ---------------- 讲评 · 对比分析 ---------------- */
 .cmp-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }

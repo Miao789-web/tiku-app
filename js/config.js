@@ -11,7 +11,7 @@
 window.CONFIG = {
   app: {
     name: '题点',
-    version: '1.20.0'
+    version: '1.21.0'
   },
 
   // 上传前压缩：长边不超过 2600px（整页小字也要够 OCR 用的分辨率）
