@@ -81,12 +81,13 @@
         images: d.images || [], point: d.point || '', pointId: d.pointId || '',
         pointUnit: d.pointUnit || '', points: d.points || [],
         lesson: d.lesson || '',
+        reviewUnits: draftReviewUnits(d),
         confidence: d.confidence || 0, needsConfirm: !!d.needsConfirm
       };
     });
     const data = {
       subject: s.subject, grade: s.grade, unit: s.unit || '',
-      reviewOf: s.reviewOf || '',
+      reviewOf: '',
       batchName: s.batchName || '', batchDate: s.batchDate || '',
       practiceType: s.practiceType || '', pageNo: s.pageNo || '',
       pool: (s.imgPool || []).slice(),
@@ -1215,6 +1216,23 @@
   /** 复习章节：章节名带「复习」的（期中复习 / 整理与复习 / 自定义的期末专项复习等） */
   function isReviewUnit(u) { return /复习/.test(u || ''); }
 
+  /** 这道题「复习自哪些单元」：每道题各自选、可多选；老草稿只有 session.reviewOf 单值时兜底成一个 */
+  function draftReviewUnits(d) {
+    if (!d) return [];
+    const arr = Array.isArray(d.reviewUnits) ? d.reviewUnits : (d.reviewOf ? [d.reviewOf] : []);
+    const out = [];
+    arr.forEach(function (u) {
+      u = String(u || '').trim();
+      if (u && out.indexOf(u) < 0) out.push(u);
+    });
+    return out;
+  }
+  function draftReviewLabel(d) {
+    const us = draftReviewUnits(d);
+    if (!us.length) return '';
+    return us.length === 1 ? us[0] : (us[0] + ' 等 ' + us.length + ' 个单元');
+  }
+
   async function resolveUnitPoint(rawName, unit, subject, grade) {
     const base = Normalize.pretty(rawName || '') || '未分类';
     const suf = unitSuffixOf(unit, subject, grade);
@@ -1353,6 +1371,17 @@
   /** 草稿（还没入库）该按哪个单元选课时 */
   function lessonUnitOfDraft(d, s) {
     if (!d || !s) return '';
+    // 复习章节（v1.22.0）：每道题各自选「复习自哪个单元」→ 课时按那个单元列；没选就看考点带的单元
+    if (isReviewUnit(s.unit)) {
+      const ru = draftReviewUnits(d)[0];
+      if (ru) return ru;
+      const pts0 = (d.points && d.points.length) ? d.points : (d.point ? [{ name: d.point, units: d.pointUnit ? [d.pointUnit] : [] }] : []);
+      for (let i = 0; i < pts0.length; i++) {
+        const u0 = (pts0[i].units && pts0[i].units[0]) || unitSuffixToUnit(pts0[i].name, s.subject, s.grade);
+        if (u0) return u0;
+      }
+      return s.unit;
+    }
     if (s.unit) return s.unit;
     const pts = (d.points && d.points.length) ? d.points : (d.point ? [{ name: d.point, units: d.pointUnit ? [d.pointUnit] : [] }] : []);
     for (let i = 0; i < pts.length; i++) {
@@ -2069,6 +2098,71 @@
       '<div class="field"><label>找课时 / 新建（输入关键字过滤）</label>' +
         '<input class="input" id="lpKw" placeholder="如：三角形、第2课时" value="' + esc(st.kw || '') + '" autocomplete="off"></div>' +
       '<div id="lpChips">' + lessonChipsHtml() + '</div>';
+  }
+
+  /** 把一组题设成「复习自这些单元」（按目录顺序存，去重） */
+  function applyReviewUnits(drafts, units) {
+    const s = S.session;
+    if (!s) return [];
+    const cat = Catalog.get(s.subject, s.grade, S.defaults.term, S.defaults.version);
+    const ordered = cat.filter(function (u) { return (units || []).indexOf(u) >= 0; });
+    (drafts || []).forEach(function (d) {
+      if (!d) return;
+      d.reviewUnits = ordered.slice();
+      // 原来选的课时若不在新单元的课时表里，清掉，免得归到错课时上
+      const first = ordered[0] || '';
+      if (d.lesson && first) {
+        const ch = lessonChoices(first, s.subject, s.grade);
+        if (ch.length && ch.indexOf(d.lesson) < 0) d.lesson = '';
+      }
+    });
+    return ordered;
+  }
+
+  /** 复习单元选择弹层：每道题单独选、可多选；i < 0 = 批量（先勾单元，再决定应用给哪些题） */
+  function reviewPickSheet(i) {
+    const s = S.session;
+    if (!s) return;
+    const batch = i < 0 || !S.drafts[i];
+    const cat = Catalog.get(s.subject, s.grade, S.defaults.term, S.defaults.version);
+    const sel = {};
+    if (!batch) draftReviewUnits(S.drafts[i]).forEach(function (u) { if (cat.indexOf(u) >= 0) sel[u] = 1; });
+    S._rv = { i: i, sel: sel };
+
+    function bodyHtml() {
+      const st = S._rv;
+      const picked = Object.keys(st.sel);
+      const n = picked.length;
+      const noPick = S.drafts.filter(function (d) { return !draftReviewUnits(d).length; }).length;
+      const head = batch
+        ? '<p class="muted" style="margin-bottom:8px">先勾选单元（<b>可多选</b>），再决定应用给哪些题。复习题会同时归到「' + esc(s.unit) + '」和这里勾的单元。</p>'
+        : '<p class="muted" style="margin-bottom:8px">这道题是哪些单元的复习？<b>可以多选</b>（入库后同时归到这几个单元）。不选也行——考点带「·第N单元」后缀会自动归过去。</p>';
+      const chips = '<div class="chips wrapv">' + cat.map(function (u) {
+        const on = !!st.sel[u];
+        return '<button class="tag' + (on ? ' active' : '') + '" data-act="rv:toggle" data-v="' + esc(u) + '">' + (on ? '✓ ' : '') + esc(u) + '</button>';
+      }).join('') + '</div>';
+      const count = '<p class="muted mt8" style="font-size:12.5px">已选 ' + n + ' 个' + (n ? '：' + esc(picked.join('、')) : '（不选＝按考点后缀自动归）') + '</p>';
+      const btns = batch
+        ? '<div class="row mt12" style="gap:8px">' +
+            '<button class="btn ghost grow" data-act="rv:clear">清空</button>' +
+            '<button class="btn primary grow" data-act="rv:okBatch"' + (n ? '' : ' disabled') + '>应用到没选的（' + noPick + ' 题）</button></div>' +
+          '<button class="btn ghost block mt8" data-act="rv:okAll"' + (n ? '' : ' disabled') + '>应用到全部（' + S.drafts.length + ' 题）</button>'
+        : '<div class="row mt12" style="gap:8px">' +
+            '<button class="btn ghost grow" data-act="rv:clear">清空</button>' +
+            '<button class="btn primary grow" data-act="rv:ok">确定</button></div>' +
+          '<button class="btn ghost block mt8" data-act="rv:okBatch">应用到本批还没选的题（' + noPick + '）</button>';
+      return head + chips + count + btns;
+    }
+
+    function draw() {
+      const d = S.drafts[i] || {};
+      UI.sheet({
+        title: batch ? '批量指定复习单元' : ('第 ' + (d.no || (i + 1)) + ' 题 · 复习单元'),
+        body: bodyHtml()
+      });
+    }
+    S._rv.draw = draw;
+    draw();
   }
 
   function lessonPickSheet(opt) {
@@ -3265,8 +3359,12 @@
       };
       let guessUnit;
       if (isReviewUnit(s.unit)) {
-        // 复习章节自己的课时没意义：优先按「是哪个单元的复习」列，还没选就按考点的单元列
-        guessUnit = s.reviewOf || (function () {
+        // 复习章节自己的课时没意义：先看各题选的「复习自哪个单元」，再按考点带的单元
+        guessUnit = (function () {
+          for (let gi = 0; gi < S.drafts.length; gi++) {
+            const ru = draftReviewUnits(S.drafts[gi])[0];
+            if (ru) return ru;
+          }
           for (let gi = 0; gi < S.drafts.length; gi++) {
             const dd = S.drafts[gi];
             const nm = dd.point || (dd.points && dd.points[0] && dd.points[0].name) || '';
@@ -3277,18 +3375,15 @@
           return '';
         })();
       } else guessUnit = s.unit || draftUnitGuess();
-      // 复习章节（v1.19.0）：章节名带「复习」时先选「是哪个单元的复习」，课时按那个单元列、题也同时归到那个单元
+      // 复习章节（v1.22.0）：不给整批绑一个单元，改成每道题各自选（可多选）；这里只留一个批量入口
       let reviewHtml = '';
       if (isReviewUnit(s.unit)) {
-        const rv = s.reviewOf || '';
-        reviewHtml = '<div class="field mt8" style="margin-bottom:0"><label>「' + esc(s.unit) +
-          '」是哪个单元的复习？（选了课时就同时归到那个单元的课时题库）</label>' +
-          '<div class="chips">' +
-          cat.map(function (u) {
-            return '<button class="tag' + (rv === u ? ' active' : '') + '" data-act="confirm:reviewOf" data-v="' + esc(u) + '">' + esc(u) + '</button>';
-          }).join('') +
-          '<button class="tag' + (!rv ? ' active' : '') + '" data-act="confirm:reviewOf" data-v="">不确定</button>' +
-          '</div></div>';
+        const noPick = S.drafts.filter(function (d) { return !draftReviewUnits(d).length; }).length;
+        reviewHtml = '<div class="field mt8" style="margin-bottom:0"><label>复习题归到哪个单元？</label>' +
+          '<p class="muted" style="font-size:12.5px;margin-bottom:6px">每道题在自己的卡片上单独选（<b>可多选</b>），不同题可以归不同单元；不选也行——考点带「·第N单元」后缀的会自动归过去。' +
+            (noPick ? '还有 <b>' + noPick + '</b> 道没选。' : (S.drafts.length ? '全部题都选好了。' : '')) + '</p>' +
+          '<button class="btn ghost block" data-act="confirm:reviewAll">批量指定复习单元' +
+            (noPick ? '（' + noPick + ' 题未选）' : '') + '</button></div>';
       }
       if (!guessUnit) {
         lessonChips = '<p class="muted" style="font-size:12px;margin-top:6px">还没选章节，也没有考点带单元：课时可以先在上面框里直接写（如「第2课时」）；题卡的考点选好单元后，这里会自动列出该单元的课时。</p>';
@@ -3326,6 +3421,12 @@
         const chipWarn = (!d.aiPending && d.needsConfirm)
           ? '<span class="chip warn">待确认</span>' : '';
         const chipRed = d.answerFromRed ? '<span class="chip gray">✍ 红笔</span>' : '';
+        // 复习章节（v1.22.0）：每道题显示/选择自己复习自哪个单元，可多选
+        const rvUs = draftReviewUnits(d);
+        const chipReview = isReviewUnit(s.unit)
+          ? '<span class="chip ' + (rvUs.length ? 'brand' : 'warn') + ' tap" data-act="draft:review" data-i="' + i + '" title="点击选这道题是哪些单元的复习（可多选）">🔁 ' +
+            (rvUs.length ? esc(draftReviewLabel(d)) : '复习单元待选') + '</span>'
+          : '';
         // 课时（v1.18.0）：点一下就按这道题（或整批）的单元列课时，没单元就按关键字新建
         const dLesson = d.lesson || s.lesson || '';
         const chipLesson = '<span class="chip gray tap" data-act="draft:lesson" data-i="' + i + '" title="点击选课时">⏱ ' +
@@ -3333,7 +3434,7 @@
         const body = [d.text].concat(d.subs || [], d.options || []).join('\n');
         return '<article class="qcard' + (d.needsConfirm && !d.aiPending ? ' needs' : '') + '">' +
           '<div class="qcard-h">' +
-            '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipWarn + chipRed + chipLesson +
+            '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipReview + chipWarn + chipRed + chipLesson +
             '<span class="chip gray tap" data-act="draft:type" data-i="' + i + '" title="点击改题型">' + esc(d.type) + '</span>' +
             '<span class="chip gray tap" data-act="draft:diff" data-i="' + i + '" title="点击改难度">难度 ' + esc(d.difficulty) + '</span>' +
           '</div>' +
@@ -4821,7 +4922,7 @@
           answer: it.answer || redTxt, solution: it.solution,
           answerFromRed: !it.answer && !!redTxt,
           type: it.type, difficulty: it.difficulty,
-          images: mine,
+          images: mine, reviewUnits: [],
           point: '', pointId: '', confidence: 0, needsConfirm: true, aiPending: true
         });
       });
@@ -4974,12 +5075,13 @@
     addUnit(primaryUnit);
     addUnit(s.unit);
     entries.forEach(function (e) { (e.units || []).forEach(addUnit); });
-    // 复习章节（v1.19.0）：选了「是哪个单元的复习」→ 题同时归复习章节和那个单元，两边题库都能看到
-    if (isReviewUnit(primaryUnit) && s.reviewOf) addUnit(s.reviewOf);
+    // 复习章节（v1.22.0）：这道题选了「复习自哪些单元」→ 同时归复习章节和这些单元（可多个），两边题库都能看到
+    const reviewUs = isReviewUnit(primaryUnit) ? draftReviewUnits(d) : [];
+    reviewUs.forEach(addUnit);
     // 课时：确认页填的课时作用于整批练习的主单元（复习章节则同时作用到所选单元）；新建考点时选的课时写到对应单元位置
     const batchLesson = (s.lesson || '').trim();
     const lessons = unitSet.map(function (u) {
-      return (u === primaryUnit || (s.reviewOf && u === s.reviewOf)) ? batchLesson : '';
+      return (u === primaryUnit || reviewUs.indexOf(u) >= 0) ? batchLesson : '';
     });
     entries.forEach(function (e) {
       if (!e.lesson) return;
@@ -4992,8 +5094,10 @@
     if (d.lesson) {
       const i0 = unitSet.indexOf(primaryUnit);
       if (i0 >= 0) lessons[i0] = d.lesson;
-      const ir = unitSet.indexOf(s.reviewOf);
-      if (ir >= 0 && !lessons[ir]) lessons[ir] = d.lesson;
+      reviewUs.forEach(function (ru) {
+        const ir = unitSet.indexOf(ru);
+        if (ir >= 0) lessons[ir] = d.lesson;
+      });
     }
     await Store.Questions.create({
       subject: s.subject,
@@ -5903,7 +6007,7 @@
         key: Util.uid('d'), imgIndex: 0, no: S.drafts.length + 1,
         text: '', subs: [], options: [], answer: '', solution: '',
         type: '应用题', difficulty: 2, point: '', pointId: '', confidence: 1,
-        needsConfirm: true, aiPending: false
+        reviewUnits: [], needsConfirm: true, aiPending: false
       });
       render();
       setTimeout(function () {
@@ -6060,6 +6164,11 @@
       prev.subs = []; prev.options = [];
       prev.type = Splitter.detectType(prev);
       prev.needsConfirm = true;
+      // 合并两题时，两道题各自的复习单元取并集（不错过任何一边）
+      prev.reviewUnits = draftReviewUnits(prev);
+      draftReviewUnits(cur).forEach(function (u) {
+        if (prev.reviewUnits.indexOf(u) < 0) prev.reviewUnits.push(u);
+      });
       // 被合并题的配图转给上一题（避免图形丢失）
       (cur.images || []).forEach(function (src) {
         prev.images = prev.images || [];
@@ -6561,7 +6670,7 @@
       if (!d || !d.drafts || !d.drafts.length) return;
       S.session = {
         images: [], subject: d.subject || S.defaults.subject, grade: d.grade || S.defaults.grade,
-        unit: d.unit || '', reviewOf: d.reviewOf || '', batchName: d.batchName || '', batchDate: d.batchDate || '',
+        unit: d.unit || '', batchName: d.batchName || '', batchDate: d.batchDate || '',
         practiceType: d.practiceType || '', pageNo: d.pageNo || '',
         stage: 'confirm', mode: 'photo', imgPool: []
       };
@@ -6576,10 +6685,13 @@
         });
       });
       S.drafts = d.drafts.map(function (x) {
-        return Object.assign({
+        const dd = Object.assign({
           key: Util.uid('d'), imgIndex: 0, subs: [], options: [],
           images: [], aiPending: false
         }, x);
+        // 老草稿：整批只有一个 reviewOf → 迁到每道题上（之后可逐题改）
+        if (!Array.isArray(dd.reviewUnits)) dd.reviewUnits = (x.reviewOf || d.reviewOf) ? [x.reviewOf || d.reviewOf] : [];
+        return dd;
       });
       S.aiFallback = '';
       S.cache.homeDraft = null;
@@ -6770,7 +6882,6 @@
     'confirm:unit': function (d, el) {
       if (!S.session) return;
       S.session.unit = (S.session.unit === d.v) ? '' : d.v;
-      if (!isReviewUnit(S.session.unit)) S.session.reviewOf = '';
       document.querySelectorAll('[data-act="confirm:unit"]').forEach(function (b) {
         b.classList.toggle('active', b.dataset.v === S.session.unit);
       });
@@ -6780,10 +6891,50 @@
       render();
     },
 
-    /* 复习章节：选「是哪个单元的复习」 */
-    'confirm:reviewOf': function (d) {
-      if (!S.session) return;
-      S.session.reviewOf = (S.session.reviewOf === d.v) ? '' : d.v;
+    /* 复习章节：每道题各自选复习单元（可多选），见 reviewPickSheet */
+    'draft:review': function (d) { reviewPickSheet(+d.i); },
+    'confirm:reviewAll': function () { reviewPickSheet(-1); },
+    'rv:toggle': function (d) {
+      const st = S._rv;
+      if (!st) return;
+      const u = String(d.v || '').trim();
+      if (!u) return;
+      if (st.sel[u]) delete st.sel[u]; else st.sel[u] = 1;
+      if (st.draw) st.draw();
+    },
+    'rv:clear': function () {
+      const st = S._rv;
+      if (!st) return;
+      st.sel = {};
+      if (st.draw) st.draw();
+    },
+    'rv:ok': function () {
+      const st = S._rv;
+      if (!st || st.i < 0) return;
+      const units = applyReviewUnits([S.drafts[st.i]], Object.keys(st.sel));
+      S._rv = null;
+      UI.close();
+      UI.toast(units.length ? ('第 ' + (S.drafts[st.i] ? (S.drafts[st.i].no || '') : '') + ' 题复习单元：' + units.join('、')) : '已清空这道题的复习单元', 2600);
+      render();
+    },
+    'rv:okBatch': function () {
+      const st = S._rv;
+      if (!st) return;
+      const todo = S.drafts.filter(function (d) { return !draftReviewUnits(d).length; });
+      if (!todo.length) { UI.toast('本批每道题都已经选过了'); return; }
+      const units = applyReviewUnits(todo, Object.keys(st.sel));
+      S._rv = null;
+      UI.close();
+      UI.toast('已给 ' + todo.length + ' 道题指定复习单元：' + units.join('、'), 3000);
+      render();
+    },
+    'rv:okAll': function () {
+      const st = S._rv;
+      if (!st) return;
+      const units = applyReviewUnits(S.drafts.slice(), Object.keys(st.sel));
+      S._rv = null;
+      UI.close();
+      UI.toast('已把 ' + S.drafts.length + ' 道题都归到：' + units.join('、'), 3000);
       render();
     },
 
@@ -6819,7 +6970,6 @@
       if (!clean) return;
       Catalog.addUnit(s.subject, s.grade, S.defaults.term, S.defaults.version, clean);
       s.unit = clean;
-      if (!isReviewUnit(clean)) s.reviewOf = '';
       UI.toast('已添加并选中：' + clean);
       await render();
     },
@@ -8611,7 +8761,7 @@
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints,
     lessonUnitOf: lessonUnitOf, lessonUnitOfDraft: lessonUnitOfDraft, lessonChoices: lessonChoices,
-    isReviewUnit: isReviewUnit, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,
+    isReviewUnit: isReviewUnit, draftReviewUnits: draftReviewUnits, reviewPickSheet: reviewPickSheet, applyReviewUnits: applyReviewUnits, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,
     PracticeTypes: PracticeTypes,
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
     usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,
