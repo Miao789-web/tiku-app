@@ -1385,6 +1385,36 @@
     return out;
   }
 
+  /* ---- 练习类型（v1.20.0：可在「我的」里自己增删改名，不再写死在 CONFIG） ---- */
+  const PTYPE_KEY = 'tiku.ptypes';
+  const PracticeTypes = (function () {
+    function list() {
+      let arr = null;
+      try { arr = JSON.parse(localStorage.getItem(PTYPE_KEY) || 'null'); } catch (e) { arr = null; }
+      const base = (Array.isArray(arr) && arr.length) ? arr : CONFIG.practiceTypes.slice();
+      const out = [];
+      base.forEach(function (t) {
+        t = String(t || '').trim();
+        if (t && out.indexOf(t) < 0) out.push(t);
+      });
+      return out.length ? out : CONFIG.practiceTypes.slice();
+    }
+    function save(arr) {
+      const out = [];
+      (arr || []).forEach(function (t) {
+        t = String(t || '').trim();
+        if (t && out.indexOf(t) < 0) out.push(t);
+      });
+      try { localStorage.setItem(PTYPE_KEY, JSON.stringify(out)); } catch (e) {}
+      return out;
+    }
+    function reset() {
+      try { localStorage.removeItem(PTYPE_KEY); } catch (e) {}
+      return CONFIG.practiceTypes.slice();
+    }
+    return { list: list, save: save, reset: reset };
+  })();
+
   /* ---- 练习名称 / 练习类型 / 页码 ----
    * 老题目只有 batchName（如「数学练习册P23」）：没显式字段时按关键词推断类型、从名称里取页码，
    * 这样以前录的题也能直接用新筛选，不用重新录。 */
@@ -2548,30 +2578,50 @@
     return { questions: qs, points: data.points, papers: data.papers, deleted: Store.deletions(), savedAt: Date.now() };
   }
 
-  let syncPushTimer = null, syncBusy = false;
+  let syncPushTimer = null, syncRetry = 0, syncPushing = false, syncPulling = false, syncFailTold = false;
   function scheduleSyncPush(delay) {
     if (!syncReady()) return;
     clearTimeout(syncPushTimer);
     syncPushTimer = setTimeout(function () { syncPushNow(); }, delay == null ? 2500 : delay);
   }
 
-  async function syncPushNow() {
-    if (!syncReady() || syncBusy) return false;
-    syncBusy = true;
+  async function syncPushNow(quiet) {
+    if (!syncReady()) return false;
+    // 上传和拉取互斥，但「另一件事正忙」绝不能把这次改动丢掉——排到 3 秒后重试
+    if (syncPushing || syncPulling) { scheduleSyncPush(3000); return false; }
+    syncPushing = true;
     try {
       const payload = await buildSyncPayload();
-      const h = window.CloudSync.hashOf(JSON.stringify(payload));
-      if (localStorage.getItem(SYNC_HASH_KEY) === h) { S.syncMsg = '内容没变化'; return true; }
+      const raw = JSON.stringify(payload);
+      S.syncSize = Math.round(raw.length / 1024);
+      const h = window.CloudSync.hashOf(raw);
+      if (localStorage.getItem(SYNC_HASH_KEY) === h) { S.syncMsg = '内容没变化'; syncRetry = 0; return true; }
       await window.CloudSync.push(payload, h);
       localStorage.setItem(SYNC_HASH_KEY, h);
       if ((payload.deleted || []).length) Store.clearDeletions();
       S.syncMsg = '已上传 ' + payload.questions.length + ' 题（' + new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) + '）';
+      syncRetry = 0;
+      syncFailTold = false;
       return true;
     } catch (e) {
       S.syncMsg = '上传失败：' + (e.message || e);
+      S.syncErr = String(e.message || e);
+      if (!quiet) {
+        // 第一次失败就冒个泡（以前只写在设置页里，手机上根本看不到，以为同步好了）
+        if (!syncFailTold) {
+          syncFailTold = true;
+          UI.toast('云同步上传失败：' + (e.message || e) + '（会自动重试，也可到「我的」手动同步）', 4200);
+        }
+      }
+      // 网络抖动 / 桥没加载好：退避重试（5s、15s、45s…，最多 6 次），切回页面时也会再试
+      if (syncRetry < 6) {
+        const wait = 5000 * Math.pow(3, syncRetry);
+        syncRetry++;
+        scheduleSyncPush(wait);
+      }
       return false;
     } finally {
-      syncBusy = false;
+      syncPushing = false;
     }
   }
 
@@ -2632,16 +2682,17 @@
 
   async function syncPullNow(silent) {
     if (!syncReady()) return 0;
-    if (syncBusy) return 0;
+    if (syncPulling || syncPushing) return 0;
     let docs;
-    syncBusy = true;
+    syncPulling = true;
     try {
       docs = await window.CloudSync.pull();
     } catch (e) {
       S.syncMsg = '拉取失败：' + (e.message || e);
+      S.syncErr = String(e.message || e);
       return 0;
     } finally {
-      syncBusy = false;
+      syncPulling = false;
     }
     const cursor = readSyncCursor();
     const me = window.CloudSync.deviceId();
@@ -2676,11 +2727,17 @@
         '改用平时打开题库的那个线上链接即可自动同步。</p>';
     }
     const st = cs.status || {};
+    const err = S.syncErr || '';
+    const bridgeHint = (err && /桥接|超时|拦截/.test(err))
+      ? '<br><span style="color:var(--warn)">桥接被拦了：请用手机自带浏览器（Safari / Chrome）打开，微信里打开的内置浏览器常拦跨站请求。</span>'
+      : '';
     return '<p class="small" style="line-height:1.9;margin:0 0 8px">' +
-      '设备：<b>' + esc(cs.deviceName()) + '</b>' +
-      (st.lastPush ? '<br>上次上传：' + esc(new Date(st.lastPush).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : '') +
+      '设备：<b>' + esc(cs.deviceName()) + '</b>（' + esc(cs.deviceId()) + '）' +
+      '<br>通道：' + (cs.sameOrigin ? '直连云端' : '经云桥中转') +
+      (S.syncSize ? '<br>上传体积：' + S.syncSize + ' KB（不含配图）' : '') +
+      (st.lastPush ? '<br>上次上传：' + esc(new Date(st.lastPush).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : '<br>本机还没成功上传过') +
       (st.lastPull ? '<br>上次拉取：' + esc(new Date(st.lastPull).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : '') +
-      (S.syncMsg ? '<br>' + esc(S.syncMsg) : '') + '</p>';
+      (S.syncMsg ? '<br>' + esc(S.syncMsg) : '') + bridgeHint + '</p>';
   }
 
   PAGES.jp = {
@@ -3233,7 +3290,7 @@
             '<input class="input" id="batchName" placeholder="如：数学练习册P23" value="' + esc(s.batchName || '') + '">' +
           '</div>' +
           '<div class="field"><label>练习类型（选填，题库按它筛题）</label><div class="chips wrapv">' +
-            CONFIG.practiceTypes.map(function (t) {
+            PracticeTypes.list().map(function (t) {
               return '<button class="tag' + (s.practiceType === t ? ' active' : '') + '" data-act="confirm:ptype" data-v="' + esc(t) + '">' + esc(t) + '</button>';
             }).join('') +
             '<button class="tag' + (!s.practiceType ? ' active' : '') + '" data-act="confirm:ptype" data-v="">不标注</button>' +
@@ -3744,6 +3801,26 @@
     UI.sheet({ title: '筛选题库', body: body });
   }
 
+  /* ---- 练习类型管理：增 / 改名 / 删（v1.20.0） ---- */
+  function ptypeMgrSheet() {
+    const list = PracticeTypes.list();
+    const rows = list.map(function (t) {
+      return '<div class="row between" style="padding:9px 2px;border-bottom:0.5px solid var(--line);align-items:center;gap:8px">' +
+        '<span style="font-size:14px;font-weight:600;flex:1">' + esc(t) + '</span>' +
+        '<button class="small" style="color:var(--brand);font-weight:600" data-act="ptype:rename" data-v="' + esc(t) + '">改名</button>' +
+        '<button class="small" style="color:#b3261e;font-weight:600" data-act="ptype:del" data-v="' + esc(t) + '">删除</button></div>';
+    }).join('');
+    UI.sheet({
+      title: '练习类型（' + list.length + ' 个）',
+      body: '<p class="muted" style="margin-bottom:8px">录题时的「练习类型」选项和题库筛选都用这份列表；改名会同步改已标这个类型的题。</p>' +
+        (rows || '<div class="empty small" style="padding:14px">还没有练习类型，先在下面加一个</div>') +
+        '<div class="row mt12" style="gap:8px">' +
+          '<input class="input" id="ptypeNew" placeholder="新类型名，如：周周练" style="flex:1">' +
+          '<button class="btn primary" data-act="ptype:add" style="white-space:nowrap">＋ 添加</button>' +
+        '</div>' +
+        '<button class="btn ghost block mt8" data-act="ptype:reset">恢复默认 5 个</button>'
+    });
+  }
   /* ---- 考点管理：全库考点列表，勾选后批量合并 / 批量删除 ---- */
   async function pointMgrSheet() {
     const sbj = S.bank.subject !== '全部' ? S.bank.subject : S.defaults.subject;
@@ -4142,6 +4219,15 @@
           }).join('') +
         '</section>' +
 
+        '<section class="card">' +
+          '<div class="card-h"><h3>练习类型</h3>' +
+            '<button class="small" style="color:var(--brand);font-weight:600" data-act="ptype:mgr">✎ 管理</button></div>' +
+          '<p class="muted" style="margin-bottom:6px">录题时「练习类型」的选项和题库筛选都来自这里。不需要的可以删，也可以自己加（如「周周练」「错题重做」）。</p>' +
+          '<div class="chips wrapv">' + PracticeTypes.list().map(function (t) {
+            return '<span class="chip gray">' + esc(t) + '</span>';
+          }).join('') + '</div>' +
+        '</section>' +
+
         '<div class="sec-title">数据</div>' +
         '<section class="card">' +
           '<div class="card-h"><h3>手机 ↔ 电脑同步</h3></div>' +
@@ -4154,6 +4240,7 @@
           '<div class="card-h"><h3>自动同步（只同步文字，不同步配图）</h3></div>' +
           syncStatusHtml() +
           '<button class="btn ghost block" data-act="sync:now">立即同步一次</button>' +
+          '<button class="btn ghost block mt8" data-act="sync:devices">查看云端各设备 / 题数</button>' +
           '<div class="row mt8" style="gap:8px;align-items:center">' +
             '<input class="input" id="syncDevName" value="' + esc((window.CloudSync && window.CloudSync.deviceName()) || '') + '" style="flex:1" placeholder="这台设备叫什么（如 手机 / 办公室电脑）">' +
             '<button class="btn soft" data-act="sync:rename" style="white-space:nowrap">改名</button>' +
@@ -7261,7 +7348,7 @@
           '<div class="field mt8"><label>练习类型（筛题用）</label>' +
             '<select class="select" id="qePType">' +
               '<option value="">（未标注）</option>' +
-              CONFIG.practiceTypes.map(function (t) {
+              PracticeTypes.list().map(function (t) {
                 return '<option value="' + esc(t) + '"' + (practiceTypeOf(q) === t ? ' selected' : '') + '>' + esc(t) + '</option>';
               }).join('') +
             '</select></div>' +
@@ -7889,6 +7976,47 @@
     },
 
     /* ---- 每单元的课时（编辑 + 保存后自动归类） ---- */
+    /* ---- 练习类型管理（我的 → 练习类型） ---- */
+    'ptype:mgr': function () { ptypeMgrSheet(); },
+    'ptype:add': function () {
+      const el = document.getElementById('ptypeNew');
+      const name = el ? el.value.trim() : '';
+      if (!name) { UI.toast('先输入类型名'); return; }
+      const list = PracticeTypes.list();
+      if (list.indexOf(name) >= 0) { UI.toast('已经有这个类型了'); return; }
+      PracticeTypes.save(list.concat([name]));
+      UI.toast('已添加「' + name + '」');
+      ptypeMgrSheet();
+    },
+    'ptype:rename': async function (d) {
+      const old = d.v || '';
+      const v = await UI.prompt({ title: '给「' + old + '」改个名', value: old, rows: 1 });
+      const name = (v || '').trim();
+      if (!name || name === old) return;
+      const list = PracticeTypes.list().map(function (t) { return t === old ? name : t; });
+      PracticeTypes.save(list);
+      // 已标这个类型的题一起改，筛选不会断
+      const qs = (await DB.all('questions')).filter(function (q) { return (q.practiceType || '') === old; });
+      for (const q of qs) await DB.put('questions', Object.assign(q, { practiceType: name, updatedAt: Date.now() }));
+      UI.toast('已改名，' + qs.length + ' 道题同步', 2600);
+      ptypeMgrSheet();
+    },
+    'ptype:del': async function (d) {
+      const old = d.v || '';
+      const n = (await DB.all('questions')).filter(function (q) { return (q.practiceType || '') === old; }).length;
+      const ok = await UI.confirm('从练习类型里删掉「' + old + '」？' + (n ? '（已标这个类型的 ' + n + ' 道题保留原类型，筛选题库时仍能看到）' : ''));
+      if (!ok) return;
+      PracticeTypes.save(PracticeTypes.list().filter(function (t) { return t !== old; }));
+      UI.toast('已删除「' + old + '」');
+      ptypeMgrSheet();
+    },
+    'ptype:reset': async function () {
+      const ok = await UI.confirm('恢复成默认 5 个练习类型？（自己加的类型会没有，已录题目不受影响）');
+      if (!ok) return;
+      PracticeTypes.reset();
+      ptypeMgrSheet();
+    },
+
     'settings:lessonsEdit': function (d) { lessonEditSheet(d.unit); },
     'settings:lessonsSave': async function (d) {
       const cv2 = S._catVersion || S.defaults.version;
@@ -7998,10 +8126,33 @@
         return;
       }
       UI.toast('同步中…');
-      await syncPushNow();
+      const pushed = await syncPushNow();
       const n = await syncPullNow(true);
       await render();
-      UI.toast(n ? '已合并 ' + n + ' 处改动' : '已是最新', 2400);
+      if (!pushed) UI.toast('上传没成功：' + (S.syncMsg || S.syncErr || '未知原因') + '（到「我的」看通道/上次上传）', 5000);
+      else UI.toast(n ? '已上传，并从云端合并 ' + n + ' 处改动' : '已上传，云端没有别的设备的新改动', 3000);
+    },
+    /* 云端各设备：一眼看出「手机到底传上来没有」 */
+    'sync:devices': async function () {
+      if (!syncReady()) { UI.toast('要从线上链接打开才能读云端（见上方说明）', 3600); return; }
+      UI.toast('读取云端…');
+      let rows;
+      try { rows = await window.CloudSync.pull(); }
+      catch (e) { UI.toast('读取失败：' + (e.message || e), 4200); return; }
+      const me = window.CloudSync.deviceId();
+      const list = (rows || []).map(function (r) {
+        const qs = (r.payload && r.payload.questions) || [];
+        return { name: r.device_name || '未命名', id: r.device || '', q: qs.length, at: r.updated_at || 0, mine: r.device === me };
+      }).sort(function (a, b) { return b.at - a.at; });
+      const body = '<p class="muted" style="margin-bottom:8px">云端每台设备一行（只存文字，不含配图）。题数为 0 说明那台没传过题。</p>' +
+        (list.length ? list.map(function (r) {
+          return '<div class="row between" style="padding:9px 2px;border-bottom:0.5px solid var(--line);align-items:center;gap:8px">' +
+            '<span style="font-size:14px;font-weight:600">' + esc(r.name) + (r.mine ? '<span class="muted" style="font-weight:400;font-size:12px">（这台）</span>' : '') + '</span>' +
+            '<span class="muted" style="font-size:12.5px">' + r.q + ' 题 · ' +
+            (r.at ? esc(new Date(r.at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })) : '—') + '</span></div>';
+        }).join('') : '<div class="empty small" style="padding:14px">云端还没有任何设备记录</div>') +
+        '<p class="muted mt12">手机看不到自己/题数是 0：在手机上打开同一个线上链接 → 我的 → 看「上次上传」；传不上去时这里会写原因（多半是被微信内置浏览器拦了，换 Safari / Chrome 打开）。</p>';
+      UI.sheet({ title: '云端各设备', body: body });
     },
     'sync:rename': function () {
       const el = document.getElementById('syncDevName');
@@ -8277,6 +8428,8 @@
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints,
     lessonUnitOf: lessonUnitOf, lessonUnitOfDraft: lessonUnitOfDraft, lessonChoices: lessonChoices,
     isReviewUnit: isReviewUnit,
+    PracticeTypes: PracticeTypes,
+    syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
     usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,
     lessonChipsHtml: lessonChipsHtml, sweepLostImages: sweepLostImages,
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
@@ -8311,13 +8464,17 @@
 
     // 任何写库动作（入库/编辑/删除/导入）都在 2.5 秒后自动上传文字快照
     try { Store.onChange(function () { scheduleSyncPush(); }); } catch (e) {}
-    // 云端文字同步：打开时拉一次，之后每 60 秒 / 每次切回页面看一次
+    // 云端文字同步：打开时先拉再推一次（老数据、离线时录的题也能补传上去），之后每 60 秒 / 切回页面各看一次
     if (syncReady()) {
-      setTimeout(function () { syncPullNow(true); }, 2500);
+      setTimeout(async function () {
+        await syncPullNow(true);
+        await syncPushNow(true);      // 本机有题但云端还没有 / 上次没传成功 → 这里补上
+      }, 2500);
       setInterval(function () { if (!document.hidden) syncPullNow(true); }, 60000);
       document.addEventListener('visibilitychange', function () {
-        if (!document.hidden && syncReady()) syncPullNow(true);
+        if (!document.hidden && syncReady()) { syncPullNow(true); syncPushNow(true); }
       });
+      window.addEventListener('online', function () { if (syncReady()) syncPushNow(true); });
     }
   })();
 })();

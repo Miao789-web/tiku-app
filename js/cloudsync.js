@@ -35,6 +35,9 @@
   /** file:// 打开（单文件版 / 本地文件）没有 Origin，云端无法校验 */
   function originOk() {
     try {
+      // ?nosync=1 / localStorage 标记：测试和临时演示用，避免把测试数据写进云端
+      if (/[?&]nosync\b/.test(location.search)) return false;
+      if (localStorage.getItem('tiku.nosync') === '1') return false;
       var h = location.hostname;
       if (!h) return false;
       return location.protocol === 'https:' || h === 'localhost' || h === '127.0.0.1' || h === '::1';
