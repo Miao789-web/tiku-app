@@ -82,7 +82,8 @@
         pointUnit: d.pointUnit || '', points: d.points || [],
         lesson: d.lesson || '',
         reviewUnits: draftReviewUnits(d),
-        confidence: d.confidence || 0, needsConfirm: !!d.needsConfirm
+        confidence: d.confidence || 0, needsConfirm: !!d.needsConfirm,
+        pointUser: !!d.pointUser
       };
     });
     const data = {
@@ -3293,7 +3294,7 @@
           ? '<section class="card" style="border-left:3px solid var(--warn)" data-act="bank:confirmList">' +
               '<div class="row between"><div>' +
                 '<div style="font-weight:700;font-size:14.5px">' + s.needsConfirm + ' 道题待确认考点</div>' +
-                '<p class="muted" style="margin-top:2px">AI 拿不准的题，确认后归类更准</p>' +
+                '<p class="muted" style="margin-top:2px">系统自动配的考点，核对一下就干净了</p>' +
               '</div>' + ARROW + '</div></section>'
           : '') +
 
@@ -3597,7 +3598,10 @@
           ? '<span class="chip gray">AI 归类中…</span>'
           : '<span class="chip brand tap" data-act="draft:point" data-i="' + i + '">' + esc(d.point || '选择考点') + ' ›</span>';
         const chipWarn = (!d.aiPending && d.needsConfirm)
-          ? '<span class="chip warn">待确认</span>' : '';
+          ? (d.point && d.point !== '未分类'
+              ? '<span class="chip warn tap" data-act="draft:pointOk" data-i="' + i + '" title="点一下＝这个考点没问题，确认掉">待确认 ✓</span>'
+              : '<span class="chip warn">待确认</span>')
+          : '';
         const chipRed = d.answerFromRed ? '<span class="chip gray">✍ 红笔</span>' : '';
         // 复习章节（v1.22.0）：每道题显示/选择自己复习自哪个单元，可多选
         const rvUs = draftReviewUnits(d);
@@ -5215,7 +5219,9 @@
         d.difficulty = r.difficulty || d.difficulty;
         d.answer = r.answer || d.answer;
         d.confidence = r.confidence || 0;
-        d.needsConfirm = d.confidence < 0.7 || !d.point || d.point === '未分类';
+        // v1.23.2：只要是系统自动配的考点就标「待确认」，等老师确认（点黄标即可确认）
+        d.needsConfirm = true;
+        d.pointUser = false;
         d.aiPending = false;
         if (known.indexOf(d.point) < 0 && d.point !== '未分类') known.push(d.point);
       });
@@ -6311,7 +6317,6 @@
       const i = +d.i;
       const draft = S.drafts[i];
       if (!draft) return;
-      const bodyBefore = [draft.text].concat(draft.subs || [], draft.options || []).join('\n');
       const txt = ((document.getElementById('deText') || {}).value || '').trim();
       if (!txt) { UI.toast('题干不能为空'); return; }
       // 编辑里识别到独立一行的 cf → 先问要不要按它拆分；选「取消」就当普通文字保存
@@ -6336,8 +6341,8 @@
       const df = Number((document.getElementById('deDiff') || {}).value);
       if (df) draft.difficulty = df;
       draft.solution = ((document.getElementById('deSol') || {}).value || '').trim();
-      // 只有题干真的改了才重新标记待确认（考点按原题干归的类）；只改答案/题型/难度/思路不动它
-      if (txt !== bodyBefore) draft.needsConfirm = true;
+      // v1.23.2：改题干（哪怕内容变了）都不再动「待确认」标记——
+      // 黄标只表示「考点是系统自动配的、老师还没确认过」，跟改字无关
       UI.close();
       // 记下这张卡的位置，render 后原地恢复，不再跳卡
       const editCardEl = document.querySelector('[data-act="draft:edit"][data-i="' + i + '"]');
@@ -6376,7 +6381,8 @@
       prev.text = (prev.text + '\n' + body).trim();
       prev.subs = []; prev.options = [];
       prev.type = Splitter.detectType(prev);
-      prev.needsConfirm = true;
+      // 合并后只有「考点还没被老师确认过」的才算待确认
+      if (!prev.pointUser) prev.needsConfirm = true;
       // 合并两题时，两道题各自的复习单元取并集（不错过任何一边）
       prev.reviewUnits = draftReviewUnits(prev);
       draftReviewUnits(cur).forEach(function (u) {
@@ -6903,7 +6909,7 @@
       S.drafts = d.drafts.map(function (x) {
         const dd = Object.assign({
           key: Util.uid('d'), imgIndex: 0, subs: [], options: [],
-          images: [], aiPending: false
+          images: [], aiPending: false, pointUser: false
         }, x);
         // 老草稿：整批只有一个 reviewOf → 迁到每道题上（之后可逐题改）
         if (!Array.isArray(dd.reviewUnits)) dd.reviewUnits = (x.reviewOf || d.reviewOf) ? [x.reviewOf || d.reviewOf] : [];
@@ -6937,12 +6943,23 @@
       draft.pointId = picked[0].id || '';
       draft.pointUnit = (picked[0].units && picked[0].units[0]) || '';
       draft.needsConfirm = false;
+      draft.pointUser = true;   // 老师亲手选过考点 → 以后再怎么改题干都不再标黄
       // v1.23.0：考点落在第 N 单元 → 复习单元直接填成那个单元，不再让老师看到「复习单元待选」
       if (isReviewUnit(s.unit) && !draft.reviewManual) {
         const u0 = draftPointUnit(draft, s);
         if (u0) { draft.reviewUnits = [u0]; draft.reviewAuto = true; }
       }
       await render();
+    },
+    /* 一键确认：考点是系统配的，老师看一眼觉得没问题，点黄标就确认掉（不改考点） */
+    'draft:pointOk': async function (d) {
+      const draft = S.drafts[+d.i];
+      if (!draft) return;
+      if (!draft.point || draft.point === '未分类') { UI.toast('这题还没有考点，先点考点选一个'); return; }
+      draft.needsConfirm = false;
+      draft.pointUser = true;
+      await render();
+      UI.toast('已确认考点：' + draft.point, 1800);
     },
     /* ---- 多选考点弹层 ---- */
     'ppm:toggle': function (d) {
