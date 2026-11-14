@@ -564,6 +564,14 @@ body[data-tab="off"] .tabbar { display: none; }
   opacity: 0; pointer-events: none; transition: all .2s; z-index: 80;
 }
 .toast.show { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.toast.with-act {
+  pointer-events: auto; display: flex; align-items: center; gap: 12px;
+  text-align: left; max-width: 86vw;
+}
+.toast-act {
+  flex: none; background: #fff; color: #111827; border: 0;
+  border-radius: 8px; padding: 6px 11px; font-size: 13px; font-weight: 700;
+}
 
 .hidden-file { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
 

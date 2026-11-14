@@ -1735,9 +1735,17 @@
    * UI 基础组件：toast / sheet / 对话框
    * ======================================================= */
   const UI = {
-    toast(msg, ms) {
+    toast(msg, ms, opt) {
       const t = document.getElementById('toast');
-      t.textContent = msg;
+      if (opt && opt.label && opt.act) {
+        // 带操作按钮的提示（例如「已入库 · 撤销」）；按钮文字/动作走 data-act 代理
+        t.innerHTML = '<span>' + esc(msg) + '</span>' +
+          '<button class="toast-act" data-act="' + esc(opt.act) + '">' + esc(opt.label) + '</button>';
+        t.classList.add('with-act');
+      } else {
+        t.classList.remove('with-act');
+        t.textContent = msg;
+      }
       t.classList.add('show');
       clearTimeout(UI._tt);
       UI._tt = setTimeout(function () { t.classList.remove('show'); }, ms || 1800);
@@ -1821,6 +1829,7 @@
     }
     S.page = page;
     S.params = params || {};
+    S.inlineEdit = null;
     await render();
     window.scrollTo(0, 0);
   }
@@ -3628,7 +3637,13 @@
             '<span class="chip gray tap" data-act="draft:type" data-i="' + i + '" title="点击改题型">' + esc(d.type) + '</span>' +
             '<span class="chip gray tap" data-act="draft:diff" data-i="' + i + '" title="点击改难度">难度 ' + esc(d.difficulty) + '</span>' +
           '</div>' +
-          '<p class="qtext">' + esc(body) + '</p>' +
+          (S.inlineEdit === i
+            ? '<div class="inline-edit"><textarea class="textarea" id="ieText" style="min-height:120px">' + esc(body) + '</textarea>' +
+                '<div class="row mt8" style="gap:8px">' +
+                  '<button class="btn ghost grow" data-act="draft:inlineCancel">取消</button>' +
+                  '<button class="btn primary grow" data-act="draft:inlineSave" data-i="' + i + '">完成</button>' +
+                '</div></div>'
+            : '<p class="qtext tap" data-act="draft:inlineEdit" data-i="' + i + '" title="点一下直接改题干">' + esc(body) + '</p>') +
           '<div class="field mt8" style="margin-bottom:0"><label>答案（选填' + (d.answerFromRed ? ' · 红笔识别，请核对' : '') + '）</label>' +
             '<input class="input" data-draft-ans="' + i + '" value="' + esc(d.answer || '') + '" placeholder="可留空，入库后随时补"></div>' +
           (d.images && d.images.length
@@ -5197,12 +5212,28 @@
     await classifyDrafts();
   }
 
+  /** 在考点库里找同名考点：先全名精确 → 归一化同名 → 去掉「·第N单元」后唯一同名 */
+  function matchLibPoint(list, name) {
+    const raw = String(name || '').trim();
+    if (!raw) return null;
+    const exact = list.find(function (p) { return p.name === raw; });
+    if (exact) return exact;
+    const n = Normalize.norm(raw);
+    const same = list.find(function (p) { return p.norm === n; });
+    if (same) return same;
+    const baseOf = function (s) { return String(s || '').replace(/·第\d+单元$/, '').trim(); };
+    const b = Normalize.norm(baseOf(raw));
+    const cands = list.filter(function (p) { return Normalize.norm(baseOf(p.name)) === b; });
+    return cands.length === 1 ? cands[0] : null;
+  }
+
   async function classifyDrafts() {
     const pending = S.drafts.filter(d => d.aiPending);
     if (!pending.length) return;
     S.aiFallback = AI.enabled() ? '' : '未配置大模型';
     const s = S.session || S.defaults;
-    const known = (await Store.Points.listBy(s.subject, s.grade)).map(p => p.name);
+    const libPts = await Store.Points.listBy(s.subject, s.grade);
+    const known = libPts.map(p => p.name);
 
     // 逐批（每批 6 题）调用，避免超长上下文
     for (let i = 0; i < pending.length; i += 6) {
@@ -5214,6 +5245,16 @@
       batch.forEach(function (d, k) {
         const r = res[k] || {};
         d.point = r.point || '未分类';
+        // v1.23.3：系统识别的考点文字跟考点库里的一样 → 直接用库里的考点（带它的单元归属），仍标「待确认」
+        const hp = matchLibPoint(libPts, d.point);
+        if (hp && hp.name !== '未分类') {
+          d.point = hp.name;
+          d.pointId = hp.id;
+          const u0 = (hp.units && hp.units[0]) || unitSuffixToUnit(hp.name, s.subject, s.grade) || '';
+          d.pointUnit = u0;
+          d.points = [{ id: hp.id, name: hp.name, units: (hp.units || []).slice() }];
+          if (isReviewUnit(s.unit) && !d.reviewManual && u0) { d.reviewUnits = [u0]; d.reviewAuto = true; }
+        }
         d.solution = r.solution || d.solution;
         d.type = r.type || d.type;
         d.difficulty = r.difficulty || d.difficulty;
@@ -5310,7 +5351,7 @@
       if (i >= 0 && lessons[i] && arr.indexOf(lessons[i]) < 0) arr.unshift(lessons[i]);
       if (arr.length) finalByUnit[u] = arr;
     });
-    await Store.Questions.create({
+    const created = await Store.Questions.create({
       subject: s.subject,
       grade: s.grade,
       unit: primaryUnit,
@@ -5338,6 +5379,7 @@
       needsConfirm: !!d.needsConfirm,
       source: 'ocr'
     });
+    return created && created.id ? created.id : '';
   }
 
   async function saveDrafts() {
@@ -6282,6 +6324,40 @@
         text: draft.text
       });
     },
+    /* 点题面直接改字（不用滑到底找「编辑」按钮） */
+    'draft:inlineEdit': function (d) {
+      S.inlineEdit = +d.i;
+      render().then(function () {
+        const ta = document.getElementById('ieText');
+        if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+      });
+    },
+    'draft:inlineCancel': async function () {
+      S.inlineEdit = null;
+      await render();
+    },
+    'draft:inlineSave': async function (d) {
+      const i = +d.i;
+      const draft = S.drafts[i];
+      const ta = document.getElementById('ieText');
+      if (!draft || !ta) { S.inlineEdit = null; await render(); return; }
+      const txt = ta.value.trim();
+      if (!txt) { UI.toast('题干不能为空'); return; }
+      // 跟编辑弹窗同一套：识别到独立一行的 cf 先问要不要拆
+      const parts = Splitter.splitByMarker(txt);
+      if (parts.length >= 2) {
+        const ok = await UI.confirm('识别到独立一行的 cf。要根据它拆成 ' + parts.length + ' 题吗？\n（取消则把 cf 当普通文字保存）');
+        if (ok) { S.inlineEdit = null; splitDraftAt(i, parts); await render(); await classifyDrafts(); return; }
+      }
+      const el = document.querySelector('[data-act="draft:inlineSave"]');
+      if (el) { const card = el.closest('.qcard'); if (card) S._scrollAnchor = Math.max(0, card.getBoundingClientRect().top + window.scrollY); }
+      S.inlineEdit = null;
+      draft.text = txt;
+      draft.subs = []; draft.options = [];
+      // 不改 needsConfirm：黄标只跟考点是否已确认有关（v1.23.2 规则）
+      await render();
+      UI.toast('已保存题干', 1600);
+    },
     'draft:edit': function (d) {
       const i = +d.i;
       const draft = S.drafts[i];
@@ -6418,7 +6494,10 @@
       const im = s.images[draft.imgIndex];
       let assetId = '';
       if (im && im.blob) { try { assetId = await Store.Assets.save(im.blob); } catch (e) { /* 存图失败不挡入库 */ } }
-      await saveDraftOne(draft, s, assetId);
+      // 撤销用快照：入库前的这道题原样留一份（防误触「保存并入库」）
+      const snap = JSON.parse(JSON.stringify(draft));
+      const qid = await saveDraftOne(draft, s, assetId);
+      S.lastSave = qid ? { id: qid, draft: snap, index: S.drafts.indexOf(draft), session: s } : null;
       // 入库后这张卡会被移除：先记下它的位置，render 后下一题正好顶到原位，不跳
       const savedCardEl = document.querySelector('[data-act="draft:saveOne"][data-i="' + (+d.i) + '"]');
       if (savedCardEl) { const card = savedCardEl.closest('.qcard'); if (card) S._scrollAnchor = Math.max(0, card.getBoundingClientRect().top + window.scrollY); }
@@ -6430,13 +6509,29 @@
         clearSession();
         clearDraftStore();
         S.cache.homeDraft = null;
-        UI.toast('已入库，这批题全部完成');
+        UI.toast('已入库，这批题全部完成', 4200, { label: '↶ 撤销', act: 'undo:saveOne' });
         await navigate('bank');
         return;
       }
       storeDraft();
-      UI.toast('已入库 1 道，剩余 ' + S.drafts.length + ' 道继续编辑', 2600);
+      UI.toast('已入库 1 道，剩 ' + S.drafts.length + ' 道', 3600, { label: '↶ 撤销', act: 'undo:saveOne' });
       await render();
+    },
+    /* 撤销「保存并入库」：删掉刚入库的那道题，把草稿原样放回原位 */
+    'undo:saveOne': async function () {
+      const ls = S.lastSave;
+      if (!ls) { UI.toast('没有可撤销的入库'); return; }
+      S.lastSave = null;
+      try { await Store.Questions.remove(ls.id); } catch (e) { /* 已不存在也继续恢复草稿 */ }
+      if (!S.session) S.session = ls.session;
+      S.session.stage = 'confirm';
+      S.drafts = S.drafts || [];
+      const at = Math.max(0, Math.min(ls.index, S.drafts.length));
+      S.drafts.splice(at, 0, ls.draft);
+      storeDraft();
+      UI.toast('已撤销，题目回到草稿', 2000);
+      if (S.page === 'confirm') await render();
+      else await navigate('confirm', {}, true);
     },
 
     /* ---- 配图管理（确认页） ---- */
