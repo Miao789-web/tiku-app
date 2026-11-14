@@ -194,7 +194,7 @@ const DocParse = (function () {
       const buf = await file.arrayBuffer();
       // 默认图片处理器会把内嵌图片转成 <img src="data:image/...;base64,...">
       const res = await mammoth.convertToHtml({ arrayBuffer: buf });
-      const r = htmlToDoc(res && res.value ? res.value : '');
+      const r = await htmlToDoc(res && res.value ? res.value : '');
       // mammoth 读不出来的图（WMF/EMF 老格式、文本框/画布里）会静默丢掉 —— 收集提示告诉老师
       const msgs = (res && res.messages) || [];
       const bad = msgs.filter(function (m) { return /Unrecognized image type|image/i.test(String(m && m.message || '')); });
@@ -219,8 +219,9 @@ const DocParse = (function () {
     throw new Error('暂不支持 .' + (e || '?') + ' 文件，请用 PDF / Word(.docx) / TXT');
   }
 
-  /** 把 mammoth 输出的 HTML 还原为"一行文字/一图一行"的纯文本 + 图片列表 */
-  function htmlToDoc(html) {
+  /** 把 mammoth 输出的 HTML 还原为"一行文字/一图一行"的纯文本 + 图片列表
+   *  表格不再拆成文字行，而是整张渲染成图片（当作配图用，题干里只留【图N】） */
+  async function htmlToDoc(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const lines = [];
     const images = [];
@@ -242,6 +243,8 @@ const DocParse = (function () {
             images.push(src);
             lines.push('【图' + images.length + '】');
           }
+        } else if (tag === 'table') {
+          lines.push({ tbl: ch });          // 表格：稍后整张转图片
         } else if (tag === 'br') {
           lines.push('');
         } else if (tag === 'p' || tag === 'li' || tag === 'tr' || /^h[1-6]$/.test(tag)) {
@@ -254,9 +257,91 @@ const DocParse = (function () {
     }
 
     walk(doc.body);
-    const text = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+
+    const out = [];
+    for (const ln of lines) {
+      if (typeof ln === 'string') { out.push(ln); continue; }
+      if (!ln || !ln.tbl) continue;
+      const src = await tableToImage(ln.tbl);
+      if (src) {
+        images.push(src);
+        out.push('【图' + images.length + '】');
+        out.push('');
+      } else {
+        out.push(tableToText(ln.tbl));      // 转图失败才退回文字
+      }
+    }
+    const text = out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
     return { text: text, images: images };
   }
 
-  return { extract, extractDoc };
+  /** 表格转文字（仅在转图失败时兜底） */
+  function tableToText(tbl) {
+    const rows = [];
+    Array.from(tbl.querySelectorAll('tr')).forEach(function (tr) {
+      const cells = Array.from(tr.querySelectorAll('th,td')).map(function (c) {
+        return String(c.textContent || '').replace(/\s+/g, ' ').trim();
+      }).filter(Boolean);
+      if (cells.length) rows.push(cells.join(' | '));
+    });
+    return rows.join('\n');
+  }
+
+  /** 把表格元素渲染成 PNG（白底、带边框），返回 dataURI；失败返回 '' */
+  function tableToImage(tbl) {
+    try {
+      const clone = tbl.cloneNode(true);
+      Array.from(clone.querySelectorAll('td,th')).forEach(function (c) {
+        c.removeAttribute('style');
+        c.style.cssText = 'border:1px solid #444;padding:6px 9px;text-align:center;' +
+          'vertical-align:middle;font-size:14px;line-height:1.6;color:#111;background:#fff';
+      });
+      Array.from(clone.querySelectorAll('table')).forEach(function (t) {
+        t.style.cssText = 'border-collapse:collapse;background:#fff';
+      });
+      clone.style.cssText = 'border-collapse:collapse;background:#fff;border:1px solid #444';
+      const holder = document.createElement('div');
+      holder.style.cssText = 'position:fixed;left:-9999px;top:0;background:#fff';
+      holder.appendChild(clone);
+      document.body.appendChild(holder);
+      const tw = Math.ceil(clone.getBoundingClientRect().width) || 300;
+      const th = Math.ceil(clone.getBoundingClientRect().height) || 90;
+      const html = clone.outerHTML;
+      holder.remove();
+
+      const pad = 12;
+      const W = Math.max(120, tw + pad * 2);
+      const H = Math.max(60, th + pad * 2);
+      const font = 'font-family:-apple-system,BlinkMacSystemFont,\'PingFang SC\',\'Microsoft YaHei\',sans-serif;';
+      const inner = '<div xmlns="http://www.w3.org/1999/xhtml" style="width:' + W + 'px;height:' + H + 'px;' +
+        'box-sizing:border-box;padding:' + pad + 'px;background:#fff;' + font + 'font-size:14px;line-height:1.6;color:#111">' +
+        html + '</div>';
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">' +
+        '<foreignObject x="0" y="0" width="' + W + '" height="' + H + '">' + inner + '</foreignObject></svg>';
+
+      return new Promise(function (resolve) {
+        const img = new Image();
+        img.onload = function () {
+          try {
+            let scale = 2;
+            if (W * H * scale * scale > 6000000) scale = 1;
+            const cv = document.createElement('canvas');
+            cv.width = Math.round(W * scale);
+            cv.height = Math.round(H * scale);
+            const ctx = cv.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, cv.width, cv.height);
+            ctx.drawImage(img, 0, 0, cv.width, cv.height);
+            resolve(cv.toDataURL('image/png'));
+          } catch (e) { resolve(''); }
+        };
+        img.onerror = function () { resolve(''); };
+        img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+      });
+    } catch (e) {
+      return Promise.resolve('');
+    }
+  }
+
+  return { extract: extract, extractDoc: extractDoc, htmlToDoc: htmlToDoc, tableToImage: tableToImage };
 })();

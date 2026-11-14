@@ -24,6 +24,9 @@
     imgUrls: {},          // assetId -> objectURL
     open: {},             // questionId -> 思路/原图是否展开
     openImg: {},          // questionId -> 配图区是否展开（undefined 时有配图的题默认展开）
+    openSol: {},          // questionId -> 入库题的解题思路是否展开（默认折叠）
+    solEditQ: null,       // 题库卡片里正在原地编辑思路的题目 id
+    solEdit: null,        // 确认页正在原地编辑思路的题下标
     cache: { same: {} },  // same: questionId -> 同考点历史题缓存
     dcalc: { showAns: false, t0: null, acc: 0, tick: null, base: '00:00' },  // 每日计算 UI 状态
     dcalcPick: '',        // 每日计算设置里临时选的年级
@@ -1830,6 +1833,8 @@
     S.page = page;
     S.params = params || {};
     S.inlineEdit = null;
+    S.solEdit = null;
+    S.solEditQ = null;
     await render();
     window.scrollTo(0, 0);
   }
@@ -1898,6 +1903,89 @@
     return '<p class="qtext opt" style="padding-top:4px">' + q.options.map(esc).join('<br>') + '</p>';
   }
 
+  /** 点配图放大：黑底浮层显示大图，再点一下恢复原样 */
+  function openImgLight(src) {
+    let box = document.getElementById('imgLight');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'imgLight';
+      box.innerHTML = '<img alt="题目图形"><div class="il-hint">点一下图片就恢复</div>';
+      box.addEventListener('click', function () { box.classList.remove('show'); });
+      document.body.appendChild(box);
+    }
+    const im = box.querySelector('img');
+    im.src = src;
+    box.classList.add('show');
+  }
+
+  /** 入库题卡片里改思路（带撤销） */
+  async function saveQSolution(id, text) {
+    const q = await DB.get('questions', id);
+    if (!q) return;
+    if ((q.solution || '') === text) return;
+    const before = await Undo.begin([id]);
+    await Store.Questions.update(id, { solution: text });
+    await Undo.end('修改解题思路', before);
+  }
+
+
+  /** 配图缩略图区：1 张整宽；≥2 张自动分列（2 列起随张数上调，最多 3 排）
+   *  opts: { del:'删除动作', id, i, clean, tag } */
+  function imgGridHtml(imgs, opts) {
+    opts = opts || {};
+    const n = imgs.length;
+    const cols = n <= 1 ? 1 : Math.min(4, Math.max(2, Math.ceil(n / 3)));
+    const wrapCls = 'dimg-list ' + (cols > 1 ? 'grid' : 'single') + ' mt8';
+    const wrapStyle = cols > 1 ? ' style="grid-template-columns:repeat(' + cols + ',minmax(0,1fr))"' : '';
+    return '<div class="' + wrapCls + '"' + wrapStyle + '>' +
+      imgs.map(function (src, k) {
+        return '<div class="dimg-item"' + (opts.noZoom ? '' : ' data-act="img:zoom"') + '>' +
+          '<img src="' + src + '" alt="题目图形" loading="lazy">' +
+          (opts.del
+            ? '<button class="dimg-x" data-act="' + opts.del + '"' +
+                (opts.id ? ' data-id="' + opts.id + '"' : '') +
+                (opts.i !== undefined && opts.i !== null ? ' data-i="' + opts.i + '"' : '') +
+                ' data-k="' + k + '" aria-label="移除图形">✕</button>'
+            : '') +
+          '</div>';
+      }).join('') +
+      (cols > 1 ? '<div class="dimg-count" style="grid-column:1/-1">共 ' + n + ' 张配图 · 点任意一张放大</div>' : '') +
+      '</div>';
+  }
+
+  /** 入库题卡片上的解题思路：有思路 → 深蓝标签，点开才显示正文；没思路 → 「可添加」标签 */
+  function bankSolHtml(q) {
+    const openSol = S.openSol[q.id] === true;
+    if (!q.solution) {
+      return '<div class="sol-row">' +
+        '<button class="sol-chip add" data-act="q:solAdd" data-id="' + q.id + '">＋ 可添加解题思路</button>' +
+        (S.solEditQ === q.id ? solEditBox(q.id, 'qsSol', '', 'q:solClear', 'q:solSave', 'q:solCancel') : '') +
+        '</div>';
+    }
+    return '<div class="sol-row">' +
+      '<button class="sol-chip" data-act="q:solToggle" data-id="' + q.id + '">💡 解题思路' + (openSol ? ' ▾' : ' ▸') + '</button>' +
+      '</div>' +
+      (openSol
+        ? (S.solEditQ === q.id
+          ? solEditBox(q.id, 'qsSol', q.solution, 'q:solClear', 'q:solSave', 'q:solCancel')
+          : '<div class="solution-box tap" data-act="q:solEdit" data-id="' + q.id + '" title="点一下直接改思路">' + esc(q.solution) + '</div>')
+        : '');
+  }
+
+  /** 思路的原地编辑框（浅色卡片里，带清空/取消/完成）
+   *  extra：附加属性（如确认页的 data-i="0"），会加到三个按钮上 */
+  function solEditBox(id, taId, text, clearAct, saveAct, cancelAct, extra) {
+    extra = extra || '';
+    const own = (id ? ' data-id="' + id + '"' : '') + extra;
+    return '<div class="solution-box sol-edit">' +
+      '<textarea class="textarea" id="' + taId + '" style="min-height:84px">' + esc(text || '') + '</textarea>' +
+      '<div class="row mt8" style="gap:8px">' +
+        '<button class="btn ghost grow" data-act="' + clearAct + '"' + own + '>清空思路</button>' +
+        '<button class="btn ghost grow" data-act="' + cancelAct + '"' + extra + '>取消</button>' +
+        '<button class="btn primary grow" data-act="' + saveAct + '"' + own + '>完成</button>' +
+      '</div></div>';
+  }
+
   function questionCard(q, opts) {
     opts = opts || {};
     const open = !!S.open[q.id];
@@ -1932,33 +2020,29 @@
       '</div>') +
       '<p class="qtext" style="padding:0">' + esc(q.text) + '</p>' +
       optionsHtml(q) +
-      /* 配图区：有配图的题默认打开（可收起），不随思路展开状态；观课模式纯展示 */
+      /* 配图区：多张自动分列（最多三排），点图放大；有配图的题默认打开（可收起），观课模式纯展示 */
       (!(q.images && q.images.length)
         ? ''
         : (clean
-          ? '<div class="dimg-list mt8">' + q.images.map(function (src) {
-              return '<div class="dimg-item"><img src="' + src + '" alt="题目图形"></div>';
-            }).join('') + '</div>'
+          ? imgGridHtml(q.images, {})
           : (S.openImg[q.id] !== false
-            ? '<div class="dimg-list mt8">' + q.images.map(function (src, k) {
-                return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
-                  '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
-              }).join('') +
+            ? imgGridHtml(q.images, { del: 'q:imgDel', id: q.id, noZoom: batch }) +
               '<div class="row between" style="margin-top:4px"><p class="muted" style="font-size:12px">↑ 题目图形（点 ✕ 移除，点「配图」可增删）</p>' +
-              '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">收起配图</button></div></div>'
+              '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">收起配图</button></div>'
             : '<div class="row between mt8"><span class="chip gray">📐 ' + q.images.length + ' 张配图</span>' +
               '<button class="small muted" data-act="q:imgToggle" data-id="' + q.id + '">展开配图</button></div>'))) +
+      /* 解题思路：默认折叠，只露深蓝标签 */
+      bankSolHtml(q) +
       (open
-        ? '<div class="solution-box" style="margin:10px 0 0">' +
-            '<b>解题思路</b>' + esc(q.solution || '（暂无，可手动补充）') +
-            (q.answer ? '<div class="answer-line"><b>答案：</b>' + esc(q.answer) + '</div>' : '') +
-          '</div>' +
+        ? (q.answer
+            ? '<div class="solution-box" style="margin:10px 12px;background:var(--ok-soft);border-color:#c9efdb">' +
+                '<div class="answer-line" style="margin-top:0"><b>答案：</b>' + esc(q.answer) + '</div></div>'
+            : '') +
           (q.assetId
-            ? '<div class="mt8" style="border-radius:10px;overflow:hidden;border:1px solid var(--line)">' +
+            ? '<div class="mt8" style="margin:0 12px;border-radius:10px;overflow:hidden;border:1px solid var(--line)">' +
                 (url ? '<img src="' + url + '" style="width:100%;display:block">'
                      : '<div class="empty small" style="padding:18px">原图加载中…</div>') + '</div>'
-            : '<p class="muted mt8">（没有保存原图）</p>') +
-        '' +
+            : '<p class="muted mt8" style="margin:0 12px">（没有保存原图）</p>') +
         sameBox(q)
         : '') +
       (batch ? '' :
@@ -3647,15 +3731,14 @@
           '<div class="field mt8" style="margin-bottom:0"><label>答案（选填' + (d.answerFromRed ? ' · 红笔识别，请核对' : '') + '）</label>' +
             '<input class="input" data-draft-ans="' + i + '" value="' + esc(d.answer || '') + '" placeholder="可留空，入库后随时补"></div>' +
           (d.images && d.images.length
-            ? '<div class="dimg-list">' + d.images.map(function (src, k) {
-                return '<div class="dimg-item"><img src="' + src + '" alt="题目图形">' +
-                  '<button class="dimg-x" data-act="draft:rimg" data-i="' + i + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
-              }).join('') +
-              '<p class="muted" style="font-size:12px;margin-top:4px">↑ 题目图形（点 ✕ 移除，点「配图」可换图）</p></div>'
+            ? imgGridHtml(d.images, { del: 'draft:rimg', i: i }) +
+              '<p class="muted" style="font-size:12px;margin-top:4px">↑ 题目图形（点 ✕ 移除，点「配图」可换图）</p>'
             : '') +
-          (d.solution
-            ? '<div class="solution-box"><b>解题思路</b>' + esc(d.solution) + '</div>'
-            : '') +
+          (S.solEdit === i
+            ? solEditBox('', 'seSol', d.solution, 'draft:solClear', 'draft:solSave', 'draft:solCancel', ' data-i="' + i + '"')
+            : (d.solution
+              ? '<div class="solution-box tap" data-act="draft:solEdit" data-i="' + i + '" title="点一下直接改思路"><b>解题思路</b>' + esc(d.solution) + '</div>'
+              : '<div class="sol-row" style="margin-left:12px;margin-right:12px"><button class="sol-chip add" data-act="draft:solEdit" data-i="' + i + '">＋ 可添加解题思路</button></div>')) +
           '<div class="qops">' +
             '<button data-act="draft:saveOne" data-i="' + i + '">✓ 保存并入库</button>' +
             '<button data-act="draft:edit" data-i="' + i + '">编辑</button>' +
@@ -4904,22 +4987,119 @@
     navigate('capture');
   }
 
+  /* ---------------- 重复上传检测（同一份练习再传一次时提醒） ---------------- */
+  const IMPORTS_KEY = 'tiku.imports.v1';
+
+  function readImports() {
+    try { return JSON.parse(localStorage.getItem(IMPORTS_KEY) || '[]') || []; } catch (e) { return []; }
+  }
+  function saveImports(list) {
+    try { localStorage.setItem(IMPORTS_KEY, JSON.stringify(list.slice(-40))); } catch (e) {}
+  }
+  function hashStr(s) {
+    let h = 0x811c9dc5;
+    const str = String(s || '');
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return h.toString(36);
+  }
+  function hashBytes(u8) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < u8.length; i++) {
+      h ^= u8[i];
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return h.toString(36);
+  }
+  /** 文件指纹：内容哈希 + 大小（同一份练习不管改文件名都能认出来） */
+  async function fileFingerprint(file) {
+    try {
+      const buf = await file.arrayBuffer();
+      return 'f' + hashBytes(new Uint8Array(buf)) + '-' + buf.byteLength;
+    } catch (e) {
+      return 'n' + hashStr((file && file.name || '') + '|' + (file && file.size || 0));
+    }
+  }
+  async function blobFingerprint(blob) {
+    try {
+      const buf = await blob.arrayBuffer();
+      return 'f' + hashBytes(new Uint8Array(buf)) + '-' + buf.byteLength;
+    } catch (e) { return ''; }
+  }
+  /** 文字指纹：内容一样但格式不同（docx 另存成 pdf）也能认出来 */
+  function textFingerprint(text) {
+    const t = String(text || '').replace(/【图\d+】/g, '').replace(/\s+/g, '');
+    if (t.length < 20) return '';
+    return 't' + hashStr(t.slice(0, 4000) + '|' + t.length);
+  }
+  function findImport(fp) {
+    if (!fp) return null;
+    const list = readImports().filter(function (x) { return x && x.fp === fp; });
+    return list.length ? list[list.length - 1] : null;
+  }
+  function noteImport(fp, name, n) {
+    if (!fp) return;
+    const list = readImports();
+    list.push({ fp: fp, name: String(name || '').slice(0, 60), at: Date.now(), n: n || 0 });
+    saveImports(list);
+  }
+  function importWhen(ts) {
+    const d = new Date(ts || Date.now());
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' +
+      String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  }
+  /** 传入指纹列表，命中了就问一句；返回 true 表示继续导入 */
+  async function askReimport(fps, fallbackName) {
+    let hit = null;
+    for (const fp of fps) { hit = findImport(fp); if (hit) break; }
+    if (!hit) return true;
+    return await UI.confirm(
+      '这份练习你 ' + importWhen(hit.at) + ' 已经传过一份了' +
+      (hit.name ? '（' + hit.name + '）' : '') +
+      (hit.n ? '，当时切出 ' + hit.n + ' 道题' : '') + '。\n\n' +
+      '还要再导入一次吗？\n（点「取消」就不重复导入，避免题库里出现两份一样的题）'
+    );
+  }
+
   async function addFiles(files) {
     const s = ensureSession();
     UI.toast('正在压缩图片…');
+    const ready = [];
     for (const f of files) {
       if (!/^image\//.test(f.type)) continue;
       try {
         const r = await ImageTool.compress(f);
-        s.images.push({
-          id: Util.uid('im'), blob: r.blob, url: URL.createObjectURL(r.blob),
-          w: r.width, h: r.height, status: 'idle', text: '', pct: 0
-        });
+        ready.push({ blob: r.blob, w: r.width, h: r.height, fp: await blobFingerprint(r.blob) });
       } catch (e) {
         console.warn(e);
         UI.toast('有图片处理失败：' + e.message);
       }
     }
+    // 同一张图再传一次：问一句，取消就跳过这几张
+    const dup = {};
+    ready.forEach(function (x) { if (x.fp && findImport(x.fp)) dup[x.fp] = 1; });
+    let use = ready;
+    if (Object.keys(dup).length) {
+      const go = await askReimport(Object.keys(dup), '');
+      if (!go) {
+        use = ready.filter(function (x) { return !dup[x.fp]; });
+        if (!use.length) {
+          UI.toast('这些图之前都传过了，已跳过', 2600);
+          if (S.page === 'capture') await render(); else await navigate('capture', {}, true);
+          return;
+        }
+        UI.toast('已跳过 ' + (ready.length - use.length) + ' 张传过的图', 2400);
+      }
+    }
+    use.forEach(function (r) {
+      s.images.push({
+        id: Util.uid('im'), blob: r.blob, url: URL.createObjectURL(r.blob),
+        w: r.w, h: r.h, status: 'idle', text: '', pct: 0, fp: r.fp
+      });
+      noteImport(r.fp, '拍照/相册', 0);
+    });
     if (S.page === 'capture') await render();
     else await navigate('capture', {}, true);
   }
@@ -6357,6 +6537,39 @@
       // 不改 needsConfirm：黄标只跟考点是否已确认有关（v1.23.2 规则）
       await render();
       UI.toast('已保存题干', 1600);
+    },
+    /* 点解题思路文字直接改（确认页），可一键清空 */
+    'draft:solEdit': function (d) {
+      S.solEdit = +d.i;
+      render().then(function () {
+        const ta = document.getElementById('seSol');
+        if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+      });
+    },
+    'draft:solCancel': async function () {
+      S.solEdit = null;
+      await render();
+    },
+    'draft:solClear': async function (d) {
+      const i = +d.i;
+      const draft = S.drafts[i];
+      if (!draft) return;
+      draft.solution = '';
+      S.solEdit = null;
+      await render();
+      UI.toast('已清空这道题的思路', 1600);
+    },
+    'draft:solSave': async function (d) {
+      const i = +d.i;
+      const draft = S.drafts[i];
+      const ta = document.getElementById('seSol');
+      if (!draft || !ta) { S.solEdit = null; await render(); return; }
+      const el = document.querySelector('[data-act="draft:solSave"]');
+      if (el) { const card = el.closest('.qcard'); if (card) S._scrollAnchor = Math.max(0, card.getBoundingClientRect().top + window.scrollY); }
+      draft.solution = ta.value.trim();
+      S.solEdit = null;
+      await render();
+      UI.toast('已保存解题思路', 1600);
     },
     'draft:edit': function (d) {
       const i = +d.i;
@@ -8151,6 +8364,54 @@
       S.openImg[d.id] = S.openImg[d.id] === false ? true : false;
       render();
     },
+    /* 点配图放大 / 再点任意处恢复 */
+    'img:zoom': function (d, el) {
+      const img = el && el.querySelector ? el.querySelector('img') : null;
+      if (!img || !img.src) return;
+      openImgLight(img.src);
+    },
+    /* ---- 入库题的解题思路：默认折叠 ---- */
+    'q:solToggle': function (d) {
+      S.openSol[d.id] = !(S.openSol[d.id] === true);
+      if (!S.openSol[d.id]) S.solEditQ = null;
+      render();
+    },
+    'q:solAdd': function (d) {
+      S.openSol[d.id] = true;
+      S.solEditQ = d.id;
+      render().then(function () {
+        const ta = document.getElementById('qsSol');
+        if (ta) ta.focus();
+      });
+    },
+    'q:solEdit': function (d) {
+      S.openSol[d.id] = true;
+      S.solEditQ = d.id;
+      render().then(function () {
+        const ta = document.getElementById('qsSol');
+        if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+      });
+    },
+    'q:solCancel': function () {
+      S.solEditQ = null;
+      render();
+    },
+    'q:solClear': async function (d) {
+      await saveQSolution(d.id, '');
+      S.solEditQ = null;
+      S.openSol[d.id] = false;
+      UI.toast('已清空解题思路', 1600);
+      await render();
+    },
+    'q:solSave': async function (d) {
+      const ta = document.getElementById('qsSol');
+      if (!ta) return;
+      await saveQSolution(d.id, ta.value.trim());
+      S.solEditQ = null;
+      S.openSol[d.id] = false;   // 存完收起来，回到「只露标签」的状态
+      UI.toast('已保存解题思路', 1600);
+      await render();
+    },
     'q:imgAdd': function (d) {
       const input = document.createElement('input');
       input.type = 'file';
@@ -9067,6 +9328,12 @@
     e.target.value = '';
     if (!files.length) return;
     const file = files[0];
+    // 同一份练习再传一次：先问一句
+    const fp = await fileFingerprint(file);
+    if (findImport(fp)) {
+      const go = await askReimport([fp], file.name);
+      if (!go) { UI.toast('已取消，没有重复导入', 2400); return; }
+    }
     UI.toast('正在解析 ' + file.name + ' …', 4000);
     try {
       const res = DocParse.extractDoc
@@ -9075,6 +9342,12 @@
       const text = OCR.tidy ? OCR.tidy(res.text) : res.text;
       if (!text.trim()) {
         throw new Error('没有解析出文字。扫描版 PDF（图片型）无法提取文字，请回到首页用拍照录入');
+      }
+      // 内容指纹：同一份练习换了文件名/格式（docx→pdf）也能认出来
+      const tfp = textFingerprint(text);
+      if (tfp && findImport(tfp) && !findImport(fp)) {
+        const go2 = await askReimport([tfp], file.name);
+        if (!go2) { UI.toast('已取消，没有重复导入', 2400); return; }
       }
       const s = ensureSession();
       s.images.forEach(im => URL.revokeObjectURL(im.url));
@@ -9090,6 +9363,9 @@
       }
       if (!s.batchName) s.batchName = file.name.replace(/\.[a-z0-9]+$/i, '');
       buildDrafts();
+      // 记下来，下次传同一份练习会提醒
+      noteImport(fp, file.name, S.drafts.length);
+      if (tfp) noteImport(tfp, file.name, S.drafts.length);
       const imgN = (res.images || []).length;
       const draftImgN = S.drafts.reduce(function (n, d) { return n + (d.images || []).length; }, 0);
       if (res.warn) UI.toast(res.warn, 6000);
@@ -9173,7 +9449,10 @@
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
     practiceTypeOf: practiceTypeOf, pageNoOf: pageNoOf, matchFilter: matchFilter,
     filterQuestions: filterQuestions, hasFilter: hasFilter, bankFilterSheet: bankFilterSheet,
-    qImgsSheet: qImgsSheet };
+    qImgsSheet: qImgsSheet,
+    imgGridHtml: imgGridHtml, openImgLight: openImgLight,
+    fileFingerprint: fileFingerprint, textFingerprint: textFingerprint,
+    findImport: findImport, noteImport: noteImport, saveQSolution: saveQSolution };
 
   /* =========================================================
    * 启动

@@ -380,6 +380,38 @@ body[data-tab="off"] .view { padding-bottom: calc(92px + var(--safe-b)); }
 }
 .dimg-item .dimg-x:active { background: var(--danger); }
 
+/* 多张配图：自动分列横向缩略图（最多三排），点图放大 */
+.dimg-list.grid { display: grid; gap: 6px; align-items: start; }
+.dimg-list.grid .dimg-item { margin-top: 0; border-radius: 9px; cursor: zoom-in; }
+.dimg-list.grid .dimg-item img { width: 100%; height: 92px; object-fit: contain; background: #fff; }
+.dimg-list.grid .dimg-x { width: 22px; height: 22px; font-size: 12px; right: 4px; top: 4px; }
+.dimg-list.single .dimg-item { cursor: zoom-in; }
+.dimg-count { font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+
+/* 图片放大层 */
+#imgLight {
+  position: fixed; inset: 0; z-index: 900;
+  background: rgba(8, 12, 20, .93);
+  display: none; align-items: center; justify-content: center; padding: 10px;
+}
+#imgLight.show { display: flex; }
+#imgLight img { max-width: 100%; max-height: 88vh; object-fit: contain; border-radius: 8px; background: #fff; }
+#imgLight .il-hint {
+  position: absolute; left: 0; right: 0; bottom: 16px; text-align: center;
+  color: rgba(255, 255, 255, .72); font-size: 12.5px;
+}
+
+/* 解题思路：深蓝色标签（默认折叠） */
+.sol-row { margin: 8px 12px 0; }
+.sol-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  height: 28px; padding: 0 11px; border-radius: 999px;
+  border: 1px solid #d3ddf8; background: #f2f6ff;
+  color: #1d3f9e; font-size: 12.5px; font-weight: 600;
+}
+.sol-chip.add { border-style: dashed; font-weight: 500; color: #3355b8; }
+.sol-chip:active { background: #e6eeff; }
+
 .pool-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .pool-tile {
   position: relative;
