@@ -6311,6 +6311,7 @@
       const i = +d.i;
       const draft = S.drafts[i];
       if (!draft) return;
+      const bodyBefore = [draft.text].concat(draft.subs || [], draft.options || []).join('\n');
       const txt = ((document.getElementById('deText') || {}).value || '').trim();
       if (!txt) { UI.toast('题干不能为空'); return; }
       // 编辑里识别到独立一行的 cf → 先问要不要按它拆分；选「取消」就当普通文字保存
@@ -6335,8 +6336,12 @@
       const df = Number((document.getElementById('deDiff') || {}).value);
       if (df) draft.difficulty = df;
       draft.solution = ((document.getElementById('deSol') || {}).value || '').trim();
-      draft.needsConfirm = true;
+      // 只有题干真的改了才重新标记待确认（考点按原题干归的类）；只改答案/题型/难度/思路不动它
+      if (txt !== bodyBefore) draft.needsConfirm = true;
       UI.close();
+      // 记下这张卡的位置，render 后原地恢复，不再跳卡
+      const editCardEl = document.querySelector('[data-act="draft:edit"][data-i="' + i + '"]');
+      if (editCardEl) { const card = editCardEl.closest('.qcard'); if (card) S._scrollAnchor = Math.max(0, card.getBoundingClientRect().top + window.scrollY); }
       render();
       UI.toast('已保存：' + draft.type + ' · 难度 ' + draft.difficulty);
     },
@@ -6408,6 +6413,9 @@
       let assetId = '';
       if (im && im.blob) { try { assetId = await Store.Assets.save(im.blob); } catch (e) { /* 存图失败不挡入库 */ } }
       await saveDraftOne(draft, s, assetId);
+      // 入库后这张卡会被移除：先记下它的位置，render 后下一题正好顶到原位，不跳
+      const savedCardEl = document.querySelector('[data-act="draft:saveOne"][data-i="' + (+d.i) + '"]');
+      if (savedCardEl) { const card = savedCardEl.closest('.qcard'); if (card) S._scrollAnchor = Math.max(0, card.getBoundingClientRect().top + window.scrollY); }
       const idx = S.drafts.indexOf(draft);
       if (idx >= 0) S.drafts.splice(idx, 1);
       await Store.Points.recount();
