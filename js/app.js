@@ -1503,10 +1503,14 @@
         if (t && out.indexOf(t) < 0) out.push(t);
       });
       try { localStorage.setItem(PTYPE_KEY, JSON.stringify(out)); } catch (e) {}
+      try { Catalog.bumpStamp('ptypes'); } catch (e) {}
+      try { if (typeof scheduleSyncPush === 'function') scheduleSyncPush(); } catch (e) {}
       return out;
     }
     function reset() {
       try { localStorage.removeItem(PTYPE_KEY); } catch (e) {}
+      try { Catalog.bumpStamp('ptypes'); } catch (e) {}
+      try { if (typeof scheduleSyncPush === 'function') scheduleSyncPush(); } catch (e) {}
       return CONFIG.practiceTypes.slice();
     }
     return { list: list, save: save, reset: reset };
@@ -1918,6 +1922,38 @@
     box.classList.add('show');
   }
 
+  /** 改课时弹层「放大看题」：白卡片浮层展示题目全文（点遮罩或按钮关闭，原弹层不动） */
+  function openQTextLight(q) {
+    if (!q) return;
+    let box = document.getElementById('qTextLight');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'qTextLight';
+      box.innerHTML = '<div class="qtl-card"><div class="qtl-head"><b class="qtl-title"></b>' +
+        '<button class="btn ghost sm" data-qtl-close>关闭</button></div>' +
+        '<div class="qtl-body"></div>' +
+        '<div class="il-hint">点空白处也能关闭</div></div>';
+      box.addEventListener('click', function (e) {
+        if (e.target === box || e.target.closest('[data-qtl-close]')) box.classList.remove('show');
+      });
+      document.body.appendChild(box);
+    }
+    box.querySelector('.qtl-title').textContent = '题目全文';
+    const parts = [];
+    parts.push('<p class="qtext" style="padding:0">' + esc(String(q.text || '')) + '</p>');
+    if (q.options && q.options.length) parts.push(optionsHtml(q));
+    if (q.images && q.images.length) {
+      parts.push('<div class="dimg-list mt8">' + q.images.map(function (im) {
+        return '<div class="dimg-item" data-act="img:zoom" data-src="' + esc(im.src || im) + '">' +
+          '<img src="' + esc(im.src || im) + '" alt="配图" style="cursor:zoom-in"></div>';
+      }).join('') + '</div>');
+    }
+    if (q.answer) parts.push('<div class="answer-line" style="margin-top:8px"><b>答案：</b>' + esc(q.answer) + '</div>');
+    if (q.solution) parts.push('<div class="muted" style="font-size:13px;margin-top:6px;line-height:1.6"><b>思路：</b>' + esc(q.solution) + '</div>');
+    box.querySelector('.qtl-body').innerHTML = parts.join('');
+    box.classList.add('show');
+  }
+
   /** 入库题卡片里改思路（带撤销） */
   async function saveQSolution(id, text) {
     const q = await DB.get('questions', id);
@@ -2092,8 +2128,11 @@
           '<span class="bcheck' + (sel[q.id] ? ' on' : '') + '"></span>' +
           '<div class="lass-main">' +
             '<div class="lass-text">' + esc(text.slice(0, 90)) + (text.length > 90 ? '…' : '') + '</div>' +
-            '<div class="lass-meta">' + esc(qPointsOf(q).map(function (p) { return p.name; }).join('、') || '未分类') +
-              ' · ' + (cur ? '课时 ' + esc(cur) : '<span style="color:var(--warn)">未分课时</span>') + '</div>' +
+            '<div class="lass-foot">' +
+              '<div class="lass-meta">' + esc(qPointsOf(q).map(function (p) { return p.name; }).join('、') || '未分类') +
+                ' · ' + (cur ? '课时 ' + esc(cur) : '<span style="color:var(--warn)">未分课时</span>') + '</div>' +
+              '<button class="lass-zoom" data-act="bank:lassZoom" data-id="' + q.id + '">🔍 放大看题</button>' +
+            '</div>' +
           '</div></div>';
       }).join('');
       const lessonBtns = lessons.map(function (L) {
@@ -3037,7 +3076,19 @@
       delete c.assetId;
       return c;
     });
-    return { questions: qs, points: data.points, papers: data.papers, deleted: Store.deletions(), savedAt: Date.now() };
+    const stamps = Catalog.stamps();
+    return { questions: qs, points: data.points, papers: data.papers, deleted: Store.deletions(), savedAt: Date.now(),
+      /* v1.25.0：教材目录 / 每单元课时 / 练习类型 也进云端（原来只存本机，换设备就丢） */
+      settings: {
+        catalog: Catalog.customMap(),
+        lessons: Catalog.lessonsMap(),
+        ptypes: PracticeTypes.list(),
+        stamps: {
+          catalog: stamps.catalog || 0,
+          lessons: stamps.lessons || 0,
+          ptypes: stamps.ptypes || 0
+        }
+      } };
   }
 
   let syncPushTimer = null, syncRetry = 0, syncPushing = false, syncPulling = false, syncFailTold = false;
@@ -3138,6 +3189,25 @@
       await DB.del('questions', id);
       n++;
     }
+
+    // 4) 设置（教材目录 / 每单元课时 / 练习类型）：分项比时间戳，谁的改动晚就听谁的
+    const st = payload.settings;
+    if (st && st.stamps) {
+      const loc = Catalog.stamps();
+      const rs = st.stamps;
+      if ((rs.catalog || 0) > (loc.catalog || 0) && st.catalog && typeof st.catalog === 'object') {
+        Catalog.setCustomMap(st.catalog, rs.catalog); n++;
+      }
+      if ((rs.lessons || 0) > (loc.lessons || 0) && st.lessons && typeof st.lessons === 'object') {
+        Catalog.setLessonsMap(st.lessons, rs.lessons); n++;
+      }
+      if ((rs.ptypes || 0) > (loc.ptypes || 0) && Array.isArray(st.ptypes) && st.ptypes.length) {
+        PracticeTypes.save(st.ptypes);           // save 会把本机时间戳顶到 now
+        Catalog.bumpStamp('ptypes', rs.ptypes);  // 再拨回远端时间戳，保持口径一致
+        n++;
+      }
+    }
+
     await Store.Points.recount();
     return n;
   }
@@ -7667,6 +7737,11 @@
 
     /* 改课时弹层：切模式 / 勾题 / 全选 / 对所选题目改课时 */
     'bank:lassMode': function (d) { S._lassMode = d.v; sheetRedraw(function () { lessonAssignSheet(d.unit); }); },
+    /** 放大看题：在改课时弹层里看某道题的完整题面（不关原弹层） */
+    'bank:lassZoom': function (d) {
+      const q = (S.cache.bankQ || []).find(function (x) { return x.id === d.id; });
+      if (q) openQTextLight(q);
+    },
     'bank:lassSel': function (d) {
       S._lassSel = S._lassSel || {};
       if (S._lassSel[d.id]) delete S._lassSel[d.id]; else S._lassSel[d.id] = 1;
@@ -9444,6 +9519,7 @@
     isReviewUnit: isReviewUnit, draftReviewUnits: draftReviewUnits, reviewPickSheet: reviewPickSheet, applyReviewUnits: applyReviewUnits, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,
     PracticeTypes: PracticeTypes,
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
+    buildSyncPayload: buildSyncPayload, applySyncDoc: applySyncDoc, openQTextLight: openQTextLight,
     usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,
     lessonChipsHtml: lessonChipsHtml, sweepLostImages: sweepLostImages,
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
@@ -9481,6 +9557,7 @@
 
     // 任何写库动作（入库/编辑/删除/导入）都在 2.5 秒后自动上传文字快照
     try { Store.onChange(function () { scheduleSyncPush(); }); } catch (e) {}
+    try { Catalog.onChange(function () { scheduleSyncPush(); }); } catch (e) {}
     // 云端文字同步：打开时先拉再推一次（老数据、离线时录的题也能补传上去），之后每 60 秒 / 切回页面各看一次
     if (syncReady()) {
       setTimeout(async function () {

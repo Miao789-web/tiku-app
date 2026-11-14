@@ -51,12 +51,32 @@ const Catalog = (function () {
 
   const LS_KEY = 'tiku.catalog.custom';
 
+  /* ---------- 设置改动时间戳（云同步用：哪台设备改得晚就听谁的，分项比较） ---------- */
+  const LS_STAMPS = 'tiku.settings.stamps';
+  function bumpStamp(key, at) {
+    try {
+      const s = JSON.parse(localStorage.getItem(LS_STAMPS) || '{}');
+      s[key] = at || Date.now();
+      localStorage.setItem(LS_STAMPS, JSON.stringify(s));
+    } catch (e) {}
+  }
+  function stamps() {
+    try { return JSON.parse(localStorage.getItem(LS_STAMPS) || '{}'); } catch (e) { return {}; }
+  }
+
+  /* ---------- 云同步回调：目录/课时一有改动就通知 app.js 触发上传 ---------- */
+  let _onChangeCb = null;
+  function onChange(cb) { _onChangeCb = cb || null; }
+  function _notify() { try { if (_onChangeCb) _onChangeCb(); } catch (e) {} }
+
   function loadCustom() {
     try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}'); } catch (e) { return {}; }
   }
 
   function saveCustom(map) {
     localStorage.setItem(LS_KEY, JSON.stringify(map || {}));
+    bumpStamp('catalog');
+    _notify();
   }
 
   /** 自定义目录的键：学科|年级|学期|版本 */
@@ -135,6 +155,19 @@ const Catalog = (function () {
   }
   function saveLessons(map) {
     localStorage.setItem(LS_LESSONS, JSON.stringify(map || {}));
+    bumpStamp('lessons');
+    _notify();
+  }
+  /* ---- 云同步：整包读写（app.js 打包/合并快照时用） ---- */
+  function customMap() { return loadCustom(); }
+  function setCustomMap(map, at) {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(map || {})); } catch (e) {}
+    bumpStamp('catalog', at || Date.now());
+  }
+  function lessonsMap() { return loadLessons(); }
+  function setLessonsMap(map, at) {
+    try { localStorage.setItem(LS_LESSONS, JSON.stringify(map || {})); } catch (e) {}
+    bumpStamp('lessons', at || Date.now());
   }
   /** 某单元的课时列表（未设置返回 []） */
   function lessonsOf(subject, grade, term, version, unit) {
@@ -156,5 +189,6 @@ const Catalog = (function () {
   }
 
   return { get, setCustom, hasCustom, addUnit, removeUnit, versions: VERSIONS, toText, fromText, DATA: RJ,
-    lessonsOf, setLessons };
+    lessonsOf, setLessons,
+    customMap, setCustomMap, lessonsMap, setLessonsMap, bumpStamp, stamps, onChange };
 })();
