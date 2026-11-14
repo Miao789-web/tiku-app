@@ -1233,6 +1233,70 @@
     return us.length === 1 ? us[0] : (us[0] + ' 等 ' + us.length + ' 个单元');
   }
 
+  /** 这道题的考点落在哪个单元（v1.23.0）：考点自带 units[0] → 考点名「·第N单元」后缀 */
+  function draftPointUnit(d, s) {
+    if (!d) return '';
+    const ss = s || S.session || S.defaults || {};
+    const pts = (d.points && d.points.length)
+      ? d.points
+      : (d.point ? [{ name: d.point, units: d.pointUnit ? [d.pointUnit] : [] }] : []);
+    for (let i = 0; i < pts.length; i++) {
+      const u = (pts[i].units && pts[i].units[0]) || unitSuffixToUnit(pts[i].name, ss.subject, ss.grade);
+      if (u && !isReviewUnit(u)) return u;
+    }
+    return '';
+  }
+
+  /**
+   * 复习章节自动填「复习单元」（v1.23.0）：考点已经落在第 N 单元，就不该再让人看到「复习单元待选」。
+   * 只填还没选、且没被手动改过的题（d.reviewManual = 老师自己点过）。
+   */
+  function autoFillReviewUnits(drafts, s) {
+    const ss = s || S.session;
+    if (!ss || !isReviewUnit(ss.unit)) return 0;
+    let n = 0;
+    (drafts || []).forEach(function (d) {
+      if (!d || d.reviewManual) return;
+      if (draftReviewUnits(d).length) return;
+      const u = draftPointUnit(d, ss);
+      if (!u) return;
+      d.reviewUnits = [u];
+      d.reviewAuto = true;
+      n++;
+    });
+    return n;
+  }
+
+  /** 这道题在某个单元下勾的课时（v1.23.0 可多个，老草稿兼容单值 d.lesson） */
+  function draftLessonsOf(d, unit) {
+    if (!d) return [];
+    const map = (d.lessonsByUnit && typeof d.lessonsByUnit === 'object') ? d.lessonsByUnit : {};
+    const out = [];
+    (Array.isArray(map[unit]) ? map[unit] : []).forEach(function (L) {
+      const v = String(L || '').trim();
+      if (v && out.indexOf(v) < 0) out.push(v);
+    });
+    if (!out.length && d.lesson) {
+      const own = unit ? (draftReviewUnits(d).indexOf(unit) >= 0 || unit === draftPointUnit(d, S.session)) : true;
+      if (own) out.push(String(d.lesson).trim());
+    }
+    return out;
+  }
+
+  /** 题库里的题：某单元下挂的全部课时（v1.23.0 起支持一题多课时） */
+  function qLessonListOf(q, unit) {
+    if (!q) return [];
+    const out = [];
+    const one = qLessonOf(q, unit);
+    if (one) out.push(one);
+    const extra = (q.lessonsByUnit && q.lessonsByUnit[unit]) || [];
+    (Array.isArray(extra) ? extra : []).forEach(function (L) {
+      const v = String(L || '').trim();
+      if (v && out.indexOf(v) < 0) out.push(v);
+    });
+    return out;
+  }
+
   async function resolveUnitPoint(rawName, unit, subject, grade) {
     const base = Normalize.pretty(rawName || '') || '未分类';
     const suf = unitSuffixOf(unit, subject, grade);
@@ -1555,7 +1619,7 @@
     if (f.unit && qUnitsOf(q).indexOf(f.unit) < 0) return false;
     if (f.lesson) {
       const hit = qUnitsOf(q).some(function (u) {
-        return (!f.unit || u === f.unit) && qLessonOf(q, u) === f.lesson;
+        return (!f.unit || u === f.unit) && qLessonListOf(q, u).indexOf(f.lesson) >= 0;
       });
       if (!hit) return false;
     }
@@ -1651,9 +1715,8 @@
   /** 某单元下「还没有课时」的题（显式『无』也算已分配） */
   function unassignedOf(q, unit) {
     const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
-    const i = us.indexOf(unit);
-    if (i < 0) return false;
-    return !((q.lessons && q.lessons[i]) || (i === 0 && q.lesson) || '');
+    if (us.indexOf(unit) < 0) return false;
+    return !qLessonListOf(q, unit).length;
   }
   /** 写库时同步主字段（pointId/pointName/unit 取第一个），保证老逻辑不受影响 */
   function syncPrimaryRef(q) {
@@ -2109,6 +2172,16 @@
     (drafts || []).forEach(function (d) {
       if (!d) return;
       d.reviewUnits = ordered.slice();
+      d.reviewManual = true;
+      d.reviewAuto = false;
+      // 课时也跟着单元走：被去掉的单元不再留课时
+      if (d.lessonsByUnit) {
+        const keep = {};
+        Object.keys(d.lessonsByUnit).forEach(function (u) {
+          if (ordered.indexOf(u) >= 0) keep[u] = d.lessonsByUnit[u];
+        });
+        d.lessonsByUnit = keep;
+      }
       // 原来选的课时若不在新单元的课时表里，清掉，免得归到错课时上
       const first = ordered[0] || '';
       if (d.lesson && first) {
@@ -2162,6 +2235,106 @@
       });
     }
     S._rv.draw = draw;
+    draw();
+  }
+
+  /* ---- 复习课时（v1.23.0）：一题可以同时进多个课时的题库 ---- */
+  /** 这道题有没有设过课时 */
+  function draftHasLesson(d) {
+    if (!d) return false;
+    const map = d.lessonsByUnit || {};
+    for (const k in map) if (Array.isArray(map[k]) && map[k].length) return true;
+    return !!d.lesson;
+  }
+  /** 这道题该按哪些单元设课时：复习单元优先，没选就按考点推 */
+  function draftLessonUnits(d, s) {
+    let us = draftReviewUnits(d);
+    if (!us.length) { const u0 = draftPointUnit(d, s); if (u0) us = [u0]; }
+    return us;
+  }
+  /** 把选中的课时写到草稿：sel = { 单元: { 课时: 1 } } */
+  function applyReviewLessons(drafts, sel) {
+    let n = 0;
+    (drafts || []).forEach(function (d) {
+      if (!d) return;
+      const us = draftLessonUnits(d, S.session);
+      const map = Object.assign({}, d.lessonsByUnit || {});
+      let touched = false;
+      us.forEach(function (u) {
+        if (!sel[u]) return;
+        const arr = Object.keys(sel[u] || {}).filter(function (L) { return sel[u][L]; });
+        if (arr.length) { map[u] = arr; touched = true; }
+        else if (map[u]) { delete map[u]; touched = true; }
+      });
+      if (!touched) return;
+      d.lessonsByUnit = map;
+      const keys = Object.keys(map).filter(function (k) { return map[k] && map[k].length; });
+      d.lesson = keys.length ? map[keys[0]][0] : '';
+      n++;
+    });
+    return n;
+  }
+
+  /** 复习课时弹层：每道题（或整批）按它自己的复习单元列出课时，可多选 */
+  function reviewLessonSheet(i) {
+    const s = S.session;
+    if (!s) return;
+    const batch = i < 0 || !S.drafts[i];
+    const src = batch ? S.drafts.slice() : [S.drafts[i]];
+    const units = [];
+    src.forEach(function (d) {
+      draftLessonUnits(d, s).forEach(function (u) { if (u && units.indexOf(u) < 0) units.push(u); });
+    });
+    if (!units.length) { UI.toast('这些题还没归单元——先点 🔁 选复习单元（或先把考点选到单元上）'); return; }
+    const cat = Catalog.get(s.subject, s.grade, S.defaults.term, S.defaults.version);
+    units.sort(function (a, b) { return cat.indexOf(a) - cat.indexOf(b); });
+    const sel = {};
+    units.forEach(function (u) { sel[u] = {}; });
+    src.forEach(function (d) {
+      draftLessonUnits(d, s).forEach(function (u) {
+        if (!sel[u]) return;
+        draftLessonsOf(d, u).forEach(function (L) { sel[u][L] = (sel[u][L] || 0) + 1; });
+      });
+    });
+    S._rl = { i: i, batch: batch, units: units, sel: sel };
+
+    function bodyHtml() {
+      const st = S._rl;
+      let html = '<p class="muted" style="margin-bottom:8px">' +
+        (st.batch
+          ? '勾选课时（<b>可多选</b>）：勾了几个，题就同时进这几个课时的题库。'
+          : '这道题要在哪些课时下出现？<b>可多选</b>，勾几个就进几个课时的题库。') + '</p>';
+      st.units.forEach(function (u) {
+        const ls = lessonChoices(u, s.subject, s.grade);
+        html += '<div class="field" style="margin-bottom:10px"><label>' + esc(unitLabelOf(u, s.subject, s.grade)) + '</label>' +
+          (ls.length
+            ? '<div class="chips wrapv">' + ls.map(function (L) {
+                const on = !!(st.sel[u] && st.sel[u][L]);
+                return '<button class="tag' + (on ? ' active' : '') + '" data-act="rl:toggle" data-u="' + esc(u) + '" data-v="' + esc(L) + '">' +
+                  (on ? '✓ ' : '') + esc(L) + '</button>';
+              }).join('') + '</div>'
+            : '<p class="muted" style="font-size:12px;margin:0">这个单元还没配课时，去「我的 → 设置 → 每单元的课时」配好再来。</p>') +
+          '</div>';
+      });
+      const pickedN = st.units.reduce(function (n, u) { return n + Object.keys(st.sel[u] || {}).length; }, 0);
+      const todo = S.drafts.filter(function (d) { return !draftHasLesson(d); }).length;
+      html += '<p class="muted mt8" style="font-size:12.5px">已勾 ' + pickedN + ' 个课时' +
+        (pickedN ? '：' + esc(st.units.map(function (u) { return Object.keys(st.sel[u] || {}).join('、'); }).filter(Boolean).join('、')) : '') + '</p>' +
+        '<div class="row mt12" style="gap:8px">' +
+          '<button class="btn ghost grow" data-act="rl:clear">清空</button>' +
+          '<button class="btn primary grow" data-act="rl:ok"' + (pickedN ? '' : ' disabled') + '>' +
+            (st.batch ? '应用到全部（' + S.drafts.length + ' 题）' : '确定') + '</button></div>' +
+        (st.batch ? '<button class="btn ghost block mt8" data-act="rl:okTodo"' + (pickedN ? '' : ' disabled') + '>只补还没设课时的（' + todo + ' 题）</button>' : '');
+      return html;
+    }
+    function draw() {
+      const d = S.drafts[i] || {};
+      UI.sheet({
+        title: batch ? '批量设课时（可多选）' : ('第 ' + (d.no || (i + 1)) + ' 题 · 课时'),
+        body: bodyHtml()
+      });
+    }
+    S._rl.draw = draw;
     draw();
   }
 
@@ -3319,6 +3492,8 @@
     html() {
       const s = S.session;
       if (!s) return '<div class="empty">没有待确认的内容</div>';
+      // v1.23.0：考点已经在某个单元上（如「复式统计图表·第2单元」）→ 复习单元直接填好，不再「待选」
+      if (isReviewUnit(s.unit)) autoFillReviewUnits(S.drafts, s);
 
       const scan = '<div class="scan-list" id="scanList">' +
         s.images.map(scanItemHtml).join('') + '</div>';
@@ -3379,11 +3554,14 @@
       let reviewHtml = '';
       if (isReviewUnit(s.unit)) {
         const noPick = S.drafts.filter(function (d) { return !draftReviewUnits(d).length; }).length;
+        const noLesson = S.drafts.filter(function (d) { return !draftHasLesson(d); }).length;
         reviewHtml = '<div class="field mt8" style="margin-bottom:0"><label>复习题归到哪个单元？</label>' +
-          '<p class="muted" style="font-size:12.5px;margin-bottom:6px">每道题在自己的卡片上单独选（<b>可多选</b>），不同题可以归不同单元；不选也行——考点带「·第N单元」后缀的会自动归过去。' +
+          '<p class="muted" style="font-size:12.5px;margin-bottom:6px">题库里的考点带了「·第N单元」就自动填好（如「复式统计图表·第2单元」→ 第2单元），不用再点；要改就在题卡上点 🔁。' +
             (noPick ? '还有 <b>' + noPick + '</b> 道没选。' : (S.drafts.length ? '全部题都选好了。' : '')) + '</p>' +
           '<button class="btn ghost block" data-act="confirm:reviewAll">批量指定复习单元' +
-            (noPick ? '（' + noPick + ' 题未选）' : '') + '</button></div>';
+            (noPick ? '（' + noPick + ' 题未选）' : '') + '</button>' +
+          '<button class="btn ghost block mt8" data-act="confirm:lessonAll">批量设课时（可多选）' +
+            (noLesson ? '（' + noLesson + ' 题未设）' : '') + '</button></div>';
       }
       if (!guessUnit) {
         lessonChips = '<p class="muted" style="font-size:12px;margin-top:6px">还没选章节，也没有考点带单元：课时可以先在上面框里直接写（如「第2课时」）；题卡的考点选好单元后，这里会自动列出该单元的课时。</p>';
@@ -3425,12 +3603,20 @@
         const rvUs = draftReviewUnits(d);
         const chipReview = isReviewUnit(s.unit)
           ? '<span class="chip ' + (rvUs.length ? 'brand' : 'warn') + ' tap" data-act="draft:review" data-i="' + i + '" title="点击选这道题是哪些单元的复习（可多选）">🔁 ' +
-            (rvUs.length ? esc(draftReviewLabel(d)) : '复习单元待选') + '</span>'
+            (rvUs.length ? esc(draftReviewLabel(d)) + (d.reviewAuto ? '（按考点）' : '') : '复习单元待选') + '</span>'
           : '';
         // 课时（v1.18.0）：点一下就按这道题（或整批）的单元列课时，没单元就按关键字新建
-        const dLesson = d.lesson || s.lesson || '';
+        // v1.23.0：复习章节里一张题可以同时挂多个课时
+        let lessonText = '';
+        if (isReviewUnit(s.unit)) {
+          const ls = [];
+          draftLessonUnits(d, s).forEach(function (u) {
+            draftLessonsOf(d, u).forEach(function (L) { if (ls.indexOf(L) < 0) ls.push(L); });
+          });
+          lessonText = ls.length ? (ls.length === 1 ? ls[0] : ls[0] + ' 等 ' + ls.length + ' 个课时') : '';
+        } else lessonText = d.lesson || s.lesson || '';
         const chipLesson = '<span class="chip gray tap" data-act="draft:lesson" data-i="' + i + '" title="点击选课时">⏱ ' +
-          (dLesson ? esc(dLesson) : '<span style="color:var(--warn)">课时待确认</span>') + '</span>';
+          (lessonText ? esc(lessonText) : '<span style="color:var(--warn)">课时待确认</span>') + '</span>';
         const body = [d.text].concat(d.subs || [], d.options || []).join('\n');
         return '<article class="qcard' + (d.needsConfirm && !d.aiPending ? ' needs' : '') + '">' +
           '<div class="qcard-h">' +
@@ -3786,15 +3972,13 @@
       S.bank.lessonSel = S.bank.lessonSel || {};
       const lessonSel = S.bank.lessonSel[u] || '';
       const lessonOf = function (q) {
-        const us = (q.units && q.units.length) ? q.units : (q.unit ? [q.unit] : []);
-        const idx = us.indexOf(u);
-        if (idx < 0) return '';
-        return (q.lessons && q.lessons[idx]) || (idx === 0 && q.lesson) || '';
+        return qUnitsOf(q).indexOf(u) >= 0 ? qLessonListOf(q, u) : [];
       };
       const lessonSet = [];
       list.forEach(function (q) {
-        const L = lessonOf(q);
-        if (L && lessonSet.indexOf(L) < 0) lessonSet.push(L);
+        lessonOf(q).forEach(function (L) {
+          if (L && lessonSet.indexOf(L) < 0) lessonSet.push(L);
+        });
       });
       // 目录里给这个单元配好的课时也列出来（还没题的课时点进去是空的，方便对照教学进度）
       Catalog.lessonsOf(S.bank.subject !== '全部' ? S.bank.subject : S.defaults.subject,
@@ -3811,7 +3995,7 @@
         return a.localeCompare(b, 'zh');
       });
       const unassigned = list.filter(function (q) { return unassignedOf(q, u); }).length;
-      const effList = lessonSel ? list.filter(function (q) { return lessonOf(q) === lessonSel; }) : list;
+      const effList = lessonSel ? list.filter(function (q) { return lessonOf(q).indexOf(lessonSel) >= 0; }) : list;
       const byPoint = {};
       effList.forEach(function (q) {
         // 一题挂多个考点：在每个考点行下都出现
@@ -3881,8 +4065,11 @@
   }
 
   function practiceLessonsOf(q, unit) {
-    if (!unit) return qLessonsOf(q);
-    return [qLessonOf(q, unit)].filter(Boolean);
+    if (!unit) return qUnitsOf(q).reduce(function (out, u) {
+      qLessonListOf(q, u).forEach(function (L) { if (out.indexOf(L) < 0) out.push(L); });
+      return out;
+    }, []);
+    return qLessonListOf(q, unit);
   }
 
   function sortByCatalog(list) {
@@ -4502,6 +4689,7 @@
           '<div class="card-h"><h3>自动同步（只同步文字，不同步配图）</h3></div>' +
           syncStatusHtml() +
           '<button class="btn ghost block" data-act="sync:now">立即同步一次</button>' +
+          '<button class="btn ghost block mt8" data-act="sync:diag">🩺 同步自检（卡在哪一步）</button>' +
           '<button class="btn ghost block mt8" data-act="sync:devices">查看云端各设备 / 题数</button>' +
           '<div class="row mt8" style="gap:8px;align-items:center">' +
             '<input class="input" id="syncDevName" value="' + esc((window.CloudSync && window.CloudSync.deviceName()) || '') + '" style="flex:1" placeholder="这台设备叫什么（如 手机 / 办公室电脑）">' +
@@ -5080,7 +5268,16 @@
     reviewUs.forEach(addUnit);
     // 课时：确认页填的课时作用于整批练习的主单元（复习章节则同时作用到所选单元）；新建考点时选的课时写到对应单元位置
     const batchLesson = (s.lesson || '').trim();
+    // v1.23.0：一题多课时 —— d.lessonsByUnit = { 单元: [课时…] }，这些单元也要进 unitSet
+    const lessonsByUnit = {};
+    if (isReviewUnit(primaryUnit) || reviewUs.length) {
+      Object.keys(d.lessonsByUnit || {}).forEach(function (u) {
+        const arr = (d.lessonsByUnit[u] || []).filter(Boolean);
+        if (arr.length) { lessonsByUnit[u] = arr.slice(); addUnit(u); }
+      });
+    }
     const lessons = unitSet.map(function (u) {
+      if (lessonsByUnit[u] && lessonsByUnit[u].length) return lessonsByUnit[u][0];
       return (u === primaryUnit || reviewUs.indexOf(u) >= 0) ? batchLesson : '';
     });
     entries.forEach(function (e) {
@@ -5099,6 +5296,14 @@
         if (ir >= 0) lessons[ir] = d.lesson;
       });
     }
+    // 每个单元上的多课时名单（第一个同时写进 lessons[]，老逻辑照旧能读）
+    const finalByUnit = {};
+    Object.keys(lessonsByUnit).forEach(function (u) {
+      const arr = lessonsByUnit[u].slice();
+      const i = unitSet.indexOf(u);
+      if (i >= 0 && lessons[i] && arr.indexOf(lessons[i]) < 0) arr.unshift(lessons[i]);
+      if (arr.length) finalByUnit[u] = arr;
+    });
     await Store.Questions.create({
       subject: s.subject,
       grade: s.grade,
@@ -5106,6 +5311,7 @@
       units: unitSet,
       lesson: lessons.filter(Boolean)[0] || '',
       lessons: lessons,
+      lessonsByUnit: finalByUnit,
       batchName: s.batchName || '',
       batchDate: s.batchDate || todayStr(),
       practiceType: s.practiceType || '',
@@ -6059,6 +6265,8 @@
       const draft = S.drafts[i];
       const s = S.session;
       if (!draft || !s) return;
+      // 复习章节（v1.23.0）：按复习单元多选课时，一题可进多个课时题库
+      if (isReviewUnit(s.unit) || draftReviewUnits(draft).length) { reviewLessonSheet(i); return; }
       const unit = lessonUnitOfDraft(draft, s);
       lessonPickSheet({
         mode: 'draft', i: i, unit: unit,
@@ -6721,6 +6929,11 @@
       draft.pointId = picked[0].id || '';
       draft.pointUnit = (picked[0].units && picked[0].units[0]) || '';
       draft.needsConfirm = false;
+      // v1.23.0：考点落在第 N 单元 → 复习单元直接填成那个单元，不再让老师看到「复习单元待选」
+      if (isReviewUnit(s.unit) && !draft.reviewManual) {
+        const u0 = draftPointUnit(draft, s);
+        if (u0) { draft.reviewUnits = [u0]; draft.reviewAuto = true; }
+      }
       await render();
     },
     /* ---- 多选考点弹层 ---- */
@@ -6935,6 +7148,49 @@
       S._rv = null;
       UI.close();
       UI.toast('已把 ' + S.drafts.length + ' 道题都归到：' + units.join('、'), 3000);
+      render();
+    },
+
+    /* 复习课时（v1.23.0）：勾多个课时，题同时进这几个课时的题库 */
+    'confirm:lessonAll': function () { reviewLessonSheet(-1); },
+    'rl:toggle': function (d) {
+      const st = S._rl;
+      if (!st) return;
+      const u = String(d.u || '').trim(), v = String(d.v || '').trim();
+      if (!u || !v || !st.sel[u]) return;
+      if (st.sel[u][v]) delete st.sel[u][v]; else st.sel[u][v] = 1;
+      if (st.draw) st.draw();
+    },
+    'rl:clear': function () {
+      const st = S._rl;
+      if (!st) return;
+      st.units.forEach(function (u) { st.sel[u] = {}; });
+      if (st.draw) st.draw();
+    },
+    'rl:ok': function () {
+      const st = S._rl;
+      if (!st) return;
+      if (st.batch) {
+        const n = applyReviewLessons(S.drafts.slice(), st.sel);
+        S._rl = null; UI.close();
+        UI.toast('已给 ' + n + ' 道题设好课时', 2600);
+        render();
+        return;
+      }
+      const i = st.i;
+      const n = applyReviewLessons([S.drafts[i]], st.sel);
+      S._rl = null; UI.close();
+      UI.toast(n ? '第 ' + ((S.drafts[i] && S.drafts[i].no) || (i + 1)) + ' 题课时已更新' : '没有变化');
+      render();
+    },
+    'rl:okTodo': function () {
+      const st = S._rl;
+      if (!st) return;
+      const todo = S.drafts.filter(function (d) { return !draftHasLesson(d); });
+      if (!todo.length) { UI.toast('本批每道题都已经设过课时了'); return; }
+      const n = applyReviewLessons(todo, st.sel);
+      S._rl = null; UI.close();
+      UI.toast('已补 ' + n + ' 道题的课时', 2600);
       render();
     },
 
@@ -8466,6 +8722,31 @@
       if (!pushed) UI.toast('上传没成功：' + (S.syncMsg || S.syncErr || '未知原因') + '（到「我的」看通道/上次上传）', 5000);
       else UI.toast(n ? '已上传，并从云端合并 ' + n + ' 处改动' : '已上传，云端没有别的设备的新改动', 3000);
     },
+    /* 同步自检：把「卡在哪一步」直接摊开给老师看（手机上传不上去时用） */
+    'sync:diag': async function () {
+      if (!window.CloudSync || !window.CloudSync.diag) { UI.toast('同步组件没加载'); return; }
+      UI.toast('自检中…');
+      const r = await window.CloudSync.diag();
+      const icon = function (ok) { return ok ? '✓' : '✗'; };
+      const text = '【题点题库 · 同步自检】\n' + r.steps.map(function (s) {
+        return icon(s.ok) + ' ' + s.name + '：' + s.detail;
+      }).join('\n') +
+        '\n设备：' + (window.CloudSync.deviceName() || '') + '（' + window.CloudSync.deviceId() + '）' +
+        '\n上次上传：' + ((window.CloudSync.status && window.CloudSync.status.lastPush)
+          ? new Date(window.CloudSync.status.lastPush).toLocaleString('zh-CN') : '从没成功过') +
+        '\nUA：' + r.ua;
+      UI.sheet({
+        title: r.ok ? '同步自检：通路正常' : '同步自检：卡住了',
+        body: '<pre class="small" style="white-space:pre-wrap;word-break:break-all;line-height:1.85;margin:0 0 10px">' + esc(text) + '</pre>' +
+          (r.ok ? '' : '<p class="muted small" style="margin-bottom:10px">把上面这段「复制」发给老师/技术，就能定位是哪一步被拦。</p>') +
+          '<button class="btn ghost block" data-act="sync:diagCopy">复制这段自检结果</button>'
+      });
+      S._diagText = text;
+    },
+    'sync:diagCopy': async function () {
+      const ok = await copyText(S._diagText || '');
+      UI.toast(ok ? '已复制，可以直接粘贴发送' : '复制失败，请长按选中上面的文字复制');
+    },
     /* 云端各设备：一眼看出「手机到底传上来没有」 */
     'sync:devices': async function () {
       if (!syncReady()) { UI.toast('要从线上链接打开才能读云端（见上方说明）', 3600); return; }
@@ -8759,6 +9040,9 @@
     dcOpenDays: dcOpenDays, migrateQuestionTypes: migrateQuestionTypes,
     assignRedAnswers: assignRedAnswers, normCmpText: normCmpText, ppmApplyOrder: ppmApplyOrder,
     qUnitsOf: qUnitsOf, qPointsOf: qPointsOf, qLessonOf: qLessonOf, qLessonsOf: qLessonsOf,
+    qLessonListOf: qLessonListOf, draftPointUnit: draftPointUnit, autoFillReviewUnits: autoFillReviewUnits,
+    draftLessonsOf: draftLessonsOf, draftHasLesson: draftHasLesson, draftLessonUnits: draftLessonUnits,
+    applyReviewLessons: applyReviewLessons, reviewLessonSheet: reviewLessonSheet,
     knownLessonsOf: knownLessonsOf, pickPoints: pickPoints,
     lessonUnitOf: lessonUnitOf, lessonUnitOfDraft: lessonUnitOfDraft, lessonChoices: lessonChoices,
     isReviewUnit: isReviewUnit, draftReviewUnits: draftReviewUnits, reviewPickSheet: reviewPickSheet, applyReviewUnits: applyReviewUnits, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,

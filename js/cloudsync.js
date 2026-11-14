@@ -221,6 +221,51 @@
     });
   }
 
+  /**
+   * 同步自检：一步步记下环境 → 云桥/直连 → 读云端，出问题能看出卡在哪。
+   * 手机上「一直未同步」时最有用（以前只有一句模糊的失败提示）。
+   */
+  function diag() {
+    var steps = [], t0 = Date.now();
+    function add(name, ok, detail) {
+      steps.push({ name: name, ok: !!ok, detail: String(detail == null ? '' : detail) });
+    }
+    add('打开方式', originOk(), location.protocol + '//' + (location.host || '(本地文件)') +
+      (originOk() ? '，可以用自动同步' : '，自动同步不会跑（要 https 线上链接，且没带 ?nosync=1）'));
+    add('同步通道', true, sameOrigin() ? '同域直连云端（最稳）' : '隐藏 iframe 经云桥中转（跨域）');
+
+    var job;
+    if (!originOk()) job = Promise.resolve();
+    else if (sameOrigin()) {
+      job = getClient().then(function (c) {
+        add('云端组件', true, 'SDK 已加载');
+        return c.database.from(CFG.table).select('device');
+      }).then(function (r) {
+        if (r && r.error) throw new Error(r.error.message || '读取失败');
+        add('读云端', true, '读到 ' + (((r && r.data) || []).length) + ' 行');
+      });
+    } else {
+      job = ensureBridge().then(function () {
+        add('云桥页面', true, 'iframe 已加载（' + (Date.now() - t0) + 'ms）');
+        var t1 = Date.now();
+        return callBridge('select', null).then(function (rows) {
+          add('云桥读云端', true, '云桥回话 ' + (Date.now() - t1) + 'ms，读到 ' + ((rows || []).length) + ' 行');
+        });
+      });
+    }
+    return job.then(function () {
+      var bad = steps.filter(function (s) { return !s.ok; });
+      return { ok: !bad.length, steps: steps, ua: navigator.userAgent };
+    }, function (e) {
+      var msg = String((e && e.message) || e);
+      var why = /createWorkBuddyCloud|undefined|初始化/.test(msg)
+        ? '（云桥页里的 wbcloud.js 没加载成功：浏览器把第三方 Cookie/脚本拦了，iPhone 的 Safari、微信内置浏览器最常见）'
+        : (/超时/.test(msg) ? '（云桥没回话：多半也是被拦了，或网络到不了云端域名）' : '');
+      add('云桥读云端', false, msg + why);
+      return { ok: false, steps: steps, ua: navigator.userAgent };
+    });
+  }
+
   window.CloudSync = {
     cfg: CFG,
     originOk: originOk,
@@ -232,6 +277,7 @@
     hashOf: hashOf,
     push: push,
     pull: pull,
+    diag: diag,
     status: status
   };
 })();
