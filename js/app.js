@@ -1075,7 +1075,7 @@
     const planStart = new Date(cfg.planStart + 'T00:00:00');
     const planEnd = new Date(planStart);
     planEnd.setDate(planEnd.getDate() + 4);
-    if (today < planStart) return { state: 'pending', grade: cfg.grade, planStart: cfg.planStart, perDay: cfg.perDay || 5, kindsN: (cfg.kinds || []).length, diffL: dcDiffLabel(cfg.diff), trapN: dcTrapCount(cfg.diff, cfg.perDay) };
+    if (today < planStart) return { state: 'pending', grade: cfg.grade, planStart: cfg.planStart, perDay: cfg.perDay || 5, kindsN: (cfg.kinds || []).length, kindsText: dcKindsSummary(cfg.kinds), weekNo: dcWeekNoOf(cfg.startDate), weekSaved: cfg.weekKey === dcWeekKeyOf(cfg.startDate), diffL: dcDiffLabel(cfg.diff), trapN: dcTrapCount(cfg.diff, cfg.perDay) };
     if (today > planEnd) return { state: 'weekDone', grade: cfg.grade };
     const idx = dcWorkdayIndex(planStart, today);
     const set = dcDaySet(cfg, idx, today);
@@ -1086,33 +1086,124 @@
     };
   }
 
-  /* 计算题型分组：设置页按类上下滑动多选（v1.26.0，不再把 19 个标签全部铺开） */
+  /* 计算题型分组（点选里的分类名，不随年级变） */
   const DCALC_GROUP = [
     { t: '整数加减乘除', ks: ['addSub20', 'addSub100', 'addSub3', 'tableMul', 'tableDiv', 'mul1', 'div1', 'mul2', 'div2'] },
     { t: '小数', ks: ['decAddSub', 'decMulInt', 'decMulDec', 'decDivInt'] },
     { t: '分数', ks: ['fracAddSub', 'fracMul', 'fracDiv'] },
     { t: '其他', ks: ['equation', 'jianBian', 'areaCalc'] }
   ];
+
+  /* 各年级「本学期重点 / 已学过」的计算题型（按苏教版进度，分上册、下册）
+     v1.27.0：题型列表按这个表 + 教材目录自动生成，没学过的类别不出现 */
+  const DCALC_SCOPE = {
+    '一年级': { '上册': { focus: ['addSub20'], learned: [] },
+               '下册': { focus: ['addSub20', 'addSub100'], learned: [] } },
+    '二年级': { '上册': { focus: ['addSub100', 'tableMul'], learned: ['addSub20'] },
+               '下册': { focus: ['tableDiv', 'div1', 'addSub100'], learned: ['tableMul', 'addSub20'] } },
+    '三年级': { '上册': { focus: ['addSub3', 'mul1', 'div1'], learned: ['tableMul', 'tableDiv'] },
+               '下册': { focus: ['mul2', 'div2', 'fracAddSub'], learned: ['addSub3', 'mul1'] } },
+    '四年级': { '上册': { focus: ['mul2', 'div2', 'addSub3'], learned: ['mul1', 'div1'] },
+               '下册': { focus: ['decAddSub', 'jianBian'], learned: ['mul2', 'div2'] } },
+    '五年级': { '上册': { focus: ['decMulInt', 'decDivInt', 'areaCalc'], learned: ['decAddSub', 'addSub3', 'mul2', 'div2'] },
+               '下册': { focus: ['fracAddSub', 'equation', 'decMulDec', 'decDivInt'], learned: ['decAddSub', 'decMulInt'] } },
+    '六年级': { '上册': { focus: ['fracMul', 'fracDiv', 'fracAddSub', 'jianBian'], learned: ['decMulDec', 'decDivInt'] },
+               '下册': { focus: ['areaCalc', 'jianBian', 'fracMul'], learned: ['fracAddSub', 'fracDiv'] } }
+  };
+
+  function dcTermNow() {
+    const cfg = readDcalcCfg() || {};
+    return S.dcalcTerm || cfg.term || (S.defaults && S.defaults.term) || '上册';
+  }
+  /** 当前教材目录文本；通用兜底目录（不是具体册次）返回空，表示不按目录过滤 */
+  function dcCatalogText(grade, term) {
+    let list = [];
+    try { list = Catalog.get('数学', grade, term, (S.defaults && S.defaults.version) || '人教版') || []; } catch (e) { list = []; }
+    if (!list.length || list[0] === '数与代数') return '';
+    return list.join(' ');
+  }
+  function dcGroupOfKind(k) {
+    const g = DCALC_GROUP.find(function (x) { return x.ks.indexOf(k) >= 0; });
+    return g ? g.t : '其他';
+  }
+  /** 这个年级本学期能选的计算题型（focus 重点 / learned 已学过）+ 分类分组 */
+  function dcScopeOf(grade, term) {
+    const g = grade || (S.defaults && S.defaults.grade) || '五年级';
+    const t = term || dcTermNow();
+    const sc = (DCALC_SCOPE[g] || {})[t] || { focus: dcDefaultKinds(g), learned: [] };
+    const text = dcCatalogText(g, t);
+    const keep = function (k) {
+      if (!text) return true;
+      if (dcGroupOfKind(k) === '分数' && text.indexOf('分数') < 0) return false;   // 本学期教材没有分数
+      if (k === 'equation' && text.indexOf('方程') < 0) return false;              // 教材没有方程
+      return true;
+    };
+    const focus = (sc.focus || []).filter(function (k) { return !!dcKindLabelOf(k) && keep(k); });
+    const learned = (sc.learned || []).filter(function (k) {
+      return !!dcKindLabelOf(k) && keep(k) && focus.indexOf(k) < 0;
+    });
+    const groups = [];
+    DCALC_GROUP.forEach(function (grp) {
+      const ks = grp.ks.filter(function (k) { return focus.indexOf(k) >= 0; });
+      if (ks.length) groups.push({ t: grp.t, ks: ks, folded: false });
+    });
+    if (learned.length) groups.push({ t: '已学过 · 非本学期重点', ks: learned, folded: true });
+    return { grade: g, term: t, focus: focus, learned: learned, groups: groups,
+      all: focus.concat(learned) };
+  }
+  /** 本学期默认勾选：重点题型（没有就退回各年级默认） */
+  function dcScopeDefaultKinds(grade, term) {
+    const sc = dcScopeOf(grade, term);
+    const def = dcDefaultKinds(grade).filter(function (k) { return sc.focus.indexOf(k) >= 0; });
+    return def.length ? def : sc.focus.slice();
+  }
   function dcKindLabelOf(k) {
     const d = DCALC_KINDS.find(function (x) { return x.k === k; });
     return d ? d.l : '';
   }
+  /** 题型名摘要：最多 4 个，后面用「等 N 种」 */
+  function dcKindsSummary(kinds) {
+    const ls = (kinds || []).map(dcKindLabelOf).filter(Boolean);
+    if (!ls.length) return '还没选题型';
+    return ls.slice(0, 4).join('、') + (ls.length > 4 ? ' 等 ' + ls.length + ' 种' : '');
+  }
+  /** 本周是第几周（按学期开始日期算） */
+  function dcWeekNoOf(startDate) {
+    const st = String(startDate || defaultStartOf(semKeyOf(new Date())) || '');
+    if (!st) return 1;
+    const d0 = new Date(st + 'T00:00:00');
+    if (isNaN(d0.getTime())) return 1;
+    const days = Math.floor((Date.now() - d0.getTime()) / 86400000);
+    return Math.max(1, Math.floor(days / 7) + 1);
+  }
+  function dcWeekKeyOf(startDate) {
+    return semKeyOf(new Date()) + '-W' + dcWeekNoOf(startDate);
+  }
+  /** 题型列表：按本学期范围分组；「已学过」默认折叠，点组名才展开 */
   function dcKindListHtml() {
-    return DCALC_GROUP.map(function (grp) {
-      const ks = grp.ks.filter(function (k) { return !!dcKindLabelOf(k); });
-      const on = ks.filter(function (k) { return S.dcalcKinds.indexOf(k) >= 0; }).length;
-      return '<div class="dc-kg">' +
-        '<div class="dc-kg-h"><span>' + esc(grp.t) + '</span>' +
+    const sc = dcScopeOf(S.dcalcPick || S.defaults.grade, dcTermNow());
+    S.dcGrpOpen = S.dcGrpOpen || {};
+    const html = sc.groups.map(function (grp) {
+      const on = grp.ks.filter(function (k) { return S.dcalcKinds.indexOf(k) >= 0; }).length;
+      const open = grp.folded ? !!S.dcGrpOpen[grp.t] : true;
+      const allOn = on === grp.ks.length && grp.ks.length;
+      return '<div class="dc-kg' + (open ? '' : ' fold') + '">' +
+        '<div class="dc-kg-h">' +
+          '<button class="dc-kg-t" data-act="dcalc:grp" data-g="' + esc(grp.t) + '">' +
+            '<span class="arw">' + (open ? '▾' : '▸') + '</span>' + esc(grp.t) +
+            '<em>' + on + '/' + grp.ks.length + '</em></button>' +
           '<button class="small" data-act="dcalc:kGroup" data-g="' + esc(grp.t) + '" style="color:var(--brand);font-weight:600">' +
-            (on === ks.length && ks.length ? '取消本类' : '整类选中') + '</button></div>' +
-        ks.map(function (k) {
+            (allOn ? '取消本类' : '整类选中') + '</button>' +
+        '</div>' +
+        '<div class="dc-kg-b">' + grp.ks.map(function (k) {
           const active = S.dcalcKinds.indexOf(k) >= 0;
           return '<button class="dc-kr' + (active ? ' active' : '') + '" data-act="dcalc:k" data-k="' + k + '">' +
             '<span class="tick">' + (active ? '✓' : '') + '</span>' +
             '<span class="l">' + esc(dcKindLabelOf(k)) + '</span>' +
             (DCALC_TRAPS[k] ? '<span class="tr">易错</span>' : '') + '</button>';
-        }).join('') + '</div>';
+        }).join('') + '</div></div>';
     }).join('');
+    return html || '<div class="empty small" style="padding:12px">这个年级还没有可选的题型</div>';
   }
 
   /** 每日计算设置表单（首页设置卡与弹层共用）
@@ -1120,7 +1211,12 @@
   function dcalcSetupBody() {
     const cfg = readDcalcCfg() || {};
     const pick = S.dcalcPick || cfg.grade || S.defaults.grade || '五年级';
-    if (!S.dcalcKinds) S.dcalcKinds = (cfg.kinds && cfg.kinds.length ? cfg.kinds.slice() : dcDefaultKinds(pick));
+    if (!S.dcalcTerm) S.dcalcTerm = dcTermNow();
+    const scNow = dcScopeOf(pick, S.dcalcTerm);
+    if (!S.dcalcKinds) {
+      const saved = (cfg.kinds || []).filter(function (k) { return scNow.all.indexOf(k) >= 0; });
+      S.dcalcKinds = saved.length ? saved : dcScopeDefaultKinds(pick, S.dcalcTerm);
+    }
     if (S.dcalcDiff === undefined || S.dcalcDiff === null) S.dcalcDiff = cfg.diff || 2;
     if (S.dcalcUseBank !== true && S.dcalcUseBank !== false) S.dcalcUseBank = cfg.useBank !== false;
     if (!S.dcalcNotes) S.dcalcNotes = (cfg.notes || []).slice();
@@ -1128,6 +1224,9 @@
     const expanded = !hasCfg || !!S.dcExpand;
     const gradeChips = CONFIG.grades.map(function (g) {
       return '<button class="tag' + (g === pick ? ' active' : '') + '" data-act="dcalc:g" data-v="' + esc(g) + '">' + esc(g) + '</button>';
+    }).join('');
+    const termChips = ['上册', '下册'].map(function (t) {
+      return '<button class="tag' + (t === S.dcalcTerm ? ' active' : '') + '" data-act="dcalc:term" data-v="' + t + '">' + t + '</button>';
     }).join('');
     const kindChips = '';
     const diffChips = DCALC_DIFFS.map(function (x) {
@@ -1157,6 +1256,7 @@
         '<div class="chips" style="flex-wrap:wrap;overflow:visible">' + gradeChips + '</div>' +
         '<div class="dc-sum mt8">' +
           '<div><span class="k">每天</span><b>' + perNow + '</b> 题　<span class="k">题型</span><b>' + S.dcalcKinds.length + '</b> 种　<span class="k">倒计时</span><b>' + (cfg.timerMin || 5) + '</b> 分钟</div>' +
+          '<div><span class="k">本周题型（第 ' + dcWeekNoOf(start) + ' 周）</span>' + esc(dcKindsSummary(S.dcalcKinds)) + '</div>' +
           '<div><span class="k">难度</span>' + esc(dcDiffDesc(S.dcalcDiff, perNow)) + '</div>' +
           '<div><span class="k">学期开始</span>' + esc(start) + (S.dcalcNotes.length ? '　<span class="k">备注</span>' + S.dcalcNotes.length + ' 条' : '') + '</div>' +
         '</div>' +
@@ -1168,6 +1268,11 @@
 
     return '<p class="muted" style="margin-bottom:8px">选好题型、难度、题数并预览一周，确认后<b>下周一</b>开始按顺序每天发布一组。出题只出<b>所选题型</b>。</p>' +
       '<div class="chips" style="flex-wrap:wrap;overflow:visible">' + gradeChips + '</div>' +
+      '<div class="row between mt8" style="align-items:center;margin-bottom:4px">' +
+        '<label style="font-weight:600;font-size:13px">本学期</label>' +
+        '<div class="chips" style="overflow:visible">' + termChips + '</div>' +
+      '</div>' +
+      '<p class="muted" style="font-size:12px;margin:0 0 2px">题型按「' + esc(pick + S.dcalcTerm) + '」教材自动列出，没学过的类别不显示。</p>' +
       '<div class="field mt8"><label>学期开始日期（用来算教学周）</label>' +
         '<input class="input" type="date" id="dcStart" value="' + start + '"></div>' +
       '<div class="row mt8" style="gap:8px">' +
@@ -1182,12 +1287,24 @@
       '</div>' +
       '<p class="dc-diffhint" id="dcDiffHint">' + esc(dcDiffDesc(S.dcalcDiff, perNow)) + '，题目数字和平时一样大。</p>' +
       '<div class="row between mt8" style="align-items:center;margin-bottom:6px">' +
-        '<label style="font-weight:600;font-size:13px">计算题型（上下滑动点选，可多选）</label>' +
-        '<span><button class="small" data-act="dcalc:allK" style="color:var(--brand);font-weight:600">全选</button>　' +
-        '<button class="small" data-act="dcalc:noneK" style="color:var(--ink-3)">清空</button></span>' +
+        '<label style="font-weight:600;font-size:13px">计算题型（本学期重点）</label>' +
+        '<button class="small" data-act="dcalc:kindOpen" style="color:var(--brand);font-weight:600">' + (S.dcKindOpen ? '收起 ▴' : '展开选择 ▾') + '</button>' +
       '</div>' +
-      '<p class="muted" style="font-size:12px;margin:0 0 4px">已选 <b id="dcKindCount">' + S.dcalcKinds.length + '</b> / ' + DCALC_KINDS.length + ' 种（带「易错」的题型会出易错样式）</p>' +
-      '<div class="dc-kindscroll">' + dcKindListHtml() + '</div>' +
+      '<div class="dc-kindsum">' +
+        '<div class="row between" style="align-items:center"><span>本周（第 <b>' + dcWeekNoOf(start) + '</b> 周）题型</span>' +
+          '<span class="small" style="color:' + (cfg.weekKey === dcWeekKeyOf(start) ? 'var(--ok)' : 'var(--danger)') + ';font-weight:600">' +
+            (cfg.weekKey === dcWeekKeyOf(start) ? '✓ 已保存' : '本周还没保存') + '</span></div>' +
+        '<div style="margin-top:2px;color:var(--ink-2)">' + esc(dcKindsSummary(S.dcalcKinds)) + '</div>' +
+      '</div>' +
+      (S.dcKindOpen
+        ? '<div class="row between" style="margin:6px 0 4px">' +
+            '<span class="muted" style="font-size:12px">已选 <b id="dcKindCount">' + S.dcalcKinds.length + '</b> / ' + scNow.all.length + ' 种（带「易错」的会出易错样式）</span>' +
+            '<span><button class="small" data-act="dcalc:allK" style="color:var(--brand);font-weight:600">全选</button>　' +
+            '<button class="small" data-act="dcalc:noneK" style="color:var(--ink-3)">清空</button></span>' +
+          '</div>' +
+          '<div class="dc-kindscroll">' + dcKindListHtml() + '</div>' +
+          '<button class="btn primary block mt8" data-act="dcalc:saveKinds">✓ 保存本周题型（第 ' + dcWeekNoOf(start) + ' 周）</button>'
+        : '') +
       '<div class="row between mt12" style="align-items:center;margin-bottom:6px">' +
         '<label style="font-weight:600;font-size:13px">题型备注（每天多练，自动出同类题）</label>' +
       '</div>' +
@@ -1399,7 +1516,8 @@
       return '<section class="card" style="border-left:3px solid var(--ok,#12b76a)">' +
         '<div class="card-h"><h3>每日计算 · 已确认 ✓</h3>' +
           '<button class="small" style="color:var(--brand);font-weight:600" data-act="dcalc:setup">设置 ✎</button></div>' +
-        '<p class="muted" style="margin-bottom:8px">' + (d.getMonth() + 1) + '月' + d.getDate() + '日（周一）开始按顺序发布，每天 ' + dc.perDay + ' 题（' + esc(dc.grade) + ' · ' + dc.kindsN + ' 种题型 · 难度：' + (dc.diffL || '中等') + '（每天 ' + (dc.trapN || 0) + ' 道易错）。</p>' +
+        '<p class="muted" style="margin-bottom:4px">' + (d.getMonth() + 1) + '月' + d.getDate() + '日（周一）开始按顺序发布，每天 ' + dc.perDay + ' 题（' + esc(dc.grade) + ' · 难度：' + (dc.diffL || '中等') + '（每天 ' + (dc.trapN || 0) + ' 道易错）。</p>' +
+        '<p class="muted" style="margin-bottom:8px">本周（第 ' + dc.weekNo + ' 周）题型：' + esc(dc.kindsText || '') + (dc.weekSaved ? '' : '　<span style="color:var(--danger)">本周还没保存，点「设置 ✎」保存</span>') + '</p>' +
         '<button class="btn soft block" data-act="dcalc:planView">先看一周计划</button>' +
       '</section>';
     }
@@ -2001,7 +2119,8 @@
         '<div class="sheet">' +
           '<div class="sheet-grab"></div>' +
           '<div class="sheet-h"><h3>' + esc(opts.title || '') + '</h3>' +
-            '<button class="x" data-act="sheet:close">关闭</button></div>' +
+            '<span class="sheet-acts">' + (opts.acts || '') +
+            '<button class="x" data-act="sheet:close">关闭</button></span></div>' +
           '<div class="sheet-b">' + (opts.body || '') + '</div>' +
         '</div>';
       sheetRoot.classList.add('show');
@@ -2304,19 +2423,47 @@
     return '<p class="qtext opt" style="padding-top:4px">' + q.options.map(esc).join('<br>') + '</p>';
   }
 
-  /** 点配图放大：黑底浮层显示大图，再点一下恢复原样 */
-  function openImgLight(src) {
+  /** 点配图放大：黑底浮层显示大图，再点一下恢复原样
+   *  v1.27.0：带 qid/k 时右上角有「✎ 构图」，直接对这张题图旋转/镜像/裁剪 */
+  function openImgLight(src, opt) {
     let box = document.getElementById('imgLight');
     if (!box) {
       box = document.createElement('div');
       box.id = 'imgLight';
-      box.innerHTML = '<img alt="题目图形"><div class="il-hint">点一下图片就恢复</div>';
+      box.innerHTML = '<button class="il-edit" type="button">✎ 构图</button>' +
+        '<img alt="题目图形"><div class="il-hint">点一下图片就恢复</div>';
       box.addEventListener('click', function () { box.classList.remove('show'); });
       document.body.appendChild(box);
     }
     const im = box.querySelector('img');
+    const btn = box.querySelector('.il-edit');
+    const canEdit = opt && opt.qid !== undefined && opt.qid !== null && opt.k !== undefined && opt.k !== null;
+    btn.style.display = canEdit ? 'block' : 'none';
+    btn.onclick = function (e) {
+      e.stopPropagation();
+      box.classList.remove('show');
+      editQImage(opt.qid, +opt.k);
+    };
     im.src = src;
     box.classList.add('show');
+  }
+
+  /** 改一道题里的第 k 张配图：点图放大 → 构图 → 保存替换（可撤销） */
+  async function editQImage(qid, k) {
+    const q = await DB.get('questions', qid);
+    if (!q || !q.images || !q.images[k]) { UI.toast('这张图已经不在了'); return; }
+    openImgEditor(q.images[k], async function (next) {
+      const fresh = await DB.get('questions', qid);
+      if (!fresh || !fresh.images || !fresh.images[k]) return;
+      const before = await Undo.begin([qid]);
+      fresh.images[k] = next;
+      await Store.Questions.update(qid, { images: fresh.images });
+      await Undo.end('配图构图', before);
+      S.imgSel = {};
+      UI.toast('已保存构图（可撤销）', 2200);
+      await refreshQImgsSheet();
+      await render();
+    });
   }
 
   /** 改课时弹层「放大看题」：白卡片浮层展示题目全文（点遮罩或按钮关闭，原弹层不动） */
@@ -2372,7 +2519,8 @@
     const wrapStyle = cols > 1 ? ' style="grid-template-columns:repeat(' + cols + ',minmax(0,1fr))"' : '';
     return '<div class="' + wrapCls + '"' + wrapStyle + '>' +
       imgs.map(function (src, k) {
-        return '<div class="dimg-item"' + (opts.noZoom ? '' : ' data-act="img:zoom"') + '>' +
+        return '<div class="dimg-item"' + (opts.noZoom ? '' : ' data-act="img:zoom"') +
+          (opts.id ? ' data-id="' + opts.id + '"' : '') + ' data-k="' + k + '">' +
           '<img src="' + src + '" alt="题目图形" loading="lazy">' +
           (opts.del
             ? '<button class="dimg-x" data-act="' + opts.del + '"' +
@@ -6804,6 +6952,37 @@
     });
   }
 
+  /** 图形池展示顺序（v1.27.0）：其余按题目顺序排，老师亲手配到题的沉到最下方（按配的先后） */
+  function poolOrderIdx(s) {
+    s.imgManual = s.imgManual || {};
+    s.imgManualSeq = s.imgManualSeq || 0;
+    const all = (s.imgPool || []).map(function (_, pi) { return pi; });
+    const normal = [], manual = [];
+    all.forEach(function (pi) {
+      const src = s.imgPool[pi];
+      if (s.imgManual[src]) manual.push(pi); else normal.push(pi);
+    });
+    normal.sort(function (a, b) {
+      const oa = poolOwnerOf(s.imgPool[a]), ob = poolOwnerOf(s.imgPool[b]);
+      const ka = oa < 0 ? 9999 : oa, kb = ob < 0 ? 9999 : ob;
+      return ka !== kb ? ka - kb : a - b;
+    });
+    manual.sort(function (a, b) {
+      return (s.imgManual[s.imgPool[a]] || 0) - (s.imgManual[s.imgPool[b]] || 0);
+    });
+    return normal.concat(manual);
+  }
+  /** 老师亲手选了「配到本题」→ 记一笔，池里排到最下方 */
+  function poolMarkManual(srcs) {
+    const s = S.session;
+    if (!s) return;
+    s.imgManual = s.imgManual || {};
+    s.imgManualSeq = s.imgManualSeq || 0;
+    (srcs || []).forEach(function (src) {
+      if (src) s.imgManual[src] = ++s.imgManualSeq;
+    });
+  }
+
   function openPoolSheet(i) {
     const s = S.session;
     if (!s) return;
@@ -6817,7 +6996,8 @@
     const multi = !!S.poolMulti;
     const n = s.imgPool.length;
     const selCount = Object.keys(S.poolSel).filter(function (k) { return S.poolSel[k]; }).length;
-    const tiles = s.imgPool.map(function (src, pi) {
+    const tiles = poolOrderIdx(s).map(function (pi) {
+      const src = s.imgPool[pi];
       const owner = poolOwnerOf(src);
       const onThis = owner === i;
       const sel = !!S.poolSel[pi];
@@ -6839,7 +7019,7 @@
         '</div></div>';
     }).join('');
     const head = '<div class="row between" style="margin-bottom:8px;align-items:center">' +
-      '<span class="muted">' + (multi ? '多选模式：点图形勾选（再点取消）' : '点图片可旋转 / 裁剪 / 镜像；右上角「多选」可批量配图') + '</span>' +
+      '<span class="muted">' + (multi ? '多选模式：点图形勾选（再点取消）' : '按题目顺序排；你亲手配到题的沉到最下方。点图可旋转 / 裁剪 / 镜像') + '</span>' +
       '<button class="small" style="color:var(--brand);font-weight:600" data-act="dpi:mode" data-i="' + i + '">' +
         (multi ? '✕ 退出多选' : '☑ 多选') + '</button></div>';
     const ops = multi
@@ -6851,8 +7031,8 @@
       : '';
     UI.sheet({
       title: '为第 ' + (i + 1) + ' 题配图（池内 ' + n + ' 张）',
-      body: head + ops +
-        '<div class="pool-grid">' + (tiles || '<div class="empty small" style="padding:14px">图形池是空的，点下面添加本地图片</div>') + '</div>' +
+      acts: '<button class="sheet-add" data-act="dpi:addLocal" data-i="' + i + '">＋ 本地图片</button>',      body: head + ops +
+        '<div class="pool-grid">' + (tiles || '<div class="empty small" style="padding:14px">图形池是空的，点右上角「＋ 本地图片」添加</div>') + '</div>' +
         '<button class="btn ghost block mt12" data-act="dpi:addLocal" data-i="' + i + '">＋ 添加本地图片</button>',
       onMount: function () {
         if (keepScroll) {
@@ -7659,6 +7839,7 @@
       if (!sel.length) { UI.toast('先点图形选中要配的'); return; }
       const srcs = sel.map(function (pi) { return s.imgPool[pi]; }).filter(Boolean);
       poolAssignSrcs(i, srcs);
+      poolMarkManual(srcs);
       S.poolSel = {};
       UI.toast('已把 ' + srcs.length + ' 张图形配给第 ' + (i + 1) + ' 题');
       openPoolSheet(i);
@@ -7707,6 +7888,7 @@
         if (added.length) {
           // 新加的图直接配到当前题（独占：先从其他题摘下来）
           poolAssignSrcs(i, added);
+          poolMarkManual(added);
         }
         UI.toast('已添加 ' + files.length + ' 张本地图片');
         if (s.imgPool.length) openPoolSheet(i);
@@ -7732,22 +7914,7 @@
     },
     /* 已入库题目：单张配图构图，保存后替换并可用顶栏 ↶ 撤销 */
     'q:imgEdit': async function (d) {
-      const k = +d.k;
-      const q = await DB.get('questions', d.id);
-      if (!q || !q.images || !q.images[k]) return;
-      const src = q.images[k];
-      openImgEditor(src, async function (next) {
-        const fresh = await DB.get('questions', d.id);
-        if (!fresh || !fresh.images || !fresh.images[k]) return;
-        const before = await Undo.begin([fresh.id]);
-        fresh.images[k] = next;
-        await Store.Questions.update(fresh.id, { images: fresh.images });
-        await Undo.end('配图构图', before);
-        S.imgSel = {};
-        UI.toast('已保存构图（可撤销）', 2200);
-        await refreshQImgsSheet();
-        await render();
-      });
+      await editQImage(d.id, +d.k);
     },
     'draft:imgToggle': async function (d) {
       const i = +d.i, pi = +d.pi;
@@ -7757,9 +7924,11 @@
       const draft = S.drafts[i];
       const k = (draft.images || []).indexOf(src);
       if (k >= 0) {
-        draft.images.splice(k, 1);             // 取消配图
+        draft.images.splice(k, 1);             // 取消配图：回到按题目顺序的位置
+        if (s.imgManual) delete s.imgManual[src];
       } else {
-        poolAssignSrcs(i, [src]);              // 独占配图
+        poolAssignSrcs(i, [src]);              // 独占配图 → 池里沉到最下方
+        poolMarkManual([src]);
       }
       openPoolSheet(i);
       await render();
@@ -7790,13 +7959,51 @@
     /* ---- 每日计算（首页） ---- */
     'dcalc:g': function (d) {
       S.dcalcPick = d.v;
-      navigate('home');
+      S.dcalcKinds = dcScopeDefaultKinds(d.v, S.dcalcTerm);   // 换年级 → 题型跟着本学期范围重来
+      S.dcGrpOpen = {};
+      dcSetupRedraw();
     },
-    'dcalc:g': function (d) {
-      S.dcalcPick = d.v;
-      document.querySelectorAll('[data-act="dcalc:g"]').forEach(function (b) {
-        b.classList.toggle('active', b.dataset.v === S.dcalcPick);
-      });
+    'dcalc:term': function (d) {
+      S.dcalcTerm = d.v;
+      S.dcalcKinds = dcScopeDefaultKinds(S.dcalcPick || S.defaults.grade, d.v);
+      S.dcGrpOpen = {};
+      dcSetupRedraw();
+    },
+    /* 题型选择框默认折叠；点开才出分组列表 */
+    'dcalc:kindOpen': function () {
+      S.dcKindOpen = !S.dcKindOpen;
+      dcSetupRedraw();
+    },
+    /* 「已学过 · 非本学期重点」这类组默认折叠，点组名展开 */
+    'dcalc:grp': function (d) {
+      S.dcGrpOpen = S.dcGrpOpen || {};
+      S.dcGrpOpen[d.g] = !S.dcGrpOpen[d.g];
+      const box = document.querySelector('.dc-kindscroll');
+      if (box) { const top = box.scrollTop; box.innerHTML = dcKindListHtml(); box.scrollTop = top; }
+    },
+    /* 保存本周题型（连同题数、倒计时、学期日期一起存） */
+    'dcalc:saveKinds': function () {
+      const cfg = readDcalcCfg() || {};
+      if (!S.dcalcKinds || !S.dcalcKinds.length) { UI.toast('至少选一种计算题型'); return; }
+      const startEl = document.getElementById('dcStart');
+      const perEl = document.getElementById('dcPerDay');
+      const timerEl = document.getElementById('dcTimerMin');
+      const start = (startEl && startEl.value) || cfg.startDate || defaultStartOf(semKeyOf(new Date()));
+      const perDay = Math.max(1, Math.min(30, parseInt(perEl && perEl.value, 10) || cfg.perDay || 5));
+      const timerMin = Math.max(1, Math.min(60, parseInt(timerEl && timerEl.value, 10) || cfg.timerMin || 5));
+      const wk = dcWeekKeyOf(start);
+      const weekKinds = Object.assign({}, cfg.weekKinds || {});
+      weekKinds[wk] = S.dcalcKinds.slice();
+      saveDcalcCfg(Object.assign({}, cfg, {
+        grade: S.dcalcPick || cfg.grade, term: S.dcalcTerm,
+        startDate: start, perDay: perDay, timerMin: timerMin,
+        kinds: S.dcalcKinds.slice(), diff: S.dcalcDiff || cfg.diff || 2,
+        useBank: dcalcUseBankNow(), notes: (S.dcalcNotes || []).slice(),
+        weekKey: wk, weekKinds: weekKinds, kindsSavedAt: Date.now()
+      }));
+      S.dcKindOpen = false;
+      UI.toast('已保存第 ' + dcWeekNoOf(start) + ' 周题型：' + dcKindsSummary(S.dcalcKinds), 2600);
+      dcSetupRedraw();
     },
     'dcalc:k': function (d) {
       const k = d.k;
@@ -7812,7 +8019,8 @@
       dcKindGroupRefresh();
     },
     'dcalc:kGroup': function (d) {
-      const grp = DCALC_GROUP.find(function (g) { return g.t === d.g; });
+      const sc = dcScopeOf(S.dcalcPick || S.defaults.grade, dcTermNow());
+      const grp = sc.groups.find(function (g) { return g.t === d.g; });
       if (!grp) return;
       const all = grp.ks.every(function (k) { return S.dcalcKinds.indexOf(k) >= 0; });
       grp.ks.forEach(function (k) {
@@ -7827,7 +8035,7 @@
     'dcalc:expand': function () { S.dcExpand = true; dcSetupRedraw(); },
     'dcalc:fold': function () { S.dcExpand = false; dcSetupRedraw(); },
     'dcalc:allK': function () {
-      S.dcalcKinds = DCALC_KINDS.map(function (x) { return x.k; });
+      S.dcalcKinds = dcScopeOf(S.dcalcPick || S.defaults.grade, dcTermNow()).all.slice();
       const box = document.querySelector('.dc-kindscroll');
       if (box) box.innerHTML = dcKindListHtml();
       dcKindCountRefresh();
@@ -7958,10 +8166,11 @@
       const perDay = Math.max(1, Math.min(30, parseInt(perEl && perEl.value, 10) || cfg0.perDay || 5));
       const timerMin = Math.max(1, Math.min(60, parseInt(timerEl && timerEl.value, 10) || cfg0.timerMin || 5));
       const kinds = (S.dcalcKinds && S.dcalcKinds.length) ? S.dcalcKinds.slice()
-        : (cfg0.kinds && cfg0.kinds.length ? cfg0.kinds.slice() : dcDefaultKinds(S.dcalcPick || cfg0.grade || S.defaults.grade));
+        : (cfg0.kinds && cfg0.kinds.length ? cfg0.kinds.slice() : dcScopeDefaultKinds(S.dcalcPick || cfg0.grade || S.defaults.grade, S.dcalcTerm || cfg0.term));
       if (!S.dcalcWeak) S.dcalcWeak = await dcCollectWeak();
       S.dcalcDraft = {
         grade: S.dcalcPick || cfg0.grade || S.defaults.grade,
+        term: S.dcalcTerm || cfg0.term || (S.defaults && S.defaults.term) || '上册',
         startDate: startEl && startEl.value ? startEl.value : (cfg0.startDate || ''),
         perDay: perDay, timerMin: timerMin, kinds: kinds,
         diff: S.dcalcDiff || cfg0.diff || 2,
@@ -7980,14 +8189,20 @@
     'dcalc:confirmPlan': async function () {
       const draft = S.dcalcDraft, plan = S.dcalcPlan;
       if (!draft || !plan) return;
-      saveDcalcCfg({
-        grade: draft.grade, startDate: draft.startDate, semKey: semKeyOf(new Date()),
+      const old = readDcalcCfg() || {};
+      const wk = dcWeekKeyOf(draft.startDate);
+      const weekKinds = Object.assign({}, old.weekKinds || {});
+      weekKinds[wk] = (draft.kinds || []).slice();
+      saveDcalcCfg(Object.assign({}, old, {
+        grade: draft.grade, term: draft.term || old.term || '上册',
+        startDate: draft.startDate, semKey: semKeyOf(new Date()),
         kinds: draft.kinds, perDay: draft.perDay, timerMin: draft.timerMin,
         diff: draft.diff || 2, useBank: draft.useBank !== false, weak: draft.weak || [],
         notes: draft.notes || [],
         confirmed: true, planStart: plan.monday, planSeed: draft.planSeed,
-        planEdits: plan.edits || {}
-      });
+        planEdits: plan.edits || {},
+        weekKey: wk, weekKinds: weekKinds
+      }));
       S.dcalcDraft = null; S.dcalcPlan = null;
       S.dcalcKinds = null; S.dcalcWeak = null; S.dcalcDiff = null; S.dcalcUseBank = null; S.dcalcNotes = null;
       S.dcalc.showAns = false;
@@ -8099,6 +8314,11 @@
     'dcalc:setup': function () {
       S.dcalcKinds = null; S.dcalcWeak = null; S.dcalcDiff = null; S.dcalcUseBank = null; S.dcalcNotes = null;   // 重新打开设置时按已存配置初始化题型
       S.dcExpand = false;                       // v1.26.0：设置过之后每次打开默认折叠
+      S.dcKindOpen = false;                     // v1.27.0：题型选择框也默认折叠，只显示本周选中的题型
+      S.dcGrpOpen = {};
+      const cfg = readDcalcCfg() || {};
+      S.dcalcPick = cfg.grade || S.dcalcPick || S.defaults.grade;
+      S.dcalcTerm = cfg.term || (S.defaults && S.defaults.term) || '上册';
       UI.sheet({ title: '每日计算 · 设置', body: dcalcSetupBody() });
     },
     'dcalc:ans': function () {
@@ -9394,11 +9614,11 @@
       S.openImg[d.id] = S.openImg[d.id] === false ? true : false;
       render();
     },
-    /* 点配图放大 / 再点任意处恢复 */
+    /* 点配图放大 / 再点任意处恢复（带 qid+k 的可以顺手构图） */
     'img:zoom': function (d, el) {
       const img = el && el.querySelector ? el.querySelector('img') : null;
       if (!img || !img.src) return;
-      openImgLight(img.src);
+      openImgLight(img.src, { qid: el.dataset.id, k: el.dataset.k });
     },
     /* ---- 入库题的解题思路：默认折叠 ---- */
     'q:solToggle': function (d) {
@@ -10475,7 +10695,9 @@
     dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs, dcEditSheet: dcEditSheet, dcEditApply: dcEditApply,
     dcTrapCount: dcTrapCount, dcTrapGen: dcTrapGen, dcFitGrade: dcFitGrade, dcDiffDesc: dcDiffDesc,
     DCALC_TRAPS: DCALC_TRAPS, DCALC_GROUP: DCALC_GROUP, dcKindListHtml: dcKindListHtml,
-    dcalcSetupBody: dcalcSetupBody,
+    dcalcSetupBody: dcalcSetupBody, dcScopeOf: dcScopeOf, dcScopeDefaultKinds: dcScopeDefaultKinds,
+    dcKindsSummary: dcKindsSummary, dcWeekNoOf: dcWeekNoOf, dcWeekKeyOf: dcWeekKeyOf,
+    poolOrderIdx: poolOrderIdx, poolMarkManual: poolMarkManual, editQImage: editQImage,
     isChoiceType: isChoiceType, choiceToggle: choiceToggle, choiceLettersOf: choiceLettersOf,
     choicePickHtml: choicePickHtml, kbInsert: kbInsert, kbOpen: kbOpen, kbClose: kbClose,
     dcSolveFixes: dcSolveFixes, dcSameNum: dcSameNum,
