@@ -1010,3 +1010,13 @@ body.kb-open .sheet { bottom: 272px; max-height: calc(100vh - 330px); }
 .dc-kg-h .dc-kg-t em { font-style: normal; font-size: 11px; font-weight: 600; color: var(--ink-3); margin-left: 2px; }
 .dc-kg.fold { border-bottom: 1px dashed var(--line); }
 .dc-kg.fold .dc-kg-b { display: none; }
+
+/* 学生投屏页（?dcalc=1，v1.28.0）：教室大屏只显示题目 + 倒计时 */
+.stu-wrap { max-width: 780px; margin: 0 auto; padding: 12px 14px 40px; }
+.stu-exit {
+  position: fixed; top: 10px; right: 12px; z-index: 20;
+  background: none; border: none; padding: 6px 10px;
+  font-size: 13px; color: var(--ink-3); cursor: pointer;
+}
+.dc-stu-timer { padding: 14px 16px; }
+.dc-stu-timer .dc-time { font-size: 44px; font-weight: 700; letter-spacing: 2px; }
