@@ -5040,9 +5040,15 @@
           })
         : list;
       const byPoint = {};
+      const pointMisfit = {};   // 挂在本单元题上、但考点本身属于别的单元 → 不当本单元考点
       effList.forEach(function (q) {
         // 一题挂多个考点：在每个考点行下都出现
         qPointsOf(q).forEach(function (p) {
+          /* v1.32.0：单元卡只列「自己就是这个单元」的考点。
+             「平移对应点距离相等·第1单元」挂在第三单元的题上时，不在第三单元卡里露脸（去第一单元找它） */
+          const meta = (S.cache.pointsByName || {})[p.name] || { name: p.name, subject: q.subject, grade: q.grade };
+          const pu = pointUnitOf(meta);
+          if (pu && u && pu !== u) { pointMisfit[p.name] = pu; return; }
           const key = p.id || 'n:' + p.name;
           const e = byPoint[key] || (byPoint[key] = { id: p.id, name: p.name, count: 0 });
           e.count++;
@@ -5070,6 +5076,12 @@
             }).join('') + '</div>' +
             '<p class="muted" style="margin:0 4px 6px;font-size:11.5px">课时标签可多选（再点一次取消），已选的排在前面</p>'
         : '';
+      /* v1.32.0：有些题挂的考点写着别的单元（如「…·第1单元」），这里说明去向，免得以为题丢了考点 */
+      const misfitNames = Object.keys(pointMisfit);
+      const misfitHtml = misfitNames.length
+        ? '<p class="muted" style="margin:6px 4px 0;font-size:11.5px">另有 ' + misfitNames.length + ' 个考点名里写了别的单元（如「' +
+            esc(misfitNames[0]) + '」），已归到对应单元，不在本单元卡显示；要改就在题卡的考点标签里重选。</p>'
+        : '';
       return '<section class="card">' +
         '<div class="card-h"><h3>' + esc(unitLabelOf(u)) + '</h3>' +
           '<div class="row" style="gap:6px"><span class="muted">' + (lessonSels.length ? effList.length + ' / ' : '') + list.length + ' 题 · ' +
@@ -5082,7 +5094,7 @@
         lessonChips +
         (lessonSels.length && !effList.length
           ? '<div class="empty" style="padding:14px 0">' + (lessonSels.length > 1 ? '这些课时下' : '这个课时下') + '还没有题目</div>'
-          : rowsHtml) +
+          : rowsHtml + misfitHtml) +
       '</section>';
     }).join('');
   }
@@ -5178,8 +5190,19 @@
     return D[s] || 0;
   }
   /** 考点真正归属的单元：库里存的优先，没有就按名字后缀猜 */
+  /** 考点名后缀里点名的单元：「平移对应点距离相等·第1单元」→ 第一单元（v1.32.0） */
+  function pointSuffixUnitOf(name, subject, grade) {
+    const s = String(name || '');
+    const m = s.match(/·\s*([^·]+)$/);        // 取最后一个 · 后面的部分
+    if (!m) return '';
+    return unitFromPointName(m[1], subject, grade);
+  }
   function pointUnitOf(p) {
     if (!p) return '';
+    /* v1.32.0：名字后缀写了单元的，以后缀为准——老师看到「·第1单元」就认为它属于第一单元，
+       不能再因为库里存的 units 是别的单元就把它塞进那个单元的题卡 */
+    const suf = pointSuffixUnitOf(p.name, p.subject, p.grade);
+    if (suf) return suf;
     const u = (p.units && p.units[0]) || '';
     if (u) return u;
     return unitFromPointName(p.name, p.subject, p.grade);
@@ -5422,12 +5445,14 @@
     pointMgrDraw(true);
   }
 
-  /** 当前范围内的考点（长按某单元进来的只看这个单元） */
+  /** 当前范围内的考点（长按某单元进来的只看这个单元；名字后缀写了别的单元的不算本单元） */
   function pointMgrBase() {
     const st = S._pm;
     if (!st || !st.scope) return st ? st.pts : [];
     return st.pts.filter(function (p) {
-      return pointUnitOf(p) === st.scope || (p.units || []).indexOf(st.scope) >= 0;
+      const pu = pointUnitOf(p);
+      if (pu) return pu === st.scope;                     // v1.32.0：以后缀/推定为谁，就只归谁
+      return (p.units || []).indexOf(st.scope) >= 0;
     });
   }
 
@@ -5762,7 +5787,7 @@
         '</section>' +
 
         (list.length
-          ? list.map(function (q) { return questionCard(q, { hidePoint: true }); }).join('')
+          ? list.map(function (q) { return questionCard(q); }).join('')   /* v1.32.0：显示考点标签，点了就和录入时一样能改考点 / 确认 */
           : '<div class="empty"><b>这个考点下还没有题目</b></div>');
     }
   };
@@ -7115,16 +7140,29 @@
           '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
           '<div class="li-s">' + (p.count || 0) + ' 题</div></div></div>';
       }
+      function selHtml() {
+        const keys = Object.keys(S._ppm.sel);
+        if (!keys.length) return '';
+        return '<p class="muted" style="margin:4px 2px 4px;font-size:12px">已挂在这道题上（点一下取消）</p>' +
+          keys.map(function (k) {
+            const it = S._ppm.sel[k];
+            return '<div class="list-item" data-act="ppm:toggle" data-key="' + esc(k) + '" data-name="' + esc(it.name) + '" data-id="' + (it.id || '') + '"' +
+              ' style="background:var(--brand-soft)">' +
+              '<span class="bcheck on"></span><div class="li-main"><div class="li-t">' + esc(it.name) + '</div>' +
+              '<div class="li-s">' + ((it.units || []).length ? '单元：' + esc(it.units.join('、')) : '未归入单元') + '</div></div></div>';
+          }).join('');
+      }
       function listHtml() {
         const kw = (S._ppm.kw || '').trim().toLowerCase();
-        // 不输入关键字时不显示已有考点，输入前几个字才联想
-        if (!kw) return '<div class="empty small" style="padding:14px">输入考点前几个字联想已有考点；没有匹配的就在下面「＋加入」新建</div>';
+        // 不输入关键字时不显示已有考点，输入前几个字才联想（已挂的考点始终列在最上面）
+        if (!kw) return selHtml() + '<div class="empty small" style="padding:14px">输入考点前几个字联想已有考点；没有匹配的就在下面「＋加入」新建</div>';
         const filtered = S._ppm.points.filter(function (p) {
+          if (S._ppm.sel[p.id || 'n:' + p.name]) return false;      // 已挂的上面已列出，不重复
           return (p.name + ' ' + (p.aliases || []).join(' ')).toLowerCase().indexOf(kw) >= 0;
         });
         let html = filtered.slice(0, 80).map(rowHtml).join('');
         if (!html) html = '<div class="empty small" style="padding:14px">没有匹配的考点，可直接在下面「＋加入」新建</div>';
-        return html;
+        return selHtml() + html;
       }
       function footerBtn() {
         const n = Object.keys(S._ppm.sel).length;
