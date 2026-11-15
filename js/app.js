@@ -2069,12 +2069,23 @@
       });
     });
     let n = 0;
+    /* v1.31.0：自动配对不算「老师改过目录」。原来 setLessons 会把 lessons 时间戳顶到 now，
+       导致本机时间戳永远最新、另一台设备真实编辑的课时被当成旧数据忽略（目录同步不过去的根因） */
+    const prevStamp = (Catalog.stamps() || {}).lessons || 0;
     Object.keys(used).forEach(function (u) {
       const cur = Catalog.lessonsOf(sbj, gd, S.defaults.term, S.defaults.version, u);
       const merged = cur.slice();
       used[u].forEach(function (L) { if (merged.indexOf(L) < 0) merged.push(L); });
       if (merged.length !== cur.length) { Catalog.setLessons(sbj, gd, S.defaults.term, S.defaults.version, u, merged); n++; }
     });
+    if (n && prevStamp) Catalog.bumpStamp('lessons', prevStamp);   // 拨回原时间戳
+    else if (n && !prevStamp) {   // 本来没有时间戳就清掉，别留下一个「now」
+      try {
+        const sk = 'tiku.settings.stamps';
+        const s0 = JSON.parse(localStorage.getItem(sk) || '{}');
+        delete s0.lessons; localStorage.setItem(sk, JSON.stringify(s0));
+      } catch (e) {}
+    }
     return n;
   }
   /** 考点基本名（去掉「·第N单元」后缀） */
@@ -3535,8 +3546,18 @@
   }
 
   async function packSheet() {
-    /* v1.30.0：手机端只做增删题，生成讲评包放在电脑上（配图不走云同步，得在电脑上打包） */
-    if (isPhoneUi()) { UI.toast('手机上只做增删讲评题；生成讲评包请到电脑上打开题库', 3200); return; }
+    /* v1.31.0：手机上也能生成讲评包（手边没电脑的场合），但先提醒一句：电脑上配图更全、更适合打印 */
+    if (isPhoneUi()) {
+      const pick = await UI.choose({
+        title: '建议在电脑上生成讲评包',
+        text: '电脑上配图更全、排版更适合打印投屏。手边没电脑也可以直接在手机上生成，缺配图的题会只有文字和思路。',
+        opts: [
+          { label: '就在手机上生成', value: 'go', kind: 'primary' },
+          { label: '先不了，回电脑再生成', value: 'no' }
+        ]
+      });
+      if (pick !== 'go') return;
+    }
     /* 生成前先看讲评题有没有配图：别的设备同步来的题 / 有原图却没图形的，先提醒手动同步再打包 */
     const miss = [];
     for (const id of jpLoad()) {
@@ -3802,7 +3823,43 @@
     if (syncPushing || syncPulling) { scheduleSyncPush(3000); return false; }
     syncPushing = true;
     try {
-      const payload = await buildSyncPayload();
+      let payload = await buildSyncPayload();
+      /* v1.31.0 少不覆盖多：本机题明显比云端少（差 10 题以上）时先拦一下，
+         防止某台旧设备 / 刚清过数据的设备用少的数据把云端多的覆盖掉 */
+      try {
+        const docs = await window.CloudSync.pull();
+        let remoteN = 0;
+        (docs || []).forEach(function (d) {
+          const c = d && d.payload && Array.isArray(d.payload.questions) ? d.payload.questions.length : 0;
+          if (c > remoteN) remoteN = c;
+        });
+        if (remoteN - payload.questions.length >= 10) {
+          if (quiet) {
+            // 自动同步不弹窗：暂停这次上传，把原因写进同步状态，等老师手动处理
+            S.syncMsg = '云端题目（' + remoteN + '）比本机（' + payload.questions.length + '）多，已暂停上传以防覆盖；请点「立即同步一次」先合并';
+            if (!syncFailTold) { syncFailTold = true; UI.toast('云端题目更多，自动上传已暂停以防覆盖；请手动点「立即同步一次」先合并', 4800); }
+            return false;
+          }
+          const pick = await UI.choose({
+            title: '云端题目更多，先合并再上传？',
+            text: '本机 ' + payload.questions.length + ' 题 / 云端 ' + remoteN + ' 题。现在上传等于用较少的数据覆盖较多的，云端多出来的题会丢。建议先把云端合并下来再上传。',
+            opts: [
+              { label: '先合并云端再上传（推荐）', value: 'merge', kind: 'primary' },
+              { label: '仍然上传（以本机为准）', value: 'go' }
+            ]
+          });
+          if (pick !== 'go') {
+            const me = window.CloudSync.deviceId();
+            for (const d of (docs || [])) {
+              if (!d || d.device === me) continue;
+              await applySyncDoc(d);       // 逐题按「谁改得晚听谁的」合并，不会丢本机新改的
+            }
+            payload = await buildSyncPayload();   // 合并完重新打包
+            S.cache.homeDraft = null;
+            await render();
+          }
+        }
+      } catch (e) { /* 拉不到云端快照就按原样推，不阻塞正常同步 */ }
       const raw = JSON.stringify(payload);
       S.syncSize = Math.round(raw.length / 1024);
       const h = window.CloudSync.hashOf(raw);
@@ -3888,21 +3945,52 @@
       n++;
     }
 
-    // 4) 设置（教材目录 / 每单元课时 / 练习类型）：分项比时间戳，谁的改动晚就听谁的
+    // 4) 设置（教材目录 / 每单元课时 / 练习类型）：分项比时间戳，谁的改动晚就听谁的；
+    //    v1.31.0 再加一道规模保护：远端内容明显比本机少时不套用，防旧/少的数据覆盖多的
     const st = payload.settings;
     if (st && st.stamps) {
       const loc = Catalog.stamps();
       const rs = st.stamps;
-      if ((rs.catalog || 0) > (loc.catalog || 0) && st.catalog && typeof st.catalog === 'object') {
-        Catalog.setCustomMap(st.catalog, rs.catalog); n++;
-      }
+      const skipped = [];
+      /* 课时的「规模」= 已配课时的单元数 */
+      const lessonUnits = function (m) {
+        let c = 0;
+        Object.keys(m || {}).forEach(function (k) { c += Object.keys((m[k] || {})).length; });
+        return c;
+      };
       if ((rs.lessons || 0) > (loc.lessons || 0) && st.lessons && typeof st.lessons === 'object') {
-        Catalog.setLessonsMap(st.lessons, rs.lessons); n++;
+        const ru = lessonUnits(st.lessons), lu = lessonUnits(Catalog.lessonsMap());
+        if (lu - ru >= 3 && ru < lu * 0.6) {
+          skipped.push('课时（云端 ' + ru + ' 单元 / 本机 ' + lu + ' 单元）');
+        } else {
+          Catalog.setLessonsMap(st.lessons, rs.lessons); n++;
+        }
+      }
+      /* 自定义目录的「规模」= 有自定义目录的教材数 */
+      const catBooks = function (m) {
+        let c = 0;
+        Object.keys(m || {}).forEach(function (k) { if (Array.isArray(m[k]) && m[k].length) c++; });
+        return c;
+      };
+      if ((rs.catalog || 0) > (loc.catalog || 0) && st.catalog && typeof st.catalog === 'object') {
+        const rb = catBooks(st.catalog), lb = catBooks(Catalog.customMap());
+        if (lb - rb >= 3 && rb < lb * 0.6) {
+          skipped.push('教材目录（云端 ' + rb + ' 本 / 本机 ' + lb + ' 本）');
+        } else {
+          Catalog.setCustomMap(st.catalog, rs.catalog); n++;
+        }
       }
       if ((rs.ptypes || 0) > (loc.ptypes || 0) && Array.isArray(st.ptypes) && st.ptypes.length) {
-        PracticeTypes.save(st.ptypes);           // save 会把本机时间戳顶到 now
+        /* v1.31.0：练习类型改并集合并——两端保留的都留下，谁也不会被谁的旧清单清掉 */
+        const merged = PracticeTypes.list().slice();
+        st.ptypes.forEach(function (t) { t = String(t || '').trim(); if (t && merged.indexOf(t) < 0) merged.push(t); });
+        PracticeTypes.save(merged);              // save 会把本机时间戳顶到 now
         Catalog.bumpStamp('ptypes', rs.ptypes);  // 再拨回远端时间戳，保持口径一致
         n++;
+      }
+      if (skipped.length) {
+        S.syncMsg = '为防旧数据覆盖，已跳过：' + skipped.join('、') + '（远端比本机少）。请在改动多的那台设备上再同步一次';
+        try { UI.toast(S.syncMsg, 5200); } catch (e) {}
       }
       /* v1.28.0：每日计算配置跟着时间戳走（教室浏览器 / 备用手机都能看到同一份设置和题目） */
       if ((rs.dcalc || 0) > (loc.dcalc || 0) && st.dcalc && typeof st.dcalc === 'object' && st.dcalc.grade) {
@@ -4000,7 +4088,7 @@
         (on ? '<button class="tb-btn text" data-act="jp:batch">退出</button>' : '') +
         (!on && n ? '<button class="tb-btn text" data-act="jp:batch">批量</button>' : '') +
         (!on && n ? '<button class="tb-btn text" data-act="jp:tags">' + (S.jpTags ? '隐藏标签' : '显示标签') + '</button>' : '') +
-        (!on && n && !isPhoneUi() ? '<button class="tb-btn text" data-act="pack:open">生成包</button>' : '');
+        (!on && n ? '<button class="tb-btn text" data-act="pack:open">生成包</button>' : '');
     },
     async load() {
       const ids = jpLoad();
@@ -5122,10 +5210,13 @@
   }
   /** 疑似垃圾考点：OCR 把题号/页码/序号当成了考点名（如「A考点0-5」「B考点1」「A考点三」）
    *  v1.30.0：全角数字「０－５」、圈码、中文数字都算，之前只认半角数字，所以点了没反应 */
+  /** 疑似垃圾考点：OCR 把题号/页码/序号/单元后缀当成了考点名（如「A考点0-5」「B考点1」「A考点三」「表面积·第3单元」） */
   function junkPointName(name) {
     const s = String(name || '').trim();
     if (!s) return false;
-    // 「小数除法第3单元」这种是老师按单元命名的正常考点（能归到目录单元的），不算垃圾
+    // 「表面积·第3单元」这种带 · 分隔的单元后缀是 OCR 拼接出来的，不是真考点
+    if (/·\s*第?\s*[0-9０-９一二三四五六七八九十]{1,3}\s*单元/.test(s)) return true;
+    // 「小数除法第3单元」这种直接拼的、能归到目录单元的，是老师按单元命名的正常考点，不算垃圾
     if (/单元/.test(s) && unitFromPointName(s)) return false;
     if (/[0-9０-９①-⑳⑴-⒇]/.test(s)) return true;                    // 半角 / 全角数字、圈码
     if (/考点\s*[一二三四五六七八九十百]/.test(s)) return true;        // 「A考点三」
@@ -11280,6 +11371,7 @@
     isReviewUnit: isReviewUnit, draftReviewUnits: draftReviewUnits, reviewPickSheet: reviewPickSheet, applyReviewUnits: applyReviewUnits, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,
     PracticeTypes: PracticeTypes,
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
+    syncCatalogLessons: syncCatalogLessons, isPhoneUi: isPhoneUi,
     buildSyncPayload: buildSyncPayload, applySyncDoc: applySyncDoc, openQTextLight: openQTextLight,
     dupKeyOf: dupKeyOf, dupDraftsOf: dupDraftsOf, gateDuplicates: gateDuplicates,
     applyDocAnswers: applyDocAnswers,
@@ -11311,6 +11403,17 @@
       await DB.open();
       await Store.Points.recount();
       await migrateQuestionTypes();
+      // v1.31.0 一次性校正：v1.25–v1.30 打开题库就自动配对课时、把 lessons 时间戳顶成 now，
+      // 存量的时间戳不可信（会导致另一台设备的真实编辑被当成旧数据忽略）。内容不动，只把时间戳清零重排。
+      if (!localStorage.getItem('tiku.stamps.fix31')) {
+        try {
+          const sk = 'tiku.settings.stamps';
+          const s0 = JSON.parse(localStorage.getItem(sk) || '{}');
+          s0.lessons = 0;
+          localStorage.setItem(sk, JSON.stringify(s0));
+          localStorage.setItem('tiku.stamps.fix31', '1');
+        } catch (e) {}
+      }
       // 不再自动生成示例题；需要例子时在首页点「载入示例（苏教版五上新教材练习）」
     } catch (e) {
       console.error(e);
