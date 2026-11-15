@@ -837,3 +837,101 @@ body[data-tab="off"] .tabbar { display: none; }
   border: 1px solid var(--line); border-radius: 10px;
 }
 .qr-wrap p { margin: 6px 0 0; font-size: 12px; color: var(--ink-3); }
+
+/* ---------------- 数学键盘（v1.26.0） ---------------- */
+.kb-fab {
+  position: fixed; z-index: 55;
+  right: max(14px, calc(50vw - 260px + 14px));
+  bottom: calc(122px + var(--safe-b));   /* 避开确认页的「确认入库」底条 */
+  width: 46px; height: 46px; border-radius: 50%;
+  background: var(--brand); color: #fff;
+  font-size: 19px; line-height: 46px; text-align: center;
+  box-shadow: 0 6px 18px rgba(70,97,238,.35);
+}
+body[data-tab="off"] .kb-fab { bottom: calc(64px + var(--safe-b)); }
+.mathkb {
+  position: fixed; left: 50%; transform: translate(-50%, 130%);
+  bottom: 0; width: 100%; max-width: 520px; z-index: 70;
+  background: rgba(255,255,255,.98); border-top: 1px solid var(--line);
+  border-radius: 16px 16px 0 0; padding: 6px 8px calc(8px + var(--safe-b));
+  box-shadow: 0 -8px 26px rgba(17,24,39,.12);
+  transition: transform .22s ease, bottom .18s ease;
+}
+.mathkb.show { transform: translate(-50%, 0); }
+.kb-h { display: flex; align-items: center; gap: 8px; padding: 2px 4px 6px; font-size: 13px; }
+.kb-h .muted { font-size: 11.5px; color: var(--ink-3); flex: 1; }
+.kb-h .x { font-size: 12px; color: var(--ink-3); padding: 2px 6px; }
+.kb-quick, .kb-letters, .kb-rows { display: flex; flex-wrap: wrap; gap: 4px; }
+.kb-quick button {
+  flex: 1 0 calc(100%/7 - 4px); height: 34px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--line); font-size: 15px;
+}
+.kb-letters { margin-top: 4px; }
+.kb-letters button {
+  flex: 0 0 calc(100%/9 - 4px); height: 32px; border-radius: 7px;
+  background: #fff; border: 1px solid var(--line); font-weight: 700; font-size: 15px;
+}
+.kb-rows { margin-top: 5px; }
+.kb-rows button {
+  flex: 1; height: 34px; border-radius: 8px;
+  background: var(--brand-soft); color: var(--brand); font-weight: 600; font-size: 13px;
+}
+.kb-more { display: none; max-height: 168px; overflow: auto; margin-top: 6px; }
+.mathkb.more .kb-more { display: block; }
+.kb-g { margin-bottom: 6px; }
+.kb-g-t { font-size: 11.5px; color: var(--ink-3); padding: 2px 2px 4px; }
+.kb-g-k { display: flex; flex-wrap: wrap; gap: 4px; }
+.kb-g-k button {
+  min-width: 40px; height: 32px; padding: 0 8px; border-radius: 7px;
+  background: var(--panel-2); border: 1px solid var(--line); font-size: 14px;
+}
+body.kb-open .app { padding-bottom: 320px; }
+body.kb-open .sheet { bottom: 272px; max-height: calc(100vh - 330px); }
+
+/* 选择题答案：大写字母点选 */
+.ans-pick { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 0 0 6px; }
+.ans-pick-b {
+  width: 38px; height: 36px; border-radius: 9px; border: 1px solid var(--line);
+  background: #fff; font-weight: 700; font-size: 15px; color: var(--ink-2);
+}
+.ans-pick-b.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+.ans-pick-t { font-size: 11.5px; color: var(--ink-3); }
+
+/* 每日计算：折叠摘要 / 难度提示 / 题型上下滑动多选 */
+.dc-sum {
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px 12px; font-size: 13px; line-height: 1.9; color: var(--ink-2);
+}
+.dc-sum .k { color: var(--ink-3); margin-right: 4px; }
+.dc-diffhint {
+  font-size: 12px; color: var(--brand); background: var(--brand-soft);
+  border-radius: 8px; padding: 6px 9px; margin: 0 0 8px;
+}
+.dc-kindscroll {
+  max-height: 208px; overflow-y: auto; border: 1px solid var(--line);
+  border-radius: 12px; background: #fff; padding: 4px 6px;
+  -webkit-overflow-scrolling: touch;
+}
+.dc-kg { padding: 2px 0 4px; border-bottom: 1px dashed var(--line); }
+.dc-kg:last-child { border-bottom: 0; }
+.dc-kg-h { display: flex; align-items: center; justify-content: space-between; padding: 4px 2px 6px; }
+.dc-kg-h span { font-size: 12px; font-weight: 700; color: var(--ink-3); }
+.dc-kr {
+  display: flex; align-items: center; gap: 8px; width: 100%; height: 38px;
+  padding: 0 8px; border-radius: 9px; text-align: left; font-size: 14px; color: var(--ink);
+}
+.dc-kr + .dc-kr { margin-top: 2px; }
+.dc-kr .tick {
+  width: 18px; height: 18px; border-radius: 5px; border: 1px solid var(--line);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; color: #fff; flex: none;
+}
+.dc-kr.active { background: var(--brand-soft); }
+.dc-kr.active .tick { background: var(--brand); border-color: var(--brand); }
+.dc-kr .l { flex: 1; }
+.dc-kr .tr { font-size: 10.5px; color: var(--warn); background: var(--warn-soft); border-radius: 5px; padding: 1px 5px; }
+.dc-trap {
+  display: inline-block; margin-left: 6px; font-size: 10.5px;
+  color: var(--warn); background: var(--warn-soft); border-radius: 5px; padding: 0 4px;
+}
+@media print { .kb-fab, .mathkb, .ans-pick { display: none !important; } }
