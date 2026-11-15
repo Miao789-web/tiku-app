@@ -4983,6 +4983,20 @@
     qs.forEach(function (q) {
       qUnitsOf(q).forEach(function (u) { (byUnit[u] = byUnit[u] || []).push(q); });
     });
+    /* v1.33.0：考点名字里点名了某个单元（如「已知梯形面积求（上＋下）第3单元」），题却归档在别的单元。
+       这类考点只按名字算在它自己那个单元 → 在本单元卡里不露脸，但要在目标单元的卡里出现，否则老师两边都找不到。 */
+    const incomingByUnit = {};
+    qs.forEach(function (q) {
+      const qus = qUnitsOf(q);
+      qPointsOf(q).forEach(function (p) {
+        const meta = (S.cache.pointsByName || {})[p.name] || { name: p.name, subject: q.subject, grade: q.grade };
+        const pu = pointUnitOf(meta);
+        if (!pu || qus.indexOf(pu) >= 0) return;
+        const g = incomingByUnit[pu] || (incomingByUnit[pu] = {});
+        const e = g[p.name] || (g[p.name] = { id: p.id, name: p.name, count: 0, from: qus[0] || '未归类' });
+        e.count++;
+      });
+    });
     let units = Object.keys(byUnit);
     if (b.subject !== '全部') {
       const def = S.defaults;
@@ -4990,13 +5004,24 @@
       units = cat.filter(u => byUnit[u]).concat(units.filter(u => cat.indexOf(u) < 0 && u !== '未归类'));
       if (byUnit['未归类']) units.push('未归类');
     }
+    // 有些单元本机一道题都没有，但名里点名它的考点要显示出来 → 把这类单元也补上，再按教材目录重排一次
+    Object.keys(incomingByUnit).forEach(function (u) { if (units.indexOf(u) < 0) units.push(u); });
+    if (b.subject !== '全部') {
+      const def = S.defaults;
+      const cat = Catalog.get(b.subject, b.grade === '全部' ? def.grade : b.grade, def.term, def.version);
+      const ord = function (x) {
+        const i = cat.indexOf(x);
+        return i >= 0 ? i : (x === '未归类' ? 999 : 998);
+      };
+      units.sort(function (x, y) { return ord(x) - ord(y); });
+    }
     if (!units.length) {
       return '<div class="empty"><b>题库还是空的</b>去拍一张练习册吧</div>' +
         '<button class="btn primary block" data-act="cap:start">拍照录题</button>';
     }
 
     return units.map(function (u) {
-      const list = byUnit[u];
+      const list = byUnit[u] || [];
       // 课时（单元下的再分类）：点了某课时只列该课时的考点，不点默认列全部考点
       // v1.30.0：可以一次选多个课时（批量多选），已选的排在标签最前面
       S.bank.lessonSel = S.bank.lessonSel || {};
@@ -5062,11 +5087,24 @@
           '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div></div>' +
           '<span class="li-n">' + p.count + '</span>' + ARROW + '</div>';
       });
+      /* v1.33.0：名字点名本单元、题却归档在别的单元 → 在本单元卡里补一行（点了能看这几道题），
+         已经在本单元有题的考点不重复列 */
+      const incomingRows = Object.keys(incomingByUnit[u] || {}).filter(function (n) {
+        return !pointRows.some(function (p) { return p.name === n; });
+      }).sort(function (a, b) { return a.localeCompare(b, 'zh'); }).map(function (n) {
+        const p = incomingByUnit[u][n];
+        return '<div class="list-item" data-act="goto" data-to="point" data-id="' + (p.id || '') + '" data-lp="point" data-name="' + esc(p.name) +
+          '" data-unit="' + esc(u) + '">' +
+          '<div class="li-main"><div class="li-t">' + esc(p.name) + '</div>' +
+          '<div class="li-s">题归档在「' + esc(p.from) + '」· 按考点名归入本单元</div></div>' +
+          '<span class="li-n">' + p.count + '</span>' + ARROW + '</div>';
+      });
+      const allRows = rows.concat(incomingRows);
       // 考点多的时候只露 5 行，剩下的上下拖动看（省得把整页撑长、翻单元卡要翻很久）
-      const rowsHtml = rows.length > 5
-        ? '<div class="unit-points">' + rows.join('') + '</div>' +
-          '<p class="muted" style="margin:6px 4px 0;font-size:11.5px">共 ' + rows.length + ' 个考点 · 长按考点可批量合并 / 删除（只动本单元）</p>'
-        : rows.join('') + (rows.length ? '<p class="muted" style="margin:6px 4px 0;font-size:11.5px">长按考点可批量合并 / 删除（只动本单元）</p>' : '');
+      const rowsHtml = allRows.length > 5
+        ? '<div class="unit-points">' + allRows.join('') + '</div>' +
+          '<p class="muted" style="margin:6px 4px 0;font-size:11.5px">共 ' + allRows.length + ' 个考点 · 长按考点可批量合并 / 删除（只动本单元）</p>'
+        : allRows.join('') + (allRows.length ? '<p class="muted" style="margin:6px 4px 0;font-size:11.5px">长按考点可批量合并 / 删除（只动本单元）</p>' : '');
       const lessonChips = lessonSet.length
         ? '<div class="chips" style="margin:8px 0 2px">' +
             '<button class="tag' + (!lessonSels.length ? ' active' : '') + '" data-act="bank:lesson" data-unit="' + esc(u) + '" data-v="">全部课时</button>' +
@@ -5080,19 +5118,19 @@
       const misfitNames = Object.keys(pointMisfit);
       const misfitHtml = misfitNames.length
         ? '<p class="muted" style="margin:6px 4px 0;font-size:11.5px">另有 ' + misfitNames.length + ' 个考点名里写了别的单元（如「' +
-            esc(misfitNames[0]) + '」），已归到对应单元，不在本单元卡显示；要改就在题卡的考点标签里重选。</p>'
+            esc(misfitNames[0]) + '」），已按考点名归到对应单元的题卡；要改就在题卡的考点标签里重选。</p>'
         : '';
       return '<section class="card">' +
         '<div class="card-h"><h3>' + esc(unitLabelOf(u)) + '</h3>' +
           '<div class="row" style="gap:6px"><span class="muted">' + (lessonSels.length ? effList.length + ' / ' : '') + list.length + ' 题 · ' +
-            Object.keys(byPoint).length + ' 考点' + (lessonSet.length ? ' · ' + lessonSet.length + ' 课时' : '') + '</span>' +
+            allRows.length + ' 考点' + (lessonSet.length ? ' · ' + lessonSet.length + ' 课时' : '') + '</span>' +
           (unassigned
             ? '<button class="btn ghost sm" data-act="bank:lessonAssign" data-unit="' + esc(u) + '">分配课时 ' + unassigned + '</button>'
             : '<button class="btn ghost sm" data-act="bank:lessonAssign" data-unit="' + esc(u) + '">改课时</button>') +
           '<button class="btn ghost sm" data-act="unit:mergePoints" data-unit="' + esc(u) + '">合并考点</button>' +
           '<button class="btn ghost sm" data-act="unit:paper" data-unit="' + esc(u) + '">组单元卷</button></div></div>' +
         lessonChips +
-        (lessonSels.length && !effList.length
+        (lessonSels.length && !effList.length && !incomingRows.length
           ? '<div class="empty" style="padding:14px 0">' + (lessonSels.length > 1 ? '这些课时下' : '这个课时下') + '还没有题目</div>'
           : rowsHtml + misfitHtml) +
       '</section>';
@@ -5193,9 +5231,21 @@
   /** 考点名后缀里点名的单元：「平移对应点距离相等·第1单元」→ 第一单元（v1.32.0） */
   function pointSuffixUnitOf(name, subject, grade) {
     const s = String(name || '');
-    const m = s.match(/·\s*([^·]+)$/);        // 取最后一个 · 后面的部分
-    if (!m) return '';
-    return unitFromPointName(m[1], subject, grade);
+    // 1) 「…·第3单元」：取最后一个 · 后面的部分
+    const m = s.match(/·\s*([^·]+)$/);
+    if (m) {
+      const u = unitFromPointName(m[1], subject, grade);
+      if (u) return u;
+    }
+    /* 2) 「…第3单元 / …第三单元」直接写在名字末尾（不一定带 ·）
+       例：「已知梯形面积求（上＋下）第3单元」→ 第三单元（v1.33.0） */
+    const m2 = s.match(/(?:第)?\s*([0-9０-９一二三四五六七八九十]{1,3})\s*单元\s*[)）】\]]?\s*$/);
+    if (m2) {
+      const cat = Catalog.get(subject || S.defaults.subject, grade || S.defaults.grade, S.defaults.term, S.defaults.version);
+      const n = numFromCn(m2[1]);
+      if (n >= 1 && n <= cat.length) return cat[n - 1];
+    }
+    return '';
   }
   function pointUnitOf(p) {
     if (!p) return '';
@@ -11385,7 +11435,7 @@
     dcTrapCount: dcTrapCount, dcTrapGen: dcTrapGen, dcFitGrade: dcFitGrade, dcDiffDesc: dcDiffDesc,
     editDraftImage: editDraftImage, dcStudentHtml: dcStudentHtml,
     sortPointsAlike: sortPointsAlike, junkPointName: junkPointName, pointUnitIdxOf: pointUnitIdxOf,
-    unitFromPointName: unitFromPointName, pointUnitOf: pointUnitOf, unitIdxOf: unitIdxOf,
+    unitFromPointName: unitFromPointName, pointUnitOf: pointUnitOf, pointSuffixUnitOf: pointSuffixUnitOf, unitIdxOf: unitIdxOf,
     pointMgrSheet: pointMgrSheet, pointMgrBase: pointMgrBase, pointMgrRows: pointMgrRows, pmPaintSelection: pmPaintSelection,
     isPhoneUi: isPhoneUi, pointPickDraw: pointPickDraw,
     DCALC_TRAPS: DCALC_TRAPS, DCALC_GROUP: DCALC_GROUP, dcKindListHtml: dcKindListHtml,
