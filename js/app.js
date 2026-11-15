@@ -1788,6 +1788,23 @@
       });
     },
 
+    /** 多选一（2~4 个按钮）：opts: [{label, value, kind:'primary'|'ghost'}]，返回 value 或 null */
+    choose(o) {
+      o = o || {};
+      return new Promise(function (resolve) {
+        UI._resolve = resolve;
+        UI._pickOpts = o.opts || [];
+        UI.sheet({
+          title: o.title || '请选择',
+          body: '<p style="font-size:14px;line-height:1.75;color:var(--ink-2);margin-bottom:14px;white-space:pre-wrap">' + esc(o.text || '') + '</p>' +
+            (o.opts || []).map(function (op, i) {
+              return '<button class="btn ' + (op.kind === 'primary' ? 'primary' : 'ghost') + ' block' +
+                (i ? ' mt8' : '') + '" data-act="dlg:pick" data-v="' + i + '">' + esc(op.label) + '</button>';
+            }).join('')
+        });
+      });
+    },
+
     prompt(opts) {
       return new Promise(function (resolve) {
         UI._resolve = resolve;
@@ -3253,6 +3270,11 @@
   function syncStatusHtml() {
     const cs = window.CloudSync;
     if (!cs) return '<p class="muted">同步组件没加载</p>';
+    if (localStorage.getItem('tiku.nosync') === '1') {
+      return '<p class="small" style="color:var(--ink-3);line-height:1.7;margin:0 0 8px">' +
+        '云同步已关闭：题库不再读写云数据库，<b>不消耗云资源</b>。<br>' +
+        '手机和电脑之间改用下面「备份本机数据到电脑 / 从电脑恢复」「生成数据码」「导出 JSON」手动搬题。</p>';
+    }
     if (!cs.originOk()) {
       return '<p class="small" style="color:var(--warn);line-height:1.7;margin:0 0 8px">' +
         '自动同步需要联网、并从线上地址打开题库（当前是从本地文件打开的，浏览器不允许跨域请求）。<br>' +
@@ -3745,15 +3767,30 @@
         if (im.redAns && im.redAns.found && im.redAns.text) redLines.push(im.redAns.text);
       });
       const redFilled = S.drafts.filter(function (d) { return d.answerFromRed; }).length;
+      const redFromTable = !!(s.images || []).some(function (im) { return im.redAns && im.redAns.fromTable; });
       const redCard = redLines.length
         ? '<section class="card" style="border-left:3px solid #e5484d;margin-bottom:10px">' +
-            '<div class="card-h"><h3>🔍 识别到红笔标记</h3>' +
+            '<div class="card-h"><h3>' + (redFromTable ? '📋 文档里的答案（不是配图）' : '🔍 识别到红笔标记') + '</h3>' +
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:copyRed">复制</button></div>' +
             '<p class="small muted">' + (redFilled
               ? '已按位置把最可能的红笔答案填到 <b>' + redFilled + ' 道题</b>的答案框（带「✍ 红笔」标记），请逐题核对修改；没填的题就是没识别出来，直接手填即可。'
-              : '一般红笔写的是答案，但这次没对上具体题目（手写识别仅供参考），请核对后填到各题的答案框：') + '</p>' +
+              : (redFromTable
+                ? '文档里的答案表只保留成文字（<b>不再转成图片占配图</b>），请对照着填到各题答案框：'
+                : '一般红笔写的是答案，但这次没对上具体题目（手写识别仅供参考），请核对后填到各题的答案框：')) + '</p>' +
             '<p style="white-space:pre-wrap;font-size:14px;font-weight:600;color:#b3261e;margin-top:6px">' + esc(redLines.join('\n')) + '</p>' +
           '</section>'
+        : '';
+
+      // 查重提示（v1.25.1）：部分题题库里已有 → 顶部提示，可一键移除
+      const dupN = S.dupNote ? S.dupNote.n : S.drafts.filter(function (d) { return d.dup; }).length;
+      const dupCard = dupN
+        ? '<section class="card flat" style="background:var(--warn-soft);border-color:#ffe3b8;margin-bottom:10px">' +
+            '<p class="small" style="color:#8a5300;margin:0 0 8px">⚠ 这 ' + S.drafts.length + ' 道题里，有 <b>' + dupN +
+              ' 道</b>题库里已经有了（题干完全一样），入库会变成重复题。</p>' +
+            '<div class="row" style="gap:8px">' +
+              '<button class="btn soft sm grow" data-act="confirm:dropDup">移除这 ' + dupN + ' 道</button>' +
+              '<button class="btn ghost sm grow" data-act="confirm:keepDup">都保留</button>' +
+            '</div></section>'
         : '';
 
       let cards = S.drafts.map(function (d, i) {
@@ -3831,6 +3868,7 @@
           '<select class="select" data-change="confirm:grade" style="flex:1">' + gradeOpts + '</select>' +
         '</div>' +
         redCard +
+        dupCard +
         '<section class="card">' +
           '<div class="card-h"><h3>归入章节</h3>' +
             '<span class="row" style="gap:10px">' +
@@ -4859,6 +4897,12 @@
         '</section>' +
         '<section class="card">' +
           '<div class="card-h"><h3>自动同步（只同步文字，不同步配图）</h3></div>' +
+          '<div class="row between" style="margin-bottom:8px">' +
+            '<span class="small" style="font-weight:600">关闭云同步（不占云资源）</span>' +
+            '<label class="switch"><input type="checkbox" id="syncOff"' +
+              (localStorage.getItem('tiku.nosync') === '1' ? ' checked' : '') +
+              ' data-change="sync:toggle"></label>' +
+          '</div>' +
           syncStatusHtml() +
           '<button class="btn ghost block" data-act="sync:now">立即同步一次</button>' +
           '<button class="btn ghost block mt8" data-act="sync:diag">🩺 同步自检（卡在哪一步）</button>' +
@@ -5304,6 +5348,55 @@
     return String(s || '').replace(/\s+/g, '').replace(/[，。；：、,.;:！？!?"'“”‘’（）()【】\[\]…—\-_]/g, '').toLowerCase();
   }
 
+  /* ---------- 查重（v1.25.1）：只看题目本身，不看练习名/文件名 ---------- */
+  /** 查重用的题干键：去掉【图N】标记、题号前缀、全部空白与标点 */
+  function dupKeyOf(t) {
+    return normCmpText(String(t || '')
+      .replace(/【图\d+】/g, '')
+      .replace(/^\s*\d{1,2}\s*[.、．)）]\s*/, ''));
+  }
+
+  /** 这批草稿里，哪些题的题干在题库中已有（完全一样），批内互相重复也算重复 */
+  async function dupDraftsOf(drafts) {
+    const all = await Store.Questions.list({});
+    const seen = {};
+    all.forEach(function (q) {
+      const k = dupKeyOf(q.text);
+      if (k) seen[k] = 1;
+    });
+    const hit = [], fresh = [];
+    (drafts || []).forEach(function (d) {
+      const k = dupKeyOf(d.text);
+      if (k && seen[k]) { hit.push(d); return; }
+      if (k) seen[k] = 1;          // 同一批里第二道一样的题也算重复
+      fresh.push(d);
+    });
+    return { hit: hit, fresh: fresh, total: (drafts || []).length };
+  }
+
+  /** 全部重复时的询问（返回 true = 仍然导入） */
+  async function askAllDup(n) {
+    return await UI.choose({
+      title: '这些题题库里已经都有了',
+      text: '这 ' + n + ' 道题的题干和题库里已有的题完全一样（不看练习名，只看题目），再导入就会变成两份重复的题。\n\n要怎么办？',
+      opts: [
+        { label: '不导入了（推荐）', value: 'no', kind: 'primary' },
+        { label: '仍然导入一份', value: 'yes' }
+      ]
+    }) === 'yes';
+  }
+
+  /** 入库前查重：全重复就拦一下；部分重复只在确认页顶部提示，可一键移除 */
+  async function gateDuplicates() {
+    const r = await dupDraftsOf(S.drafts);
+    S.dupNote = null;
+    if (!r.hit.length) return true;
+    if (r.hit.length === r.total) return await askAllDup(r.total);
+    r.hit.forEach(function (d) { d.dup = true; });
+    S.dupNote = { n: r.hit.length, total: r.total };
+    return true;
+  }
+
   /** 红笔答案 → 每题：红色字一般写在题目附近，按图片里的行位置归到它上面最近的那道题。
    *  返回 { 题目下标: 答案文本 }；没有位置信息时按顺序均分兜底。 */
   function assignRedAnswers(im, items) {
@@ -5457,6 +5550,13 @@
     }
 
     buildDrafts();
+    // v1.25.1：入库前按题目查重（不看练习名）；全重复会先问一句
+    if (!(await gateDuplicates())) {
+      UI.toast('已取消，没有导入（题库里已经是这些题）', 2600);
+      clearSession();
+      await navigate('home');
+      return;
+    }
     s.stage = 'confirm';
     await render();
     await classifyDrafts();
@@ -6379,6 +6479,14 @@
     'sheet:close': function () { UI.close(); },
     'dlg:no': function () { UI.close(); const r = UI._resolve; UI._resolve = null; if (r) r(null); },
     'dlg:yes': function () { UI.close(); const r = UI._resolve; UI._resolve = null; if (r) r(true); },
+    'dlg:pick': function (d) {
+      const opts = UI._pickOpts || [];
+      const op = opts[+d.v];
+      UI.close();
+      const r = UI._resolve;
+      UI._resolve = null; UI._pickOpts = null;
+      if (r) r(op ? op.value : null);
+    },
     'dlg:ok': function () {
       const el = document.getElementById('dlgInput');
       const v = el ? el.value : '';
@@ -7619,6 +7727,21 @@
       });
       const ok = await copyText(lines.join('\n'));
       UI.toast(ok ? '已复制，可粘贴到各题答案框' : '复制失败，请手动选择文字复制');
+    },
+
+    /* 查重提示：一键移除题库里已有的题 / 都保留 */
+    'confirm:dropDup': function () {
+      const before = S.drafts.length;
+      S.drafts = S.drafts.filter(function (d) { return !d.dup; });
+      S.dupNote = null;
+      S._scrollAnchor = null;
+      UI.toast('已移除 ' + (before - S.drafts.length) + ' 道重复题', 2400);
+      render();
+    },
+    'confirm:keepDup': function () {
+      S.drafts.forEach(function (d) { d.dup = false; });
+      S.dupNote = null;
+      render();
     },
 
     'confirm:addUnit': async function () {
@@ -9384,6 +9507,16 @@
       render();
     } else if (key === 'settings:llm') {
       CONFIG.llm.enabled = el.checked;
+    } else if (key === 'sync:toggle') {
+      try {
+        if (el.checked) localStorage.setItem('tiku.nosync', '1');
+        else localStorage.removeItem('tiku.nosync');
+      } catch (e) {}
+      S.syncMsg = '';
+      S.syncErr = '';
+      if (!el.checked) scheduleSyncPush(600);
+      UI.toast(el.checked ? '已关闭云同步，不再读写云数据库（改用下方手动同步）' : '已开启云同步', 3000);
+      render();
     }
   });
 
@@ -9403,12 +9536,6 @@
     e.target.value = '';
     if (!files.length) return;
     const file = files[0];
-    // 同一份练习再传一次：先问一句
-    const fp = await fileFingerprint(file);
-    if (findImport(fp)) {
-      const go = await askReimport([fp], file.name);
-      if (!go) { UI.toast('已取消，没有重复导入', 2400); return; }
-    }
     UI.toast('正在解析 ' + file.name + ' …', 4000);
     try {
       const res = DocParse.extractDoc
@@ -9417,12 +9544,6 @@
       const text = OCR.tidy ? OCR.tidy(res.text) : res.text;
       if (!text.trim()) {
         throw new Error('没有解析出文字。扫描版 PDF（图片型）无法提取文字，请回到首页用拍照录入');
-      }
-      // 内容指纹：同一份练习换了文件名/格式（docx→pdf）也能认出来
-      const tfp = textFingerprint(text);
-      if (tfp && findImport(tfp) && !findImport(fp)) {
-        const go2 = await askReimport([tfp], file.name);
-        if (!go2) { UI.toast('已取消，没有重复导入', 2400); return; }
       }
       const s = ensureSession();
       s.images.forEach(im => URL.revokeObjectURL(im.url));
@@ -9436,11 +9557,22 @@
         }
         if (reds.length) s.images[0].redAns = { found: true, text: reds.join('\n') };
       }
+      // 答案表（v1.25.1）：表格里是答案的，不再转成图片占配图，答案文字并到红笔答案卡里
+      if (res.answers && res.answers.length) {
+        const prev = (s.images[0].redAns && s.images[0].redAns.text) || '';
+        s.images[0].redAns = { found: true, fromTable: true,
+          text: (prev ? prev + '\n' : '') + res.answers.join('\n') };
+      }
       if (!s.batchName) s.batchName = file.name.replace(/\.[a-z0-9]+$/i, '');
       buildDrafts();
-      // 记下来，下次传同一份练习会提醒
-      noteImport(fp, file.name, S.drafts.length);
-      if (tfp) noteImport(tfp, file.name, S.drafts.length);
+      // v1.25.1：查重只看题目本身（题干完全一样），不看练习名/文件名
+      const keep = await gateDuplicates();
+      if (!keep) {
+        UI.toast('已取消，没有导入（题库里已经是这些题）', 2600);
+        clearSession();
+        await navigate('home');
+        return;
+      }
       const imgN = (res.images || []).length;
       const draftImgN = S.drafts.reduce(function (n, d) { return n + (d.images || []).length; }, 0);
       if (res.warn) UI.toast(res.warn, 6000);
@@ -9520,6 +9652,7 @@
     PracticeTypes: PracticeTypes,
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
     buildSyncPayload: buildSyncPayload, applySyncDoc: applySyncDoc, openQTextLight: openQTextLight,
+    dupKeyOf: dupKeyOf, dupDraftsOf: dupDraftsOf, gateDuplicates: gateDuplicates,
     usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,
     lessonChipsHtml: lessonChipsHtml, sweepLostImages: sweepLostImages,
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,

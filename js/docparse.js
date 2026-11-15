@@ -259,9 +259,12 @@ const DocParse = (function () {
     walk(doc.body);
 
     const out = [];
+    const answers = [];
     for (const ln of lines) {
       if (typeof ln === 'string') { out.push(ln); continue; }
       if (!ln || !ln.tbl) continue;
+      // 答案表（v1.25.1）：答案/参考答案表不转图（否则答案变成图片占配图），只收成文字
+      if (looksAnswerTable(ln.tbl)) { answers.push(tableToText(ln.tbl)); continue; }
       const src = await tableToImage(ln.tbl);
       if (src) {
         images.push(src);
@@ -272,7 +275,20 @@ const DocParse = (function () {
       }
     }
     const text = out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    return { text: text, images: images };
+    return { text: text, images: images, answers: answers };
+  }
+
+  /** 这张表是不是「答案表」（答案 / 参考答案 / 答案与解析 / 口算答案） */
+  function looksAnswerTable(tbl) {
+    try {
+      const t = String((tbl && tbl.textContent) || '').replace(/\s+/g, '');
+      if (!t) return false;
+      if (!/答案|参考答案|答案与解析|口算答案/.test(t)) return false;
+      // 题干里的「答案」多半是「答案填在括号里」之类，只有表头/首格出现才算答案表
+      const head = Array.from(tbl.querySelectorAll('tr')).slice(0, 2)
+        .map(function (tr) { return String(tr.textContent || '').replace(/\s+/g, ''); }).join('|');
+      return /答案/.test(head);
+    } catch (e) { return false; }
   }
 
   /** 表格转文字（仅在转图失败时兜底） */
@@ -343,5 +359,6 @@ const DocParse = (function () {
     }
   }
 
-  return { extract: extract, extractDoc: extractDoc, htmlToDoc: htmlToDoc, tableToImage: tableToImage };
+  return { extract: extract, extractDoc: extractDoc, htmlToDoc: htmlToDoc, tableToImage: tableToImage,
+    looksAnswerTable: looksAnswerTable };
 })();
