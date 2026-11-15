@@ -260,11 +260,17 @@ const DocParse = (function () {
 
     const out = [];
     const answers = [];
+    const answerBlocks = [];
     for (const ln of lines) {
       if (typeof ln === 'string') { out.push(ln); continue; }
       if (!ln || !ln.tbl) continue;
-      // 答案表（v1.25.1）：答案/参考答案表不转图（否则答案变成图片占配图），只收成文字
-      if (looksAnswerTable(ln.tbl)) { answers.push(tableToText(ln.tbl)); continue; }
+      // 答案表（v1.25.2）：不转图（否则答案变成图片占配图），按题号解析后逐题回填答案框
+      if (looksAnswerTable(ln.tbl)) {
+        const at = parseAnswerTable(ln.tbl);
+        answers.push(at.text);
+        answerBlocks.push(at.map);
+        continue;
+      }
       const src = await tableToImage(ln.tbl);
       if (src) {
         images.push(src);
@@ -275,7 +281,85 @@ const DocParse = (function () {
       }
     }
     const text = out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    return { text: text, images: images, answers: answers };
+    return { text: text, images: images, answers: answers, answerBlocks: answerBlocks };
+  }
+
+  /** 表格 → 二维文字 */
+  function tableRows(tbl) {
+    try {
+      return Array.from(tbl.querySelectorAll('tr')).map(function (tr) {
+        return Array.from(tr.querySelectorAll('th,td')).map(function (c) {
+          return String(c.textContent || '').replace(/\s+/g, ' ').trim();
+        });
+      }).filter(function (r) { return r.length; });
+    } catch (e) { return []; }
+  }
+
+  /** 「1.A 2.B 3.C」这类连写答案：逐组拆开 */
+  function scanPairs(str, map) {
+    String(str || '').split(/\n+/).forEach(function (line) {
+      line.split(/\s+(?=\d{1,3}\s*[.、．,，:：)）])/).forEach(function (p) {
+        const m = String(p).match(/^\s*(\d{1,3})\s*[.、．,，:：)）]?\s*(\S[\s\S]*)$/);
+        if (!m) return;
+        const a = String(m[2]).replace(/\s*\|[\s\S]*$/, '').trim();
+        const n = parseInt(m[1], 10);
+        if (a && n && !map[n]) map[n] = a;
+      });
+    });
+    return map;
+  }
+
+  /** 答案表 → { map: {题号: 答案}, text }；认不出题号时 map 为空，只留 text 兜底 */
+  function parseAnswerTable(tbl) {
+    const rows = tableRows(tbl);
+    const text = rows.map(function (r) { return r.join(' | '); }).join('\n');
+    const map = {};
+    if (!rows.length) return { map: map, text: text };
+    const isNo = function (s) { return /^\d{1,3}$/.test(String(s).replace(/\s/g, '')); };
+
+    // 1) 横排：表头一行多个题号，紧接一行首格是「答案」
+    for (let h = 0; h < rows.length - 1; h++) {
+      const head = rows[h], body = rows[h + 1];
+      if (!body || !/答案/.test(body[0] || '')) continue;
+      const cols = [];
+      head.forEach(function (c, i) {
+        const v = String(c).replace(/\s/g, '');
+        if (isNo(v)) cols.push([parseInt(v, 10), i]);
+      });
+      if (cols.length < 2) continue;
+      cols.forEach(function (p) {
+        const a = String(body[p[1]] == null ? '' : body[p[1]]).trim();
+        if (a) map[p[0]] = a;
+      });
+      if (Object.keys(map).length) return { map: map, text: text };
+    }
+
+    // 2) 竖排：一行一个题号（含「题号 | 答案 | 解析」三列的情况）
+    rows.forEach(function (r) {
+      if (!r || r.length < 2) return;
+      const k = String(r[0]).replace(/\s/g, '');
+      if (/题号|序号|答案|解析|题目|得分/.test(k)) return;
+      const rg = k.match(/^(\d{1,3})[-–—~～](\d{1,3})$/);
+      if (rg) {
+        const a1 = parseInt(rg[1], 10), a2 = parseInt(rg[2], 10);
+        const raw = String(r[1] || '').trim();
+        const flat = raw.replace(/\s/g, '');
+        if (a2 >= a1 && flat && flat.length === a2 - a1 + 1) {
+          for (let n = a1; n <= a2; n++) map[n] = flat[n - a1];
+        } else if (raw) {
+          map[a1] = raw;
+        }
+        return;
+      }
+      if (!isNo(k)) return;
+      const a = String(r[1] || '').trim();
+      if (a) map[parseInt(k, 10)] = a;
+    });
+    if (Object.keys(map).length) return { map: map, text: text };
+
+    // 3) 兜底：整表文字里找「1.A 2.B」「1、A」这种
+    scanPairs(text, map);
+    return { map: map, text: text };
   }
 
   /** 这张表是不是「答案表」（答案 / 参考答案 / 答案与解析 / 口算答案） */
@@ -360,5 +444,5 @@ const DocParse = (function () {
   }
 
   return { extract: extract, extractDoc: extractDoc, htmlToDoc: htmlToDoc, tableToImage: tableToImage,
-    looksAnswerTable: looksAnswerTable };
+    looksAnswerTable: looksAnswerTable, parseAnswerTable: parseAnswerTable };
 })();

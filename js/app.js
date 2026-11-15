@@ -3767,18 +3767,32 @@
         if (im.redAns && im.redAns.found && im.redAns.text) redLines.push(im.redAns.text);
       });
       const redFilled = S.drafts.filter(function (d) { return d.answerFromRed; }).length;
-      const redFromTable = !!(s.images || []).some(function (im) { return im.redAns && im.redAns.fromTable; });
       const redCard = redLines.length
         ? '<section class="card" style="border-left:3px solid #e5484d;margin-bottom:10px">' +
-            '<div class="card-h"><h3>' + (redFromTable ? '📋 文档里的答案（不是配图）' : '🔍 识别到红笔标记') + '</h3>' +
+            '<div class="card-h"><h3>🔍 识别到红笔标记</h3>' +
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:copyRed">复制</button></div>' +
             '<p class="small muted">' + (redFilled
               ? '已按位置把最可能的红笔答案填到 <b>' + redFilled + ' 道题</b>的答案框（带「✍ 红笔」标记），请逐题核对修改；没填的题就是没识别出来，直接手填即可。'
-              : (redFromTable
-                ? '文档里的答案表只保留成文字（<b>不再转成图片占配图</b>），请对照着填到各题答案框：'
-                : '一般红笔写的是答案，但这次没对上具体题目（手写识别仅供参考），请核对后填到各题的答案框：')) + '</p>' +
-            '<p style="white-space:pre-wrap;font-size:14px;font-weight:600;color:#b3261e;margin-top:6px">' + esc(redLines.join('\n')) + '</p>' +
+              : '一般红笔写的是答案，但这次没对上具体题目（手写识别仅供参考），请核对后填到各题的答案框：') + '</p>' +
+            (redFilled ? '' : '<p style="white-space:pre-wrap;font-size:14px;font-weight:600;color:#b3261e;margin-top:6px">' + esc(redLines.join('\n')) + '</p>') +
           '</section>'
+        : '';
+
+      // 文档答案表（v1.25.2）：已按题号填进各题答案框；只有对不上的才在这里列出来
+      const docFilled = S.drafts.filter(function (d) { return d.answerFromDoc; }).length;
+      const docLeft = S.docAnsLeft || [];
+      const docAnsCard = docFilled
+        ? '<p class="small" style="color:var(--ink-3);margin:-2px 0 10px">📋 文档答案表已按题号填到各题答案框（共 <b>' + docFilled +
+            '</b> 题，带「📋 文档答案」标记），请逐题核对；不对的题点答案框直接改。</p>'
+        : '';
+      const docLeftCard = docLeft.length
+        ? '<details class="card flat" style="margin-bottom:10px;padding:10px 12px">' +
+            '<summary class="small" style="color:var(--ink-2);cursor:pointer">⚠ 有 ' + docLeft.length +
+              ' 条答案没对上题号（点开看，可复制后手填）</summary>' +
+            '<div class="row" style="gap:8px;margin-top:8px"><button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:copyDocLeft">复制</button></div>' +
+            '<p style="white-space:pre-wrap;font-size:13px;color:var(--ink-2);margin-top:6px">' +
+              esc(docLeft.map(function (x) { return x.no + '. ' + x.ans; }).join('\n')) + '</p>' +
+          '</details>'
         : '';
 
       // 查重提示（v1.25.1）：部分题题库里已有 → 顶部提示，可一键移除
@@ -3802,7 +3816,8 @@
               ? '<span class="chip warn tap" data-act="draft:pointOk" data-i="' + i + '" title="点一下＝这个考点没问题，确认掉">待确认 ✓</span>'
               : '<span class="chip warn">待确认</span>')
           : '';
-        const chipRed = d.answerFromRed ? '<span class="chip gray">✍ 红笔</span>' : '';
+        const chipRed = (d.answerFromRed ? '<span class="chip gray">✍ 红笔</span>' : '') +
+          (d.answerFromDoc ? '<span class="chip gray">📋 文档答案</span>' : '');
         // 复习章节（v1.22.0）：每道题显示/选择自己复习自哪个单元，可多选
         const rvUs = draftReviewUnits(d);
         const chipReview = isReviewUnit(s.unit)
@@ -3835,7 +3850,7 @@
                   '<button class="btn primary grow" data-act="draft:inlineSave" data-i="' + i + '">完成</button>' +
                 '</div></div>'
             : '<p class="qtext tap" data-act="draft:inlineEdit" data-i="' + i + '" title="点一下直接改题干">' + esc(body) + '</p>') +
-          '<div class="field mt8" style="margin-bottom:0"><label>答案（选填' + (d.answerFromRed ? ' · 红笔识别，请核对' : '') + '）</label>' +
+          '<div class="field mt8" style="margin-bottom:0"><label>答案（选填' + (d.answerFromRed ? ' · 红笔识别，请核对' : '') + (d.answerFromDoc ? ' · 文档答案表，请核对' : '') + '）</label>' +
             '<input class="input" data-draft-ans="' + i + '" value="' + esc(d.answer || '') + '" placeholder="可留空，入库后随时补"></div>' +
           (d.images && d.images.length
             ? imgGridHtml(d.images, { del: 'draft:rimg', i: i }) +
@@ -3868,6 +3883,8 @@
           '<select class="select" data-change="confirm:grade" style="flex:1">' + gradeOpts + '</select>' +
         '</div>' +
         redCard +
+        docAnsCard +
+        docLeftCard +
         dupCard +
         '<section class="card">' +
           '<div class="card-h"><h3>归入章节</h3>' +
@@ -5090,7 +5107,7 @@
       S.session = {
         images: [], subject: S.defaults.subject, grade: S.defaults.grade,
         unit: '', lesson: '', batchName: '', batchDate: '', stage: 'pick',
-        practiceType: '', pageNo: ''
+        practiceType: '', pageNo: '', docAnsBlocks: []
       };
     }
     return S.session;
@@ -5224,6 +5241,7 @@
     S.session = null;
     S.drafts = [];
     S.aiFallback = '';
+    S.docAnsLeft = [];
   }
 
   function defaultBatchName() {
@@ -5444,6 +5462,69 @@
     return out;
   }
 
+  /** 文档答案表 → 逐题回填答案框（v1.25.2）
+   *  优先按题号对；题号重复（分大题各自从 1 编）或对不上时按顺序填。
+   *  已有答案的题不覆盖。返回 { filled, left:[{no,ans}] } */
+  function applyDocAnswers() {
+    const s = S.session;
+    if (!s) return { filled: 0, left: [] };
+    const blocks = s.docAnsBlocks || [];
+    if (!blocks.length || !S.drafts.length) { S.docAnsLeft = []; return { filled: 0, left: [] }; }
+    const noOf = function (d) {
+      const m = String(d && d.no != null ? d.no : '').match(/\d{1,3}/);
+      return m ? parseInt(m[0], 10) : 0;
+    };
+    let filled = 0;
+    const used = {};
+
+    if (blocks.length === 1) {
+      const map = blocks[0] || {};
+      const keys = Object.keys(map).map(Number).filter(function (n) { return n > 0; }).sort(function (a, b) { return a - b; });
+      if (!keys.length) { S.docAnsLeft = []; return { filled: 0, left: [] }; }
+      const nos = S.drafts.map(noOf);
+      const pos = nos.filter(function (n) { return n > 0; });
+      const uniq = new Set(pos).size === pos.length;
+      let byNo = 0;
+      nos.forEach(function (n) { if (n && map[n]) byNo++; });
+      // 题号可信（不重复且能对上大半）就按题号；否则按顺序
+      if (uniq && byNo >= Math.max(1, Math.min(pos.length, keys.length) * 0.8)) {
+        S.drafts.forEach(function (d) {
+          const n = noOf(d);
+          const a = n ? map[n] : '';
+          if (a && !String(d.answer || '').trim()) {
+            d.answer = a; d.answerFromDoc = true; filled++; used[n] = 1;
+          } else if (a) { used[n] = 1; }
+        });
+      } else {
+        const seq = keys.map(function (k) { return { no: k, ans: map[k] }; });
+        seq.forEach(function (it, i) {
+          const d = S.drafts[i];
+          if (!d) return;
+          if (!String(d.answer || '').trim()) {
+            d.answer = it.ans; d.answerFromDoc = true; filled++; used[it.no] = 1;
+          } else used[it.no] = 1;
+        });
+      }
+      // 没用上的答案：留着给老师看（可能题号对不上）
+      S.docAnsLeft = keys.filter(function (k) { return !used[k]; }).map(function (k) { return { no: k, ans: map[k] }; });
+      return { filled: filled, left: S.docAnsLeft };
+    }
+
+    // 多张答案表（常见：分大题各自 1 号起）：按出现顺序拉平后顺序填
+    const flat = [];
+    blocks.forEach(function (map) {
+      Object.keys(map).map(Number).filter(function (n) { return n > 0; }).sort(function (a, b) { return a - b; })
+        .forEach(function (k) { flat.push({ no: k, ans: map[k] }); });
+    });
+    flat.forEach(function (it, i) {
+      const d = S.drafts[i];
+      if (!d) return;
+      if (!String(d.answer || '').trim()) { d.answer = it.ans; d.answerFromDoc = true; filled++; }
+    });
+    S.docAnsLeft = flat.slice(S.drafts.length);
+    return { filled: filled, left: S.docAnsLeft };
+  }
+
   function buildDrafts() {
     const s = S.session;
     const drafts = [];
@@ -5498,6 +5579,8 @@
       }
     }
     S.drafts = drafts;
+    // 文档答案表：按题号填进各题答案框（待老师核对），不再集中显示在顶部
+    if (s.docAnsBlocks && s.docAnsBlocks.length) applyDocAnswers();
   }
 
   async function runOCR() {
@@ -6803,6 +6886,7 @@
       draft.subs = []; draft.options = [];
       draft.answer = ((document.getElementById('deAns') || {}).value || '').trim();
       draft.answerFromRed = false;
+      draft.answerFromDoc = false;
       const t = (document.getElementById('deType') || {}).value;
       if (t) draft.type = t;
       const df = Number((document.getElementById('deDiff') || {}).value);
@@ -7726,6 +7810,14 @@
         if (im.redAns && im.redAns.found && im.redAns.text) lines.push(im.redAns.text);
       });
       const ok = await copyText(lines.join('\n'));
+      UI.toast(ok ? '已复制，可粘贴到各题答案框' : '复制失败，请手动选择文字复制');
+    },
+
+    /* 文档答案表里没对上题号的那些答案：复制出来手填 */
+    'confirm:copyDocLeft': async function () {
+      const left = S.docAnsLeft || [];
+      if (!left.length) return;
+      const ok = await copyText(left.map(function (x) { return x.no + '. ' + x.ans; }).join('\n'));
       UI.toast(ok ? '已复制，可粘贴到各题答案框' : '复制失败，请手动选择文字复制');
     },
 
@@ -9557,12 +9649,8 @@
         }
         if (reds.length) s.images[0].redAns = { found: true, text: reds.join('\n') };
       }
-      // 答案表（v1.25.1）：表格里是答案的，不再转成图片占配图，答案文字并到红笔答案卡里
-      if (res.answers && res.answers.length) {
-        const prev = (s.images[0].redAns && s.images[0].redAns.text) || '';
-        s.images[0].redAns = { found: true, fromTable: true,
-          text: (prev ? prev + '\n' : '') + res.answers.join('\n') };
-      }
+      // 答案表（v1.25.2）：不转图片、不集中显示，按题号直接填进各题答案框待核对
+      s.docAnsBlocks = (res.answerBlocks && res.answerBlocks.length) ? res.answerBlocks : [];
       if (!s.batchName) s.batchName = file.name.replace(/\.[a-z0-9]+$/i, '');
       buildDrafts();
       // v1.25.1：查重只看题目本身（题干完全一样），不看练习名/文件名
@@ -9653,6 +9741,7 @@
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
     buildSyncPayload: buildSyncPayload, applySyncDoc: applySyncDoc, openQTextLight: openQTextLight,
     dupKeyOf: dupKeyOf, dupDraftsOf: dupDraftsOf, gateDuplicates: gateDuplicates,
+    applyDocAnswers: applyDocAnswers,
     usedLessonsOf: usedLessonsOf, lessonPickSheet: lessonPickSheet, stripImageMarkers: stripImageMarkers,
     lessonChipsHtml: lessonChipsHtml, sweepLostImages: sweepLostImages,
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
