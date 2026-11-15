@@ -6563,6 +6563,223 @@
     });
   }
 
+  /* =========================================================
+   * 配图构图（v1.26.1）：旋转 90° / 左右·上下镜像 / 拖框裁剪
+   * 图形池、已入库配图里点图就打开，保存后原地替换原图
+   * ======================================================= */
+  let IE = null;   // { src, img, rot, flipH, flipV, onSave }
+
+  function closeImgEditor() {
+    const el = document.getElementById('imgEd');
+    if (el) el.remove();
+    IE = null;
+  }
+
+  /** 打开构图层：src 为 dataURI，onSave(newSrc) 保存回调 */
+  function openImgEditor(src, onSave) {
+    closeImgEditor();
+    const el = document.createElement('div');
+    el.id = 'imgEd';
+    el.className = 'ie';
+    el.innerHTML =
+      '<div class="ie-top">' +
+        '<button class="ie-t" data-ie="cancel">取消</button>' +
+        '<b>构图</b>' +
+        '<button class="ie-t ie-save" data-ie="save">保存</button>' +
+      '</div>' +
+      '<p class="ie-hint">拖白框四角裁出要保留的部分；旋转、镜像可以反复点，最后点「保存」替换原图。</p>' +
+      '<div class="ie-stage"><div class="ie-frame" id="ieFrame">' +
+        '<canvas id="ieCanvas"></canvas>' +
+        '<div class="crop-box" id="ieBox">' +
+          '<span class="h nw" data-h="nw"></span><span class="h ne" data-h="ne"></span>' +
+          '<span class="h sw" data-h="sw"></span><span class="h se" data-h="se"></span>' +
+        '</div>' +
+      '</div></div>' +
+      '<div class="ie-tools">' +
+        '<button data-ie="rl">↺ 左转</button>' +
+        '<button data-ie="rr">↻ 右转</button>' +
+        '<button data-ie="fh">⇋ 左右镜像</button>' +
+        '<button data-ie="fv">⇅ 上下镜像</button>' +
+        '<button data-ie="reset">↺ 还原</button>' +
+      '</div>' +
+      '<div class="ie-foot"><span id="ieInfo">整图</span>' +
+        '<button data-ie="full">选框铺满</button></div>';
+    document.body.appendChild(el);
+
+    IE = { src: src, img: null, rot: 0, flipH: false, flipV: false, onSave: onSave };
+
+    const img = new Image();
+    img.onload = function () {
+      if (!IE) return;
+      IE.img = img;
+      ieRender();
+      ieInitCrop();
+      ieBindCrop();
+    };
+    img.onerror = function () { closeImgEditor(); UI.toast('这张图打不开，无法构图'); };
+    img.src = src;
+
+    el.querySelectorAll('[data-ie]').forEach(function (b) {
+      b.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        const k = b.dataset.ie;
+        if (!IE) return;
+        if (k === 'cancel') { closeImgEditor(); return; }
+        if (k === 'save') { ieSave(); return; }
+        if (!IE.img) return;
+        if (k === 'rl') IE.rot = (IE.rot + 270) % 360;
+        if (k === 'rr') IE.rot = (IE.rot + 90) % 360;
+        if (k === 'fh') IE.flipH = !IE.flipH;
+        if (k === 'fv') IE.flipV = !IE.flipV;
+        if (k === 'full') { ieInitCrop(); return; }
+        if (k === 'reset') { IE.rot = 0; IE.flipH = false; IE.flipV = false; }
+        ieRender();
+        ieInitCrop();     // 转完/镜像后原选框已失去意义，铺满重选
+      });
+    });
+  }
+
+  /** 把「旋转 + 镜像」画进画布（画布就是输出底图，裁剪在其上量） */
+  function ieRender() {
+    if (!IE || !IE.img) return;
+    const img = IE.img, rot = IE.rot;
+    const swap = rot % 180 !== 0;
+    const W = swap ? img.naturalHeight : img.naturalWidth;
+    const H = swap ? img.naturalWidth : img.naturalHeight;
+    const cv = document.getElementById('ieCanvas');
+    if (!cv) return;
+    cv.width = W; cv.height = H;
+    const ctx = cv.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.scale(IE.flipH ? -1 : 1, IE.flipV ? -1 : 1);   // 先镜像再旋转 → 左右/上下按屏幕上看到的来
+    ctx.rotate(rot * Math.PI / 180);
+    ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    ctx.restore();
+
+    // 等比缩到舞台内（自己算尺寸，保证白框和画布严格对齐）
+    const stage = document.querySelector('#imgEd .ie-stage');
+    const aw = Math.max(120, (stage ? stage.clientWidth : window.innerWidth) - 4);
+    const ah = Math.max(120, window.innerHeight - 300);
+    const sc = Math.min(1, aw / W, ah / H);
+    cv.style.width = Math.round(W * sc) + 'px';
+    cv.style.height = Math.round(H * sc) + 'px';
+  }
+
+  /** 选框铺满整图，并更新底部尺寸提示 */
+  function ieInitCrop() {
+    const cv = document.getElementById('ieCanvas');
+    const box = document.getElementById('ieBox');
+    if (!cv || !box) return;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (!w || !h) { requestAnimationFrame(ieInitCrop); return; }
+    box.style.left = '0px'; box.style.top = '0px';
+    box.style.width = w + 'px'; box.style.height = h + 'px';
+    ieInfo();
+  }
+
+  function ieInfo() {
+    const cv = document.getElementById('ieCanvas');
+    const box = document.getElementById('ieBox');
+    const span = document.getElementById('ieInfo');
+    if (!cv || !box || !span) return;
+    const ratio = cv.width / Math.max(1, cv.clientWidth);
+    const w = Math.round(parseFloat(box.style.width || 0) * ratio);
+    const h = Math.round(parseFloat(box.style.height || 0) * ratio);
+    span.textContent = (w && h) ? '输出 ' + w + ' × ' + h : '整图';
+  }
+
+  /** 拖框：拖角改大小、拖框内移动（和白框手势一致） */
+  function ieBindCrop() {
+    const cv = document.getElementById('ieCanvas');
+    const box = document.getElementById('ieBox');
+    if (!cv || !box) return;
+    let mode = null, sx = 0, sy = 0, start = null;
+
+    function rect() {
+      return {
+        left: parseFloat(box.style.left || 0), top: parseFloat(box.style.top || 0),
+        width: parseFloat(box.style.width || 0), height: parseFloat(box.style.height || 0)
+      };
+    }
+
+    box.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      try { box.setPointerCapture(e.pointerId); } catch (err) {}
+      mode = (e.target.dataset && e.target.dataset.h) || 'move';
+      sx = e.clientX; sy = e.clientY; start = rect();
+    });
+
+    box.addEventListener('pointermove', function (e) {
+      if (!mode || !start) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      const W = cv.clientWidth, H = cv.clientHeight;
+      const r = Object.assign({}, start);
+      const MIN = 36;
+      if (mode === 'move') {
+        r.left = Util.clamp(start.left + dx, 0, W - start.width);
+        r.top = Util.clamp(start.top + dy, 0, H - start.height);
+      } else {
+        if (mode.indexOf('w') >= 0) {
+          const nl = Util.clamp(start.left + dx, 0, start.left + start.width - MIN);
+          r.width = start.width + (start.left - nl); r.left = nl;
+        }
+        if (mode.indexOf('e') >= 0) r.width = Util.clamp(start.width + dx, MIN, W - start.left);
+        if (mode.indexOf('n') >= 0) {
+          const nt = Util.clamp(start.top + dy, 0, start.top + start.height - MIN);
+          r.height = start.height + (start.top - nt); r.top = nt;
+        }
+        if (mode.indexOf('s') >= 0) r.height = Util.clamp(start.height + dy, MIN, H - start.top);
+      }
+      box.style.left = Math.round(r.left) + 'px';
+      box.style.top = Math.round(r.top) + 'px';
+      box.style.width = Math.round(r.width) + 'px';
+      box.style.height = Math.round(r.height) + 'px';
+      ieInfo();
+    });
+
+    function end(e) {
+      if (mode) { try { box.releasePointerCapture(e.pointerId); } catch (err) {} }
+      mode = null; start = null;
+    }
+    box.addEventListener('pointerup', end);
+    box.addEventListener('pointercancel', end);
+  }
+
+  /** 导出：把选框区域画到新画布 → dataURI（文字图形优先无损 PNG） */
+  async function ieSave() {
+    if (!IE || !IE.img) return;
+    const cv = document.getElementById('ieCanvas');
+    const box = document.getElementById('ieBox');
+    if (!cv || !box) return;
+    const ratio = cv.width / Math.max(1, cv.clientWidth);
+    const sx = Util.clamp(parseFloat(box.style.left || 0) * ratio, 0, cv.width - 1);
+    const sy = Util.clamp(parseFloat(box.style.top || 0) * ratio, 0, cv.height - 1);
+    const sw = Math.min(parseFloat(box.style.width || 0) * ratio, cv.width - sx);
+    const sh = Math.min(parseFloat(box.style.height || 0) * ratio, cv.height - sy);
+    if (!(sw > 1 && sh > 1)) { UI.toast('选框太小了，请拖大一点'); return; }
+
+    const MAXS = 1600;   // 配图不需要超过 1600px，防止数据太大
+    const k = Math.min(1, MAXS / Math.max(sw, sh));
+    const ow = Math.max(1, Math.round(sw * k));
+    const oh = Math.max(1, Math.round(sh * k));
+    const out = document.createElement('canvas');
+    out.width = ow; out.height = oh;
+    const ctx = out.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, ow, oh);
+    if ('imageSmoothingQuality' in ctx) ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(cv, sx, sy, sw, sh, 0, 0, ow, oh);
+
+    const png = /^data:image\/png/i.test(IE.src) && ow * oh <= 1400 * 1400;
+    let url = '';
+    try { url = out.toDataURL(png ? 'image/png' : 'image/jpeg', 0.92); } catch (e) { url = ''; }
+    if (!url) { UI.toast('保存失败，请重试'); return; }
+    const cb = IE.onSave;
+    closeImgEditor();
+    if (cb) await cb(url);
+  }
+
   /** 确认页图形池弹层：右上角「多选」→ 批量勾选 → 配到本题 / 删除；普通模式单图配到本题 / 删除 */
   function poolOwnerOf(src) {
     let owner = -1;
@@ -6613,15 +6830,16 @@
           '</div>';
       }
       return '<div class="pool-tile' + (onThis ? ' picked' : '') + '">' +
-        '<img src="' + src + '" alt="图形' + (pi + 1) + '">' +
+        '<img src="' + src + '" alt="图形' + (pi + 1) + '" class="pool-edit" data-act="dpi:edit" data-i="' + i + '" data-pi="' + pi + '">' +
         '<span class="pool-tag">' + (onThis ? '✓ 本题' : owner >= 0 ? '第' + (owner + 1) + '题' : '未配置') + '</span>' +
+        '<span class="pool-edit-hint">✎ 构图</span>' +
         '<div class="pool-ops">' +
           '<button data-act="draft:imgToggle" data-i="' + i + '" data-pi="' + pi + '">' + (onThis ? '取消配图' : '配到本题') + '</button>' +
           '<button class="del" data-act="draft:imgDel" data-pi="' + pi + '">删除</button>' +
         '</div></div>';
     }).join('');
     const head = '<div class="row between" style="margin-bottom:8px;align-items:center">' +
-      '<span class="muted">' + (multi ? '多选模式：点图形勾选（再点取消）' : '点右上角「多选」可批量配图 / 批量删除') + '</span>' +
+      '<span class="muted">' + (multi ? '多选模式：点图形勾选（再点取消）' : '点图片可旋转 / 裁剪 / 镜像；右上角「多选」可批量配图') + '</span>' +
       '<button class="small" style="color:var(--brand);font-weight:600" data-act="dpi:mode" data-i="' + i + '">' +
         (multi ? '✕ 退出多选' : '☑ 多选') + '</button></div>';
     const ops = multi
@@ -6674,6 +6892,7 @@
       return '<div class="dimg-item' + (sel[k] ? ' sel-on' : '') + '" data-act="q:imgPick" data-k="' + k + '">' +
         '<span class="dimg-pick' + (sel[k] ? ' on' : '') + '">' + (sel[k] ? '✓' : '') + '</span>' +
         '<img src="' + src + '" alt="题目图形">' +
+        '<button class="dimg-e" data-act="q:imgEdit" data-id="' + q.id + '" data-k="' + k + '" aria-label="旋转裁剪镜像">✎ 构图</button>' +
         '<button class="dimg-x" data-act="q:imgDel" data-id="' + q.id + '" data-k="' + k + '" aria-label="移除图形">✕</button></div>';
     }).join('') || '<div class="empty small" style="padding:14px">这道题还没有图形，点下面按钮添加</div>';
     UI.sheet({
@@ -6681,7 +6900,7 @@
       body: (q.fromSync && !imgs.length
           ? '<p class="small" style="background:var(--warn-soft,#fff7ed);color:#8a5300;border-radius:8px;padding:8px 10px;line-height:1.7;margin-bottom:8px">这道题是从另一台设备自动同步来的，<b>配图不随自动同步走</b>。要看原图：回原来那台设备点「导出数据」，再到这台设备「导入 JSON」把图带过来。</p>'
           : '') +
-        '<p class="muted" data-sheet="imgs" style="margin-bottom:10px">点图片勾选（可多选），再点「删除所选」一次删掉；点右上角 ✕ 只删这一张。删完停在这里，不会跳回题目卡。</p>' +
+        '<p class="muted" data-sheet="imgs" style="margin-bottom:10px">点图片勾选（可多选），再点「删除所选」一次删掉；点 ✎ 构图 可旋转 / 裁剪 / 镜像这张图。删完停在这里，不会跳回题目卡。</p>' +
         '<div>' + list + '</div>' +
         (imgs.length
           ? '<div class="lass-bar">' +
@@ -7494,6 +7713,41 @@
         await render();
       };
       input.click();
+    },
+    /* 图形池：点图打开构图（旋转 / 镜像 / 裁剪），保存后替换池里这一张，已配到题上的同步换 */
+    'dpi:edit': function (d) {
+      const i = +d.i, pi = +d.pi;
+      const s = S.session;
+      const src = s && s.imgPool ? s.imgPool[pi] : '';
+      if (!src) return;
+      openImgEditor(src, async function (next) {
+        s.imgPool[pi] = next;
+        S.drafts.forEach(function (dd) {
+          dd.images = (dd.images || []).map(function (x) { return x === src ? next : x; });
+        });
+        UI.toast('已应用构图');
+        openPoolSheet(i);
+        await render();
+      });
+    },
+    /* 已入库题目：单张配图构图，保存后替换并可用顶栏 ↶ 撤销 */
+    'q:imgEdit': async function (d) {
+      const k = +d.k;
+      const q = await DB.get('questions', d.id);
+      if (!q || !q.images || !q.images[k]) return;
+      const src = q.images[k];
+      openImgEditor(src, async function (next) {
+        const fresh = await DB.get('questions', d.id);
+        if (!fresh || !fresh.images || !fresh.images[k]) return;
+        const before = await Undo.begin([fresh.id]);
+        fresh.images[k] = next;
+        await Store.Questions.update(fresh.id, { images: fresh.images });
+        await Undo.end('配图构图', before);
+        S.imgSel = {};
+        UI.toast('已保存构图（可撤销）', 2200);
+        await refreshQImgsSheet();
+        await render();
+      });
     },
     'draft:imgToggle': async function (d) {
       const i = +d.i, pi = +d.pi;
@@ -10247,7 +10501,8 @@
     Undo: Undo, cnNum: cnNum, unitLabelOf: unitLabelOf, practiceNameOf: practiceNameOf,
     practiceTypeOf: practiceTypeOf, pageNoOf: pageNoOf, matchFilter: matchFilter,
     filterQuestions: filterQuestions, hasFilter: hasFilter, bankFilterSheet: bankFilterSheet,
-    qImgsSheet: qImgsSheet,
+    qImgsSheet: qImgsSheet, openImgEditor: openImgEditor, closeImgEditor: closeImgEditor,
+    imgEditState: function () { return IE ? { rot: IE.rot, flipH: IE.flipH, flipV: IE.flipV, src: IE.src } : null; },
     imgGridHtml: imgGridHtml, openImgLight: openImgLight,
     fileFingerprint: fileFingerprint, textFingerprint: textFingerprint,
     findImport: findImport, noteImport: noteImport, saveQSolution: saveQSolution };

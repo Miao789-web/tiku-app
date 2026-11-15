@@ -935,3 +935,48 @@ body.kb-open .sheet { bottom: 272px; max-height: calc(100vh - 330px); }
   color: var(--warn); background: var(--warn-soft); border-radius: 5px; padding: 0 4px;
 }
 @media print { .kb-fab, .mathkb, .ans-pick { display: none !important; } }
+
+/* ---------------- 配图构图：旋转 / 镜像 / 裁剪（v1.26.1） ---------------- */
+.ie {
+  position: fixed; inset: 0; z-index: 950;
+  background: rgba(8, 12, 20, .95);
+  display: flex; flex-direction: column;
+  padding: calc(8px + var(--safe-b)) 12px calc(10px + var(--safe-b));
+  color: #fff;
+}
+.ie-top { display: flex; align-items: center; justify-content: space-between; padding: 2px 0 8px; flex: none; }
+.ie-top b { font-size: 15.5px; font-weight: 700; }
+.ie-t { font-size: 14px; color: #fff; padding: 6px 8px; }
+.ie-save { color: #8ff0bd; font-weight: 700; }
+.ie-hint { flex: none; font-size: 12px; color: rgba(255,255,255,.62); line-height: 1.6; padding: 0 2px 8px; }
+.ie-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.ie-frame { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
+.ie-frame canvas { display: block; border-radius: 4px; background: #fff; }
+.ie-frame .crop-box { box-shadow: 0 0 0 9999px rgba(9, 12, 22, .58); }
+.ie-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; flex: none; }
+.ie-tools button {
+  flex: 1 0 calc(33.33% - 6px); height: 40px; border-radius: 10px;
+  background: rgba(255,255,255,.12); color: #fff; font-size: 13px; font-weight: 600;
+}
+.ie-tools button:active { background: rgba(255,255,255,.24); }
+.ie-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: 8px; font-size: 12px; color: rgba(255,255,255,.62); flex: none;
+}
+.ie-foot button { height: 32px; padding: 0 12px; border-radius: 8px; background: rgba(255,255,255,.12); color: #fff; font-size: 12.5px; }
+
+/* 图形池：图片可点开构图 */
+.pool-tile .pool-edit { cursor: pointer; }
+.pool-tile .pool-edit-hint {
+  position: absolute; right: 6px; bottom: 40px; pointer-events: none;
+  background: rgba(17,24,39,.62); color: #fff; font-size: 11px; font-weight: 700;
+  padding: 2px 7px; border-radius: 999px;
+}
+.pool-tile.selectable .pool-edit-hint { display: none; }
+/* 已入库配图：构图按钮 */
+.dimg-item .dimg-e {
+  position: absolute; left: 6px; bottom: 6px;
+  height: 26px; padding: 0 9px; border-radius: 999px;
+  background: rgba(17,24,39,.66); color: #fff; font-size: 11.5px; font-weight: 700;
+}
+.dimg-list.grid .dimg-item .dimg-e { height: 22px; font-size: 11px; left: 4px; bottom: 4px; padding: 0 7px; }
