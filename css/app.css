@@ -179,6 +179,8 @@ body[data-tab="off"] .view { padding-bottom: calc(92px + var(--safe-b)); }
   gap: 5px;
 }
 .tag.active { background: var(--brand); border-color: var(--brand); color: #fff; box-shadow: 0 4px 12px rgba(70,97,238,.25); }
+/* v1.34.0：课时多选——没选的是灰色，已选的是深蓝（.active），一眼能分 */
+.tag.off { background: #f2f4f9; border-color: #e6e9f2; color: var(--ink-3); }
 .tag .n { font-size: 11px; opacity: .7; font-weight: 500; }
 
 .field { margin-bottom: 12px; }

@@ -122,20 +122,60 @@ const Store = (function () {
     try { changeHook(); } catch (e) { /* 同步失败不影响本地操作 */ }
   }
 
-  /* 删除记录（只记 id，供另一台设备同步时把同样的题删掉；最多留 300 条） */
+  /* 删除记录（供另一台设备同步时把同样的题/考点删掉）
+   * v1.34.0：带删除时间戳、保留 30 天（原来 push 完就清空 → 另一台设备的旧快照再推上来，
+   * 删掉的考点/题目又「复活」，老师以为删了个假的）。最多留 500 条，超过 30 天的自动丢。 */
   const DEL_KEY = 'tiku.sync.del';
-  function readDeleted() {
-    try { return JSON.parse(localStorage.getItem(DEL_KEY) || '[]'); } catch (e) { return []; }
+  const DELP_KEY = 'tiku.sync.delP';
+  const DEL_KEEP_MS = 30 * 24 * 3600 * 1000;
+
+  function pruneDeletes(list) {
+    const now = Date.now();
+    const seen = {}, out = [];
+    (list || []).forEach(function (e) {
+      const id = typeof e === 'string' ? e : (e && e.id);
+      if (!id || seen[id]) return;
+      const at = typeof e === 'string' ? 0 : (e.at || 0);
+      if (at && now - at > DEL_KEEP_MS) return;
+      seen[id] = 1;
+      out.push({ id: id, key: (e && e.key) || '', at: at });
+    });
+    while (out.length > 500) out.shift();
+    return out;
   }
+  function readDeletedRaw() {
+    try {
+      const a = JSON.parse(localStorage.getItem(DEL_KEY) || '[]');
+      return Array.isArray(a) ? a : [];
+    } catch (e) { return []; }
+  }
+  function readDeleted() { return readDeletedRaw().map(function (e) { return typeof e === 'string' ? e : e.id; }).filter(Boolean); }
+  function readDeletedDetailed() { return pruneDeletes(readDeletedRaw()); }
   function addDeleted(id) {
     if (!id) return;
-    const a = readDeleted();
-    if (a.indexOf(id) < 0) a.push(id);
-    while (a.length > 300) a.shift();
-    try { localStorage.setItem(DEL_KEY, JSON.stringify(a)); } catch (e) {}
+    const a = readDeletedDetailed();
+    if (!a.some(function (e) { return e.id === id; })) a.push({ id: id, at: Date.now() });
+    try { localStorage.setItem(DEL_KEY, JSON.stringify(pruneDeletes(a))); } catch (e) {}
+  }
+  function readDeletedPoints() {
+    try {
+      const a = JSON.parse(localStorage.getItem(DELP_KEY) || '[]');
+      return pruneDeletes(Array.isArray(a) ? a : []);
+    } catch (e) { return []; }
+  }
+  /** 记一条考点墓碑：key = 科目|年级|norm，用于「换台设备后 id 不同但其实是同一个考点」也能拦住 */
+  function addDeletedPoint(p) {
+    if (!p) return;
+    const a = readDeletedPoints();
+    const key = p.key || ((p.subject || '') + '|' + (p.grade || '') + '|' + (p.norm || p.name || ''));
+    const at = p.at || Date.now();
+    if (!a.some(function (e) { return (p.id && e.id === p.id) || (key && e.key === key); })) {
+      a.push({ id: p.id || '', key: key, at: at, name: p.name || '' });
+    }
+    try { localStorage.setItem(DELP_KEY, JSON.stringify(pruneDeletes(a))); } catch (e) {}
   }
   function clearDeletions() {
-    try { localStorage.removeItem(DEL_KEY); } catch (e) {}
+    try { localStorage.removeItem(DEL_KEY); localStorage.removeItem(DELP_KEY); } catch (e) {}
   }
 
   /* ---------- 图片 ---------- */
@@ -344,8 +384,25 @@ const Store = (function () {
       to.aliases = aliases;
       await DB.put('points', to);
       await DB.del('points', fromId);
+      addDeletedPoint(from);
       await this.recount();
+      notifyChange();
       return to;
+    },
+
+    /** 删除考点（可批量）：留墓碑 → 云端和另一台设备都会跟着删，不会再「复活」 v1.34.0 */
+    async remove(ids) {
+      let n = 0;
+      for (const id of [].concat(ids || [])) {
+        if (!id) continue;
+        const p = await DB.get('points', id);
+        if (!p) continue;
+        addDeletedPoint(p);
+        await DB.del('points', id);
+        n++;
+      }
+      if (n) { notifyChange(); }
+      return n;
     },
 
     async removeEmpty() {
@@ -356,7 +413,8 @@ const Store = (function () {
         (q.points || []).forEach(p => { if (p && p.id) used.add(p.id); });
       });
       const dead = points.filter(p => !used.has(p.id));
-      for (const p of dead) await DB.del('points', p.id);
+      for (const p of dead) { addDeletedPoint(p); await DB.del('points', p.id); }
+      if (dead.length) notifyChange();
       return dead.length;
     }
   };
@@ -452,5 +510,7 @@ const Store = (function () {
   }
 
   return { Assets, Questions, Points, Papers, Mastery, stats, exportAll, importAll, onChange,
-    deletions: readDeleted, clearDeletions: clearDeletions };
+    deletions: readDeleted, deletionsDetailed: readDeletedDetailed,
+    pointDeletions: readDeletedPoints, addDeletedPoint: addDeletedPoint,
+    clearDeletions: clearDeletions };
 })();
