@@ -4158,6 +4158,7 @@
     }
 
     n += await sanitizeOrphanPointRefs();   // v1.35.0：合并进来的数据也可能带孤儿引用，顺手清掉
+    n += await autoAssignUnitsBySuffix();   // v1.37.0：合并进来的没归单元考点，按名字后缀自动归位
     await Store.Points.recount();
     return n;
   }
@@ -4200,6 +4201,24 @@
       if (nRef || nQDel) scheduleSyncPush();   // 清干净的结果也推上云，别的设备跟着自愈
     } catch (e) { console.error('sanitizeOrphanPointRefs', e); }
     return nRef + nQDel;
+  }
+
+  /* v1.37.0 名字后缀自动归单元（写库）：
+     考点名末尾写着「·第N单元 / 某单元名」的，直接把那个单元写进 units——
+     之前只在展示/分组时按名字猜，选考点弹层等处只看库里存的 units，就显示成「未归入单元」。
+     只处理「还没归单元」的考点；老师手动改过/标了无单元的不动。 */
+  async function autoAssignUnitsBySuffix() {
+    let n = 0;
+    try {
+      const pts = await DB.all('points');
+      for (const p of pts) {
+        if (p.noUnit || (p.units || []).length) continue;
+        const u = pointSuffixUnitOf(p.name, p.subject, p.grade) || unitFromPointName(p.name, p.subject, p.grade);
+        if (u) { p.units = [u]; await DB.put('points', p); n++; }
+      }
+      if (n) { await Store.Points.recount(); scheduleSyncPush(); }
+    } catch (e) { console.error('autoAssignUnitsBySuffix', e); }
+    return n;
   }
 
   async function syncPullNow(silent) {
@@ -7530,10 +7549,15 @@
         return '<p class="muted" style="margin:4px 2px 4px;font-size:12px">已挂在这道题上（点一下取消）</p>' +
           keys.map(function (k) {
             const it = S._ppm.sel[k];
+            /* v1.37.0：库里没归单元的，按名字后缀识别出来展示，不再一律「未归入单元」 */
+            const gu = (it.units || []).length ? it.units : (function () {
+              const u = pointUnitOf(it) || pointSuffixUnitOf(it.name, it.subject || S._ppm.subject, it.grade || S._ppm.grade);
+              return u ? [u] : [];
+            })();
             return '<div class="list-item" data-act="ppm:toggle" data-key="' + esc(k) + '" data-name="' + esc(it.name) + '" data-id="' + (it.id || '') + '"' +
               ' style="background:var(--brand-soft)">' +
               '<span class="bcheck on"></span><div class="li-main"><div class="li-t">' + esc(it.name) + '</div>' +
-              '<div class="li-s">' + ((it.units || []).length ? '单元：' + esc(it.units.join('、')) : '未归入单元') + '</div></div></div>';
+              '<div class="li-s">' + (gu.length ? '单元：' + esc(gu.join('、')) + ((it.units || []).length ? '' : '（按名字识别）') : '未归入单元') + '</div></div></div>';
           }).join('');
       }
       function listHtml() {
@@ -7563,10 +7587,15 @@
         });
         const ptsHtml = keys.map(function (k, i) {
           const it = S._ppm.sel[k];
+          /* v1.37.0：库里没归单元的，按名字后缀识别出来展示（保存时可再改） */
+          const gu = (it.units || []).length ? it.units : (function () {
+            const u = pointUnitOf(it) || pointSuffixUnitOf(it.name, it.subject || S._ppm.subject, it.grade || S._ppm.grade);
+            return u ? [u] : [];
+          })();
           return '<div class="list-item ppm-pt" data-ptkey="' + esc(k) + '"' + (i === 0 ? ' data-first="1"' : '') + '>' +
             '<span class="drag-h" title="按住拖动排序">⋮⋮</span>' +
             '<div class="li-main"><div class="li-t">' + (i === 0 ? '<span class="chip brand" style="margin-right:6px">主分类</span>' : '') + esc(it.name) + '</div>' +
-            ((it.units || []).length ? '<div class="li-s">单元：' + esc(it.units.join('、')) + '</div>' : '<div class="li-s">未归入单元</div>') + '</div>' +
+            (gu.length ? '<div class="li-s">单元：' + esc(gu.join('、')) + ((it.units || []).length ? '' : '（按名字识别，可改）') + '</div>' : '<div class="li-s">未归入单元</div>') + '</div>' +
             (i > 0 ? '<button class="small" data-act="ppmc:top" data-key="' + esc(k) + '">置顶</button>' : '') +
             '<button class="small del" data-act="ppmc:rm" data-key="' + esc(k) + '">移除</button></div>';
         }).join('');
@@ -11886,7 +11915,7 @@
   window.addEventListener('beforeunload', function () { OCR.destroy(); });
 
   /* 调试钩子（控制台可用：__tiku.S、__tiku.navigate(...) 等） */
-  window.__tiku = { S: S, navigate: navigate, UI: UI, ACTIONS: ACTIONS,
+  window.__tiku = { S: S, navigate: navigate, UI: UI, ACTIONS: ACTIONS, DB: DB,
     dcodeEncode: dcodeEncode, dcodeDecode: dcodeDecode,
     ensureSession: ensureSession, buildDrafts: buildDrafts, classifyDrafts: classifyDrafts,
     seedDemo: seedDemo, Store: Store, resolveUnitPoint: resolveUnitPoint, unitSuffixOf: unitSuffixOf,
@@ -11927,7 +11956,7 @@
     isReviewUnit: isReviewUnit, draftReviewUnits: draftReviewUnits, reviewPickSheet: reviewPickSheet, applyReviewUnits: applyReviewUnits, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,
     PracticeTypes: PracticeTypes,
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
-    sanitizeOrphanPointRefs: sanitizeOrphanPointRefs,
+    sanitizeOrphanPointRefs: sanitizeOrphanPointRefs, autoAssignUnitsBySuffix: autoAssignUnitsBySuffix,
     syncCatalogLessons: syncCatalogLessons, isPhoneUi: isPhoneUi,
     buildSyncPayload: buildSyncPayload, applySyncDoc: applySyncDoc, openQTextLight: openQTextLight,
     dupKeyOf: dupKeyOf, dupDraftsOf: dupDraftsOf, gateDuplicates: gateDuplicates,
@@ -11961,6 +11990,7 @@
       await Store.Points.recount();
       await migrateQuestionTypes();
       await sanitizeOrphanPointRefs();      // v1.35.0：清掉删掉的考点在题上留的孤儿引用 + 老测试垃圾题
+      await autoAssignUnitsBySuffix();      // v1.37.0：没归单元的考点按名字后缀自动归位（可再手动改）
       // v1.31.0 一次性校正：v1.25–v1.30 打开题库就自动配对课时、把 lessons 时间戳顶成 now，
       // 存量的时间戳不可信（会导致另一台设备的真实编辑被当成旧数据忽略）。内容不动，只把时间戳清零重排。
       if (!localStorage.getItem('tiku.stamps.fix31')) {
