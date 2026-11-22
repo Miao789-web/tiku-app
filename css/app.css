@@ -390,6 +390,14 @@ body[data-tab="off"] .view { padding-bottom: calc(92px + var(--safe-b)); }
 .dimg-list.single .dimg-item { cursor: zoom-in; }
 .dimg-count { font-size: 12px; color: var(--ink-3); margin-top: 4px; }
 
+/* 重复题对比（v1.36.0）：左＝本次练习，右＝题库已有 */
+.dup-cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px dashed #e8c98a; padding: 8px 0 2px; }
+.dup-cmp-col { min-width: 0; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.dup-cmp-h { font-size: 12px; font-weight: 700; color: var(--brand); }
+.dup-cmp-col .dimg-item { cursor: default; }
+.dup-cmp-col .dimg-list { margin: 6px 0 0; }
+.dup-cmp-col .dimg-item img { width: 100%; display: block; max-height: 170px; object-fit: contain; background: #fff; }
+
 /* 图片放大层 */
 #imgLight {
   position: fixed; inset: 0; z-index: 900;

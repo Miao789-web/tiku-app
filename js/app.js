@@ -4778,12 +4778,36 @@
         : '';
 
       // 查重提示（v1.25.1）：部分题题库里已有 → 顶部提示，可一键移除
+      // v1.36.0：下面直接左右对比「本次练习 vs 题库已有」的题干 + 配图，看完再决定移除还是保留
       const dupN = S.dupNote ? S.dupNote.n : S.drafts.filter(function (d) { return d.dup; }).length;
+      const dupItems = S.drafts.map(function (d, i) { return { d: d, i: i }; }).filter(function (x) { return x.d.dup && x.d.dupRef; });
+      const cmpImgs = function (srcs) {
+        return (srcs || []).length
+          ? '<div class="dimg-list single" style="margin-top:6px">' + srcs.map(function (src) {
+              return '<div class="dimg-item" style="max-height:180px;overflow:hidden"><img src="' + src + '" alt="题目配图" loading="lazy"></div>';
+            }).join('') + '</div>'
+          : '';
+      };
+      const dupCmpHtml = dupItems.map(function (x) {
+        const d = x.d, r = d.dupRef;
+        const dText = [d.text].concat(d.subs || []).join('\n').trim();
+        return '<div class="dup-cmp">' +
+          '<div class="dup-cmp-col"><div class="dup-cmp-h">本次练习 · 第 ' + esc(d.no || (x.i + 1)) + ' 题</div>' +
+            '<p class="small" style="white-space:pre-wrap;margin:4px 0 0">' + esc(dText) + '</p>' + cmpImgs(d.images) +
+          '</div>' +
+          '<div class="dup-cmp-col"><div class="dup-cmp-h" style="color:var(--ink-2)">题库已有' + (r.batch ? ' · ' + esc(r.batch) : '') + '</div>' +
+            '<p class="small" style="white-space:pre-wrap;margin:4px 0 0">' + esc(String(r.text || '').trim()) + '</p>' +
+            (cmpImgs(r.images) || '<p class="muted small" style="margin:6px 0 0">（这道题没存配图）</p>') +
+          '</div></div>';
+      }).join('');
       const dupCard = dupN
         ? '<section class="card flat" style="background:var(--warn-soft);border-color:#ffe3b8;margin-bottom:10px">' +
             '<p class="small" style="color:#8a5300;margin:0 0 8px">⚠ 这 ' + S.drafts.length + ' 道题里，有 <b>' + dupN +
-              ' 道</b>题库里已经有了（题干完全一样），入库会变成重复题。</p>' +
-            '<div class="row" style="gap:8px">' +
+              ' 道</b>题库里已经有了（题干完全一样），入库会变成重复题。下面是对比（左＝本次，右＝题库），看完再决定：</p>' +
+            (dupItems.length <= 3
+              ? dupCmpHtml
+              : '<details><summary class="small" style="color:#8a5300;cursor:pointer">点开对比这 ' + dupN + ' 道题（题干 + 配图）</summary>' + dupCmpHtml + '</details>') +
+            '<div class="row" style="gap:8px;margin-top:8px">' +
               '<button class="btn soft sm grow" data-act="confirm:dropDup">移除这 ' + dupN + ' 道</button>' +
               '<button class="btn ghost sm grow" data-act="confirm:keepDup">都保留</button>' +
             '</div></section>'
@@ -6847,19 +6871,20 @@
       .replace(/^\s*\d{1,2}\s*[.、．)）]\s*/, ''));
   }
 
-  /** 这批草稿里，哪些题的题干在题库中已有（完全一样），批内互相重复也算重复 */
+  /** 这批草稿里，哪些题的题干在题库中已有（完全一样），批内互相重复也算重复。
+   *  v1.36.0：命中的草稿记 d.dupRef（题库那道题的题干+配图快照），确认页用来左右对比 */
   async function dupDraftsOf(drafts) {
     const all = await Store.Questions.list({});
     const seen = {};
     all.forEach(function (q) {
       const k = dupKeyOf(q.text);
-      if (k) seen[k] = 1;
+      if (k && !seen[k]) seen[k] = { kind: 'q', id: q.id, text: q.text, images: (q.images || []).slice(), batch: q.batchName || '', date: q.createdAt };
     });
     const hit = [], fresh = [];
     (drafts || []).forEach(function (d) {
       const k = dupKeyOf(d.text);
-      if (k && seen[k]) { hit.push(d); return; }
-      if (k) seen[k] = 1;          // 同一批里第二道一样的题也算重复
+      if (k && seen[k]) { d.dupRef = seen[k]; hit.push(d); return; }
+      if (k) seen[k] = { kind: 'draft', text: d.text, images: (d.images || []).slice() };   // 批内重复 → 跟本批第一道比
       fresh.push(d);
     });
     return { hit: hit, fresh: fresh, total: (drafts || []).length };
