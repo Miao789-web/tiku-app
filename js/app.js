@@ -4157,8 +4157,49 @@
       }
     }
 
+    n += await sanitizeOrphanPointRefs();   // v1.35.0：合并进来的数据也可能带孤儿引用，顺手清掉
     await Store.Points.recount();
     return n;
+  }
+
+  /* v1.35.0 孤儿考点引用清理：
+     考点删掉后，题上还挂着「只写名字、id 已失效」的引用（以前测试脚本留下的垃圾就这样），
+     列表按题上的名字一分组，删掉的考点就像「复活」了。
+     这里统一剥掉：引用必须 id 存在于考点表，或名字能对上一个现存考点；
+     顺带删掉老测试脚本留下的垃圾题（「A单元第N题」开头）。启动和每次同步合并后都会跑一遍。 */
+  async function sanitizeOrphanPointRefs() {
+    let nRef = 0, nQDel = 0;
+    try {
+      const pts = await DB.all('points');
+      const ids = new Set();
+      const norms = new Set();
+      pts.forEach(function (p) { ids.add(p.id); if (p.norm) norms.add(p.norm); });
+      const qs = await DB.all('questions');
+      for (const q of qs) {
+        /* 老测试脚本的垃圾题（文本以「A单元第N题」开头）：整题删除（带删除记录，两端一起删） */
+        if (/^A\s*单元第\d+题/.test(String(q.text || '').trim())) {
+          await Store.Questions.remove(q.id);
+          nQDel++;
+          continue;
+        }
+        let dirty = false;
+        const before = (q.points || []).length;
+        const kept = (q.points || []).filter(function (x) {
+          if (!x) return false;
+          if (x.id) return ids.has(x.id);
+          return norms.has(Normalize.norm(x.name || ''));
+        });
+        if (kept.length !== before) { q.points = kept; dirty = true; }
+        if (q.pointId && !ids.has(q.pointId)) { q.pointId = null; dirty = true; }
+        const firstP = kept[0];
+        if (!firstP) { if (q.pointName) { q.pointName = ''; dirty = true; } }
+        else if (q.pointName !== firstP.name) { q.pointName = firstP.name; dirty = true; }
+        if (dirty) { await DB.put('questions', q); nRef++; }
+      }
+      if (nRef) await Store.Points.recount();
+      if (nRef || nQDel) scheduleSyncPush();   // 清干净的结果也推上云，别的设备跟着自愈
+    } catch (e) { console.error('sanitizeOrphanPointRefs', e); }
+    return nRef + nQDel;
   }
 
   async function syncPullNow(silent) {
@@ -11861,6 +11902,7 @@
     isReviewUnit: isReviewUnit, draftReviewUnits: draftReviewUnits, reviewPickSheet: reviewPickSheet, applyReviewUnits: applyReviewUnits, ptypeApplyOrder: ptypeApplyOrder, PracticeTypes: PracticeTypes,
     PracticeTypes: PracticeTypes,
     syncPushNow: syncPushNow, syncPullNow: syncPullNow, syncReady: syncReady,
+    sanitizeOrphanPointRefs: sanitizeOrphanPointRefs,
     syncCatalogLessons: syncCatalogLessons, isPhoneUi: isPhoneUi,
     buildSyncPayload: buildSyncPayload, applySyncDoc: applySyncDoc, openQTextLight: openQTextLight,
     dupKeyOf: dupKeyOf, dupDraftsOf: dupDraftsOf, gateDuplicates: gateDuplicates,
@@ -11893,6 +11935,7 @@
       await DB.open();
       await Store.Points.recount();
       await migrateQuestionTypes();
+      await sanitizeOrphanPointRefs();      // v1.35.0：清掉删掉的考点在题上留的孤儿引用 + 老测试垃圾题
       // v1.31.0 一次性校正：v1.25–v1.30 打开题库就自动配对课时、把 lessons 时间戳顶成 now，
       // 存量的时间戳不可信（会导致另一台设备的真实编辑被当成旧数据忽略）。内容不动，只把时间戳清零重排。
       if (!localStorage.getItem('tiku.stamps.fix31')) {
