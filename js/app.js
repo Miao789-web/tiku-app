@@ -11962,6 +11962,58 @@
   document.addEventListener('focusin', function (e) {
     if (kbTargetOk(e.target)) S.kb.target = e.target;
   });
+
+  /* v1.41.0：横向滑动条（章节 chips、扫码列表等）电脑端也能滚 —— 滚轮横滚 + 按住左键拖动。
+     手机触摸滑动本来就能用；电脑端之前只能看不能滚，这里全局兜底：
+     从点击处往上找「横向放不下且 overflow-x 为 auto/scroll」的容器来处理。 */
+  (function () {
+    function findHScroll(el) {
+      while (el && el !== document.body) {
+        if (el.nodeType === 1) {
+          const st = getComputedStyle(el);
+          if (el.scrollWidth > el.clientWidth + 4 && /(auto|scroll)/.test(st.overflowX)) return el;
+        }
+        el = el.parentNode;
+      }
+      return null;
+    }
+    /* 鼠标滚轮：在横滚容器上把 deltaY 转成横向滚动（到边缘则放行给页面） */
+    document.addEventListener('wheel', function (e) {
+      const t = findHScroll(e.target);
+      if (!t) return;
+      const max = t.scrollWidth - t.clientWidth;
+      if (max <= 0) return;
+      const before = t.scrollLeft;
+      t.scrollLeft += (Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX) || 0;
+      if (t.scrollLeft !== before) e.preventDefault();
+    }, { passive: false });
+    /* 按住拖动：只对鼠标生效，松手时若真拖动过则拦掉误触点击 */
+    let drag = null;
+    document.addEventListener('pointerdown', function (e) {
+      if (e.pointerType !== 'mouse' || e.button !== 0) return;
+      const t = findHScroll(e.target);
+      if (!t) return;
+      drag = { el: t, x: e.clientX, left: t.scrollLeft, moved: false };
+    });
+    document.addEventListener('pointermove', function (e) {
+      if (!drag) return;
+      if (!(e.buttons & 1)) { drag = null; return; }
+      const dx = e.clientX - drag.x;
+      if (Math.abs(dx) > 3) drag.moved = true;
+      drag.el.scrollLeft = drag.left - dx;
+    });
+    function endDrag() {
+      if (!drag) return;
+      if (drag.moved) {
+        drag.el.addEventListener('click', function (ev) { ev.stopPropagation(); ev.preventDefault(); },
+          { capture: true, once: true });
+      }
+      drag = null;
+    }
+    document.addEventListener('pointerup', endDrag, true);
+    document.addEventListener('pointercancel', endDrag, true);
+  })();
+
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', kbKeepVisible);
     window.visualViewport.addEventListener('scroll', kbKeepVisible);
