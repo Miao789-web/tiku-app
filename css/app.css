@@ -1054,3 +1054,20 @@ body.kb-open .sheet { bottom: 272px; max-height: calc(100vh - 330px); }
 .stu-wrap .dc-ans { font-size: clamp(15px, 2.1vw, 20px); }
 .stu-wrap .dc-stu-timer { padding: 16px; }
 .stu-wrap .dc-stu-timer .dc-time { font-size: clamp(52px, 8vw, 80px); }
+
+/* v1.40.0：重置倒计时面板 · ＋/－ 步进数字（类似翻页时钟） */
+.dc-rst-col { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.dc-rst-btn {
+  width: 56px; height: 40px; border-radius: 20px;
+  border: 1px solid var(--line); background: var(--panel-2, #f2f4f8);
+  font-size: 20px; line-height: 1; color: var(--ink-2);
+  cursor: pointer; padding: 0;
+}
+.dc-rst-btn:active { background: var(--brand-soft, #e8f0fe); border-color: var(--brand); }
+.dc-rst-num {
+  width: 64px; text-align: center;
+  font-size: 54px; font-weight: 700; line-height: 1.15;
+  font-variant-numeric: tabular-nums; color: var(--ink, #222);
+}
+.dc-rst-colon { font-size: 44px; font-weight: 700; color: var(--ink, #222); margin: 0 2px; }
+.dc-rst-lbl { font-size: 15px; color: var(--ink-3); align-self: flex-end; padding-bottom: 26px; }
