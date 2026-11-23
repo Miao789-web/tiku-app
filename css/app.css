@@ -1113,3 +1113,9 @@ body.dimg-reording * { cursor: grabbing !important; }
 }
 .dc-rst-colon { font-size: 44px; font-weight: 700; color: var(--ink, #222); margin: 0 2px; }
 .dc-rst-lbl { font-size: 15px; color: var(--ink-3); align-self: flex-end; padding-bottom: 26px; }
+
+/* v1.45.0：确认页按「本次导入 / 之前的草稿」分组 */
+.dgroup { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; margin: 16px 2px 8px; }
+.dgroup::before { content: ""; width: 100%; border-top: 1px dashed var(--line); margin-bottom: 2px; }
+.dgroup b { font-size: 14px; color: var(--ink); }
+.dgroup span { font-size: 12px; color: var(--ink-3); }

@@ -108,13 +108,62 @@
     }
   }
 
+  /* ---------- v1.45.0：每批导入各带一份练习信息（章节/课时/练习名/类型/页码），互不干扰 ---------- */
+  function newBatchId() {
+    return 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
+  /** 会话当前的「本批练习信息」快照 */
+  function sessionMeta(s) {
+    s = s || S.session || {};
+    return {
+      subject: s.subject || S.defaults.subject,
+      grade: s.grade || S.defaults.grade,
+      unit: s.unit || '',
+      lesson: s.lesson || '',
+      batchName: s.batchName || '',
+      batchDate: s.batchDate || '',
+      practiceType: s.practiceType || '',
+      pageNo: s.pageNo || ''
+    };
+  }
+  /** 给草稿盖上本批信息（之后改表单也只作用于本批，不回头改老草稿） */
+  function stampDraftMeta(d, s) {
+    s = s || S.session || {};
+    if (!s.batchId) s.batchId = newBatchId();
+    d.meta = sessionMeta(s);
+    d.batchId = s.batchId;
+    return d;
+  }
+  /** 这道题入库该用哪套练习信息：自己有就用自己那套，老草稿才回退到当前会话 */
+  function draftMetaOf(d) {
+    if (d && d.meta && typeof d.meta === 'object') {
+      const m = Object.assign({}, d.meta);
+      if (!m.subject) m.subject = (S.session && S.session.subject) || S.defaults.subject;
+      if (!m.grade) m.grade = (S.session && S.session.grade) || S.defaults.grade;
+      return m;
+    }
+    return sessionMeta(S.session);
+  }
+
+  /** 本批（新导入的）草稿统一用表单里最新的练习信息；老草稿不动 */
+  function syncCurBatchMeta(s) {
+    s = s || S.session;
+    if (!s) return;
+    const m = sessionMeta(s);
+    (S.drafts || []).forEach(function (d) {
+      if (d.batchId && d.batchId === s.batchId) d.meta = Object.assign({}, m);
+    });
+  }
+
   function storeDraft() {
     if (!S.session || !S.drafts.length) return;
     const s = S.session;
+    syncCurBatchMeta(s);
     const plain = S.drafts.map(function (d) {
       return {
         no: d.no, text: d.text, subs: d.subs || [], options: d.options || [],
         answer: d.answer || '', solution: d.solution || '',
+        meta: d.meta || null, batchId: d.batchId || '',
         type: d.type, difficulty: d.difficulty,
         images: d.images || [], point: d.point || '', pointId: d.pointId || '',
         pointUnit: d.pointUnit || '', points: d.points || [],
@@ -158,6 +207,13 @@
 
   /** 草稿快照 → 内存草稿数组（恢复、导入前带上旧草稿都用它） */
   function draftsFromStoreData(d) {
+    const legacyMeta = {
+      subject: (d && d.subject) || '', grade: (d && d.grade) || '',
+      unit: (d && d.unit) || '', lesson: (d && d.lesson) || '',
+      batchName: (d && d.batchName) || '', batchDate: (d && d.batchDate) || '',
+      practiceType: (d && d.practiceType) || '', pageNo: (d && d.pageNo) || ''
+    };
+    const legacyBid = 'b' + ((d && d.savedAt) || 0);
     return ((d && d.drafts) || []).map(function (x) {
       const dd = Object.assign({
         key: Util.uid('d'), imgIndex: 0, subs: [], options: [],
@@ -165,6 +221,9 @@
       }, x);
       // 老草稿：整批只有一个 reviewOf → 迁到每道题上（之后可逐题改）
       if (!Array.isArray(dd.reviewUnits)) dd.reviewUnits = (x.reviewOf || d.reviewOf) ? [x.reviewOf || d.reviewOf] : [];
+      // v1.45.0：没有分批判信息的旧草稿，用快照里那套整批信息补上，之后新导入不覆盖它
+      if (!dd.meta) dd.meta = Object.assign({}, legacyMeta);
+      if (!dd.batchId) dd.batchId = legacyBid;
       return dd;
     });
   }
@@ -5045,7 +5104,29 @@
             '</div></section>'
         : '';
 
+      /* v1.45.0：按「本批导入 / 之前的草稿」分组显示——新导入的在前，各自用自己的练习信息 */
+      const curBid = s.batchId;
+      const freshN = S.drafts.filter(function (x) { return x.batchId && x.batchId === curBid; }).length;
+      const oldN = S.drafts.length - freshN;
+      const metaBrief = function (m) {
+        return [m.batchName, m.unit, m.lesson, m.practiceType, m.pageNo ? ('P' + m.pageNo) : '']
+          .filter(Boolean).join(' · ');
+      };
+      const groupHead = function (title, sub) {
+        return '<div class="dgroup"><b>' + title + '</b><span>' + sub + '</span></div>';
+      };
+
       let cards = S.drafts.map(function (d, i) {
+        let head = '';
+        if (freshN && oldN) {
+          if (i === 0) head = groupHead('本次导入 · ' + freshN + ' 题', '用上面填的章节 / 课时 / 练习信息');
+          else if (i === freshN) {
+            const firstOld = S.drafts[i];
+            const mb = metaBrief(draftMetaOf(firstOld));
+            head = groupHead('之前未入库的草稿 · ' + oldN + ' 题', '保留原来的练习信息，不受上面影响' + (mb ? '（' + esc(mb) + '）' : ''));
+          }
+        }
+        const dm = draftMetaOf(d);
         const chipPoint = d.aiPending
           ? '<span class="chip gray">AI 归类中…</span>'
           : '<span class="chip brand tap" data-act="draft:point" data-i="' + i + '">' + esc(d.point || '选择考点') + ' ›</span>';
@@ -5058,24 +5139,24 @@
           (d.answerFromDoc ? '<span class="chip gray">📋 文档答案</span>' : '');
         // 复习章节（v1.22.0）：每道题显示/选择自己复习自哪个单元，可多选
         const rvUs = draftReviewUnits(d);
-        const chipReview = isReviewUnit(s.unit)
+        const chipReview = isReviewUnit(dm.unit)
           ? '<span class="chip ' + (rvUs.length ? 'brand' : 'warn') + ' tap" data-act="draft:review" data-i="' + i + '" title="点击选这道题是哪些单元的复习（可多选）">🔁 ' +
             (rvUs.length ? esc(draftReviewLabel(d)) + (d.reviewAuto ? '（按考点）' : '') : '复习单元待选') + '</span>'
           : '';
         // 课时（v1.18.0）：点一下就按这道题（或整批）的单元列课时，没单元就按关键字新建
         // v1.23.0：复习章节里一张题可以同时挂多个课时
         let lessonText = '';
-        if (isReviewUnit(s.unit)) {
+        if (isReviewUnit(dm.unit)) {
           const ls = [];
           draftLessonUnits(d, s).forEach(function (u) {
             draftLessonsOf(d, u).forEach(function (L) { if (ls.indexOf(L) < 0) ls.push(L); });
           });
           lessonText = ls.length ? (ls.length === 1 ? ls[0] : ls[0] + ' 等 ' + ls.length + ' 个课时') : '';
-        } else lessonText = d.lesson || s.lesson || '';
+        } else lessonText = d.lesson || dm.lesson || '';
         const chipLesson = '<span class="chip gray tap" data-act="draft:lesson" data-i="' + i + '" title="点击选课时">⏱ ' +
           (lessonText ? esc(lessonText) : '<span style="color:var(--warn)">课时待确认</span>') + '</span>';
         const body = [d.text].concat(d.subs || [], d.options || []).join('\n');
-        return '<article class="qcard' + (d.needsConfirm && !d.aiPending ? ' needs' : '') + '">' +
+        return head + '<article class="qcard' + (d.needsConfirm && !d.aiPending ? ' needs' : '') + '">' +
           '<div class="qcard-h">' +
             '<span class="qno">' + (d.no || (i + 1)) + '</span>' + chipPoint + chipReview + chipWarn + chipRed + chipLesson +
             '<span class="chip gray tap" data-act="draft:type" data-i="' + i + '" title="点击改题型">' + esc(d.type) + '</span>' +
@@ -5126,7 +5207,12 @@
         docLeftCard +
         dupCard +
         '<section class="card">' +
-          '<div class="card-h"><h3>归入章节</h3>' +
+          (oldN
+            ? '<p class="small" style="color:var(--brand);background:var(--brand-soft,#eef6ff);border-radius:8px;padding:8px 10px;margin:0 0 10px;line-height:1.6">' +
+                '本次导入 ' + freshN + ' 题单独用下面这套信息；之前未入库的 ' + oldN + ' 道草稿保留原来的章节 / 课时 / 练习信息，不会被改掉。' +
+              '</p>'
+            : '') +
+          '<div class="card-h"><h3>' + (oldN ? '本次导入的练习信息' : '归入章节') + '</h3>' +
             '<span class="row" style="gap:10px">' +
               '<span class="muted" id="unitPicked">' + esc(s.unit || '未选择') + '</span>' +
               '<button class="small" style="color:var(--brand);font-weight:600" data-act="confirm:unitMgr">删除章节</button>' +
@@ -6836,7 +6922,7 @@
       S.session = {
         images: [], subject: S.defaults.subject, grade: S.defaults.grade,
         unit: '', lesson: '', batchName: '', batchDate: '', stage: 'pick',
-        practiceType: '', pageNo: '', docAnsBlocks: [], imgPool: []
+        practiceType: '', pageNo: '', docAnsBlocks: [], imgPool: [], batchId: newBatchId()
       };
       /* v1.44.0：新一轮导入前，把上次没入库的草稿接进来（新导入的排在后面），不再覆盖丢题 */
       let carried = (S.drafts || []).slice();
@@ -6850,15 +6936,34 @@
       }
       if (carried.length) {
         S.drafts = carried;
-        UI.toast('已带上上次未入库的 ' + carried.length + ' 道草稿，新导入的排在后面', 3800);
+        UI.toast('已带上上次未入库的 ' + carried.length + ' 道草稿（各自的练习信息保留），新导入的会排在它们前面', 4000);
       }
-      S.session.baseDrafts = carried;   // 导入前的底稿（buildDrafts 会拼在它后面）
+      S.session.baseDrafts = carried;   // 导入前的底稿（buildDrafts 把它们接在新题后面）
     }
     return S.session;
   }
 
+  /** v1.45.0：上一批已经出过草稿、老师又要导入新文件 → 开新一批
+   *  旧草稿收进底稿（各自保留原来的章节/课时/练习信息），本批信息清空等老师重填 */
+  function beginNewBatch(s) {
+    s = s || S.session;
+    if (!s) return s;
+    if (s.stage !== 'confirm' || !(S.drafts || []).length) return s;
+    s.baseDrafts = (S.drafts || []).slice();
+    S.drafts = [];
+    (s.images || []).forEach(function (im) { try { URL.revokeObjectURL(im.url); } catch (e) {} });
+    s.images = [];
+    s.docAnsBlocks = [];
+    s.unit = ''; s.lesson = ''; s.batchName = '';
+    s.batchDate = todayStr(); s.practiceType = ''; s.pageNo = '';
+    s.stage = 'pick';
+    s.batchId = newBatchId();
+    return s;
+  }
+
   function startCapture() {
-    ensureSession();
+    const s = ensureSession();
+    beginNewBatch(s);   // v1.45.0：上一批的草稿留在底稿里，本批练习信息重新填
     navigate('capture');
   }
 
@@ -7330,27 +7435,24 @@
         }
       }
     }
-    S.drafts = drafts;
-    /* v1.44.0：已有草稿不丢 —— 新导入的按原顺序接在后面，和旧草稿重复（题干+答案相同）的跳过 */
-    if (base.length) {
-      const seen = {};
-      base.forEach(function (x) { const k = dupKeyOf(x.text).slice(0, 80); if (k) seen[k] = 1; });
-      let nextNo = base.length, skip = 0;
-      const add = [];
-      drafts.forEach(function (d) {
-        const k = dupKeyOf(d.text).slice(0, 80);
-        if (k && seen[k]) { skip++; return; }   // 题干一样就算重复（答案可能一份为空）
-        if (k) seen[k] = 1;
-        d.no = ++nextNo;
-        add.push(d);
-      });
-      S.drafts = base.concat(add);
-      S._lastFresh = add;
-      if (skip) UI.toast('有 ' + skip + ' 道和已有草稿重复，已跳过；新导入的已排在草稿后面', 3600);
-    } else {
-      S.drafts = drafts;
-      S._lastFresh = drafts;
-    }
+    /* v1.45.0：新导入的这批排在草稿最前面，各题带上本批的章节/课时/练习信息；老草稿留在后面、保留各自原来的信息 */
+    const bid = s.batchId || (s.batchId = newBatchId());
+    const seen = {};
+    base.forEach(function (x) { const k = dupKeyOf(x.text).slice(0, 80); if (k) seen[k] = 1; });
+    let skip = 0;
+    const fresh = [];
+    drafts.forEach(function (d) {
+      const k = dupKeyOf(d.text).slice(0, 80);
+      if (base.length && k && seen[k]) { skip++; return; }   // 题干和已有草稿一样就算重复（答案可能一份为空）
+      if (k) seen[k] = 1;
+      stampDraftMeta(d, s);
+      d.batchId = bid;
+      fresh.push(d);
+    });
+    S.drafts = fresh.concat(base);
+    S.drafts.forEach(function (x, i) { x.no = i + 1; });   // 按新的显示顺序重新编号
+    S._lastFresh = fresh;
+    if (skip) UI.toast('有 ' + skip + ' 道和已有草稿重复，已跳过；新导入的 ' + fresh.length + ' 道已排在草稿最前面', 3800);
     // 文档答案表：按题号填进各题答案框（待老师核对），不再集中显示在顶部
     if (s.docAnsBlocks && s.docAnsBlocks.length) applyDocAnswers(S._lastFresh);
   }
@@ -7478,48 +7580,50 @@
 
   /** 单题入库（整批「确认入库」和单题「保存并入库」共用） */
   async function saveDraftOne(d, s, assetId) {
+    // v1.45.0：这道题用自己那批的练习信息（章节/课时/练习名/类型/页码/年级科目），不同文件互不干扰
+    const M = draftMetaOf(d);
     // 多考点/多单元：一道题可同时挂多个考点、归入多个单元（各考点/单元题库里都能看到）
     const entries = (d.points && d.points.length)
       ? d.points
       : [{ id: d.pointId || '', name: d.point || '未分类', units: d.pointUnit ? [d.pointUnit] : [] }];
     const resolved = [];
     const unitSet = [];
-    let primaryUnit = s.unit || '';   // 练习选了章节：这份练习的题默认都归那个单元
+    let primaryUnit = M.unit || '';   // 练习选了章节：这份练习的题默认都归那个单元
     const addUnit = function (u) { if (u && unitSet.indexOf(u) < 0) unitSet.push(u); };
     for (const e of entries) {
       if (e.id) {
         resolved.push({ id: e.id, name: e.name });
         // 考点名已带「·第N单元」后缀（AI 归类/以前存的）：题同时归到那个单元——复习章节的题不用再挑一遍
-        const up = unitSuffixToUnit(e.name, s.subject, s.grade);
+        const up = unitSuffixToUnit(e.name, M.subject, M.grade);
         if (up) addUnit(up);
         continue;
       }
-      const u0 = (e.units && e.units[0]) || s.unit || '';
+      const u0 = (e.units && e.units[0]) || M.unit || '';
       if (!primaryUnit && u0) primaryUnit = u0;
       let pt = { id: '', name: e.name };
       try {
-        const r = await resolveUnitPoint(e.name || '未分类', u0, s.subject, s.grade);
+        const r = await resolveUnitPoint(e.name || '未分类', u0, M.subject, M.grade);
         pt = { id: r.point.id, name: r.point.name };
       } catch (err) { /* 解析失败按原名入库 */ }
       resolved.push(pt);
     }
     if (!resolved.length) resolved.push({ id: '', name: '未分类' });
-    if (!primaryUnit) primaryUnit = s.unit || '';
+    if (!primaryUnit) primaryUnit = M.unit || '';
     // 没选章节、考点也没带单元信息时，按考点名后缀「·第N单元」把单元补上（课时才有地方落）
     if (!primaryUnit) {
       for (const e of entries) {
-        const u0 = (e.units && e.units[0]) || unitSuffixToUnit(e.name, s.subject, s.grade);
+        const u0 = (e.units && e.units[0]) || unitSuffixToUnit(e.name, M.subject, M.grade);
         if (u0) { primaryUnit = u0; break; }
       }
     }
     addUnit(primaryUnit);
-    addUnit(s.unit);
+    addUnit(M.unit);
     entries.forEach(function (e) { (e.units || []).forEach(addUnit); });
     // 复习章节（v1.22.0）：这道题选了「复习自哪些单元」→ 同时归复习章节和这些单元（可多个），两边题库都能看到
     const reviewUs = isReviewUnit(primaryUnit) ? draftReviewUnits(d) : [];
     reviewUs.forEach(addUnit);
     // 课时：确认页填的课时作用于整批练习的主单元（复习章节则同时作用到所选单元）；新建考点时选的课时写到对应单元位置
-    const batchLesson = (s.lesson || '').trim();
+    const batchLesson = (M.lesson || '').trim();
     // v1.23.0：一题多课时 —— d.lessonsByUnit = { 单元: [课时…] }，这些单元也要进 unitSet
     const lessonsByUnit = {};
     if (isReviewUnit(primaryUnit) || reviewUs.length) {
@@ -7557,17 +7661,17 @@
       if (arr.length) finalByUnit[u] = arr;
     });
     const created = await Store.Questions.create({
-      subject: s.subject,
-      grade: s.grade,
+      subject: M.subject,
+      grade: M.grade,
       unit: primaryUnit,
       units: unitSet,
       lesson: lessons.filter(Boolean)[0] || '',
       lessons: lessons,
       lessonsByUnit: finalByUnit,
-      batchName: s.batchName || '',
-      batchDate: s.batchDate || todayStr(),
-      practiceType: s.practiceType || '',
-      pageNo: s.pageNo || '',
+      batchName: M.batchName || '',
+      batchDate: M.batchDate || todayStr(),
+      practiceType: M.practiceType || '',
+      pageNo: M.pageNo || '',
       pointId: resolved[0].id,
       pointName: resolved[0].name,
       points: resolved,
@@ -7606,6 +7710,7 @@
     if (pageInput) s.pageNo = pageInput.value.replace(/^[Pp]\.?\s*/, '').trim();
     const lessonInput0 = document.getElementById('batchLesson');
     if (lessonInput0) s.lesson = lessonInput0.value.trim();
+    syncCurBatchMeta(s);   // v1.45.0：表单里刚改的信息同步到本批草稿（老草稿保留自己的）
     for (const d of S.drafts) {
       await saveDraftOne(d, s, assetIds[d.imgIndex] || '');
       n++;
@@ -9099,6 +9204,7 @@
       if (pageInput) s.pageNo = pageInput.value.replace(/^[Pp]\.?\s*/, '').trim();
       const lessonInput = document.getElementById('batchLesson');
       if (lessonInput) s.lesson = lessonInput.value.trim();
+      syncCurBatchMeta(s);   // v1.45.0：只用本批最新信息，老草稿照旧
       UI.toast('正在入库…');
       const im = s.images[draft.imgIndex];
       let assetId = '';
@@ -12403,6 +12509,7 @@
         throw new Error('没有解析出文字。扫描版 PDF（图片型）无法提取文字，请回到首页用拍照录入');
       }
       const s = ensureSession();
+      beginNewBatch(s);   // v1.45.0：导入新文件＝新一批，旧草稿各自保留原来的练习信息
       s.images.forEach(im => URL.revokeObjectURL(im.url));
       s.images = [{ id: Util.uid('im'), blob: null, url: '', status: 'done', text: text, pct: 1, docImages: res.images || [] }];
       // 文档里的图片也做红笔答案检测（一般红笔标记的是答案）
@@ -12482,6 +12589,7 @@
     dcodeEncode: dcodeEncode, dcodeDecode: dcodeDecode,
     ensureSession: ensureSession, buildDrafts: buildDrafts, classifyDrafts: classifyDrafts,
     readDraftStore: readDraftStore, readDraftBaks: readDraftBaks, draftsFromStoreData: draftsFromStoreData, storeDraft: storeDraft,   // v1.44.0 草稿追加/找回
+    draftMetaOf: draftMetaOf, sessionMeta: sessionMeta, stampDraftMeta: stampDraftMeta, syncCurBatchMeta: syncCurBatchMeta, saveDraftOne: saveDraftOne, beginNewBatch: beginNewBatch,   // v1.45.0 分批练习信息
     seedDemo: seedDemo, Store: Store, resolveUnitPoint: resolveUnitPoint, unitSuffixOf: unitSuffixOf,
     dcDaySet: dcDaySet, dcWeightedPool: dcWeightedPool, dcNextMonday: dcNextMonday,
     dcWorkdayIndex: dcWorkdayIndex, dcDateKey: dcDateKey,
