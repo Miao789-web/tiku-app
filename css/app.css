@@ -1049,18 +1049,32 @@ body.kb-open .sheet { bottom: 272px; max-height: calc(100vh - 330px); }
 .stu-wrap .card-h h3 { font-size: clamp(20px, 3.2vw, 30px); }
 .stu-wrap .muted { font-size: clamp(14px, 1.8vw, 18px); }
 .stu-wrap .dc-q {
-  font-size: clamp(19px, 2.9vw, 28px);
+  font-size: calc(clamp(19px, 2.9vw, 28px) * var(--dc-zoom, 1));
   line-height: 1.9;
   padding: clamp(8px, 1.6vw, 16px) 4px;
 }
 .stu-wrap .dc-num {
-  min-width: clamp(24px, 2.9vw, 34px); height: clamp(24px, 2.9vw, 34px);
-  line-height: calc(clamp(24px, 2.9vw, 34px) - 2px);
-  font-size: clamp(13px, 1.6vw, 17px); margin-right: 12px;
+  min-width: calc(clamp(24px, 2.9vw, 34px) * var(--dc-zoom, 1));
+  height: calc(clamp(24px, 2.9vw, 34px) * var(--dc-zoom, 1));
+  line-height: calc(clamp(24px, 2.9vw, 34px) * var(--dc-zoom, 1) - 2px);
+  font-size: calc(clamp(13px, 1.6vw, 17px) * var(--dc-zoom, 1)); margin-right: 12px;
 }
-.stu-wrap .dc-ans { font-size: clamp(15px, 2.1vw, 20px); }
+.stu-wrap .dc-ans { font-size: calc(clamp(15px, 2.1vw, 20px) * var(--dc-zoom, 1)); }
 .stu-wrap .dc-stu-timer { padding: 16px; }
-.stu-wrap .dc-stu-timer .dc-time { font-size: clamp(52px, 8vw, 80px); }
+.stu-wrap .dc-stu-timer .dc-time { font-size: calc(clamp(52px, 8vw, 80px) * var(--dc-zoom, 1)); }
+
+/* v1.42.0：学生页右侧 ＋/－ 缩放（一面看不全时可手动缩小/放大，比例存 localStorage） */
+.stu-zoom {
+  position: fixed; right: 10px; top: calc(50% + 46px); z-index: 20;
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+}
+.stu-zoom-btn {
+  width: 46px; height: 46px; border-radius: 50%; padding: 0; line-height: 1;
+  border: 1px solid var(--line); background: var(--panel-2, #f2f4f8);
+  font-size: 24px; font-weight: 700; color: var(--ink-2); cursor: pointer;
+}
+.stu-zoom-btn:active { background: var(--brand-soft, #e8f0fe); border-color: var(--brand); }
+.stu-zoom-pct { font-size: 11px; font-weight: 600; color: var(--ink-3); }
 
 /* v1.40.0：重置倒计时面板 · ＋/－ 步进数字（类似翻页时钟） */
 .dc-rst-col { display: flex; flex-direction: column; align-items: center; gap: 6px; }

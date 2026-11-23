@@ -2590,7 +2590,12 @@
           '<button class="btn soft grow" data-act="dcalc:reset">↺ 重置</button>' +
           '<button class="btn soft grow" data-act="dcalc:restore">恢复</button>' +
         '</div>' +
-        '<button class="btn soft block mt8" data-act="dcalc:ans">对答案</button>';
+        '<button class="btn soft block mt8" data-act="dcalc:ans">对答案</button>' +
+        '<div class="stu-zoom">' +
+          '<button class="stu-zoom-btn" data-act="dcalc:zoom" data-d="0.1" title="放大">＋</button>' +
+          '<span class="stu-zoom-pct"></span>' +
+          '<button class="stu-zoom-btn" data-act="dcalc:zoom" data-d="-0.1" title="缩小">－</button>' +
+        '</div>';
     }
     return '<section class="card" style="border-left:3px solid var(--brand)">' +
       '<button class="stu-exit" data-act="dcalc:stuExit" title="回到完整版">退出</button>' +
@@ -2599,13 +2604,29 @@
     '</section>';
   }
 
+  /* v1.42.0：学生页缩放 —— 右侧 ＋/－ 调整题目字号比例（0.5~2，存 localStorage，刷新不丢） */
+  function dcStuZoomGet() {
+    let z = 1;
+    try { z = parseFloat(localStorage.getItem('tiku:dcStuZoom')) || 1; } catch (e) {}
+    return Math.min(2, Math.max(0.5, z));
+  }
+  function dcStuZoomApply() {
+    const wrap = document.querySelector('.stu-wrap');
+    if (!wrap) return;
+    wrap.style.setProperty('--dc-zoom', S.dcStuZoom);
+    const lbl = document.querySelector('.stu-zoom-pct');
+    if (lbl) lbl.textContent = Math.round(S.dcStuZoom * 100) + '%';
+  }
+
   function renderStudentDcalc() {
+    S.dcStuZoom = dcStuZoomGet();
     topbar.innerHTML = '';
     topbar.classList.add('hidden');
     document.body.dataset.tab = 'off';
     const fab = document.getElementById('kbFab');
     if (fab) fab.style.display = 'none';
     view.innerHTML = '<div class="stu-wrap">' + dcStudentHtml() + '</div>';
+    dcStuZoomApply();
   }
 
   async function render() {
@@ -9601,6 +9622,13 @@
     /* ---- 学生投屏页 ---- */
     'dcalc:student': function () { location.href = location.pathname + '?dcalc=1'; },
     'dcalc:stuExit': function () { location.href = location.pathname; },
+    /* v1.42.0：学生页 ＋/－ 缩放（步进 0.1，范围 0.5~2，比例存 localStorage） */
+    'dcalc:zoom': function (d) {
+      if (!Number.isFinite(S.dcStuZoom)) S.dcStuZoom = dcStuZoomGet();
+      S.dcStuZoom = Math.min(2, Math.max(0.5, Math.round((S.dcStuZoom + (+d.d || 0)) * 10) / 10));
+      try { localStorage.setItem('tiku:dcStuZoom', String(S.dcStuZoom)); } catch (e) {}
+      dcStuZoomApply();
+    },
 
     /* ---- 选择题答案点选（大写字母，可多选） ---- */
     'draft:ansPick': function (d) {
@@ -12167,6 +12195,7 @@
     dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs, dcEditSheet: dcEditSheet, dcEditApply: dcEditApply,
     dcTrapCount: dcTrapCount, dcTrapGen: dcTrapGen, dcFitGrade: dcFitGrade, dcDiffDesc: dcDiffDesc,
     editDraftImage: editDraftImage, dcStudentHtml: dcStudentHtml,
+    dcStuZoomGet: dcStuZoomGet,   // v1.42.0 学生页缩放
     sortPointsAlike: sortPointsAlike, junkPointName: junkPointName, pointUnitIdxOf: pointUnitIdxOf,
     unitFromPointName: unitFromPointName, pointUnitOf: pointUnitOf, pointSuffixUnitOf: pointSuffixUnitOf, unitIdxOf: unitIdxOf,
     pointMgrSheet: pointMgrSheet, pointMgrBase: pointMgrBase, pointMgrRows: pointMgrRows, pmPaintSelection: pmPaintSelection,
