@@ -65,6 +65,7 @@
    * 导入草稿（确认页未入库时的自动保存 / 恢复）
    * ======================================================= */
   const DRAFT_KEY = 'tiku.draft';
+  const DRAFT_BAK_KEY = 'tiku.draft.bak';   // v1.44.0：草稿历史备份（最近 3 份，防导入覆盖丢题）
 
   function readDraftStore() {
     try { return JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null'); }
@@ -73,6 +74,38 @@
 
   function clearDraftStore() {
     try { localStorage.removeItem(DRAFT_KEY); } catch (e) {}
+  }
+
+  /** 草稿内容指纹：题数＋每题文本/答案/配图数，用来判断「这次保存是不是换了内容」 */
+  function draftSig(d) {
+    return (d && d.drafts ? d.drafts : []).map(function (x) {
+      return (x.text || '').slice(0, 40) + '|' + (x.answer || '') + '|' + (x.images || []).length;
+    }).join('#');
+  }
+
+  function readDraftBaks() {
+    try { return JSON.parse(localStorage.getItem(DRAFT_BAK_KEY) || '[]') || []; } catch (e) { return []; }
+  }
+
+  /** 覆盖前把上一份草稿存进历史（最多 3 份；存不下时去掉配图再存） */
+  function pushDraftBak(prev) {
+    if (!prev || !(prev.drafts || []).length) return;
+    let list = readDraftBaks();
+    const sig = draftSig(prev);
+    if (list.some(function (x) { return x.sig === sig; })) return;   // 同样内容不重复存
+    list.unshift({ at: prev.savedAt || Date.now(), n: prev.drafts.length, sig: sig, withImg: true, data: prev });
+    list = list.slice(0, 3);
+    for (let t = 0; t < 3; t++) {
+      try { localStorage.setItem(DRAFT_BAK_KEY, JSON.stringify(list)); return; }
+      catch (e) {   // 存不下：去掉备份里的配图/图形池再试
+        list.forEach(function (x) {
+          if (!x.withImg) return;
+          x.withImg = false;
+          x.data.drafts.forEach(function (d) { d.images = []; });
+          x.data.pool = [];
+        });
+      }
+    }
   }
 
   function storeDraft() {
@@ -99,6 +132,9 @@
       pool: (s.imgPool || []).slice(),
       savedAt: Date.now(), drafts: plain
     };
+    /* v1.44.0：内容变了就先备份上一份（导入覆盖、手滑丢弃都能找回） */
+    const prev = readDraftStore();
+    if (prev && (prev.drafts || []).length && draftSig(prev) !== draftSig(data)) pushDraftBak(prev);
     try {
       localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
     } catch (e) {
@@ -118,6 +154,19 @@
         } catch (e3) { /* 存不下就算了 */ }
       }
     }
+  }
+
+  /** 草稿快照 → 内存草稿数组（恢复、导入前带上旧草稿都用它） */
+  function draftsFromStoreData(d) {
+    return ((d && d.drafts) || []).map(function (x) {
+      const dd = Object.assign({
+        key: Util.uid('d'), imgIndex: 0, subs: [], options: [],
+        images: [], aiPending: false, pointUser: false
+      }, x);
+      // 老草稿：整批只有一个 reviewOf → 迁到每道题上（之后可逐题改）
+      if (!Array.isArray(dd.reviewUnits)) dd.reviewUnits = (x.reviewOf || d.reviewOf) ? [x.reviewOf || d.reviewOf] : [];
+      return dd;
+    });
   }
 
   /** 离开确认页前询问：保存草稿 / 不保存 / 取消 */
@@ -4544,6 +4593,7 @@
       // 未完成的导入草稿（确认页没入库就退出的）
       const dr = readDraftStore();
       S.cache.homeDraft = (dr && dr.drafts && dr.drafts.length) ? dr : null;
+      S.cache.homeBaks = readDraftBaks();   // v1.44.0：草稿历史备份数
       // 每日计算（状态由配置 + 今天日期决定，每次进首页重建，代价极小）
       S.cache.dcalc = dcalcBuild();
       if (S.dcalc.tick && !document.getElementById('dcTime')) {
@@ -4597,6 +4647,12 @@
                 '<button class="btn danger-soft grow sm" data-act="draft:discard">丢弃</button>' +
               '</div>' +
             '</section>'
+          : '') +
+
+        /* v1.44.0：导入覆盖/误丢弃后找回（有历史备份才显示） */
+        ((S.cache.homeBaks || []).length
+          ? '<button class="btn ghost block sm" data-act="draft:baks" style="margin-top:-2px">🗂 找回更早的草稿（' +
+            S.cache.homeBaks.length + ' 份备份）</button>'
           : '') +
 
         '<div class="quick">' +
@@ -6780,8 +6836,23 @@
       S.session = {
         images: [], subject: S.defaults.subject, grade: S.defaults.grade,
         unit: '', lesson: '', batchName: '', batchDate: '', stage: 'pick',
-        practiceType: '', pageNo: '', docAnsBlocks: []
+        practiceType: '', pageNo: '', docAnsBlocks: [], imgPool: []
       };
+      /* v1.44.0：新一轮导入前，把上次没入库的草稿接进来（新导入的排在后面），不再覆盖丢题 */
+      let carried = (S.drafts || []).slice();
+      const saved = readDraftStore();
+      if (!carried.length && saved && (saved.drafts || []).length) {
+        carried = draftsFromStoreData(saved);
+        (saved.pool || []).forEach(function (src) { if (S.session.imgPool.indexOf(src) < 0) S.session.imgPool.push(src); });
+        carried.forEach(function (x) {
+          (x.images || []).forEach(function (src) { if (S.session.imgPool.indexOf(src) < 0) S.session.imgPool.push(src); });
+        });
+      }
+      if (carried.length) {
+        S.drafts = carried;
+        UI.toast('已带上上次未入库的 ' + carried.length + ' 道草稿，新导入的排在后面', 3800);
+      }
+      S.session.baseDrafts = carried;   // 导入前的底稿（buildDrafts 会拼在它后面）
     }
     return S.session;
   }
@@ -6908,11 +6979,13 @@
     else await navigate('capture', {}, true);
   }
 
-  function clearSession() {
+  function clearSession(keepBase) {
     if (!S.session) return;
+    const base = (S.session.baseDrafts || []).slice();
     S.session.images.forEach(function (im) { URL.revokeObjectURL(im.url); });
     S.session = null;
-    S.drafts = [];
+    /* v1.44.0：导入被取消（查重拦下等）时，之前已带进来的旧草稿要留着 */
+    S.drafts = keepBase ? base : [];
     S.aiFallback = '';
     S.docAnsLeft = [];
   }
@@ -7078,9 +7151,10 @@
     }) === 'yes';
   }
 
-  /** 入库前查重：全重复就拦一下；部分重复只在确认页顶部提示，可一键移除 */
-  async function gateDuplicates() {
-    const r = await dupDraftsOf(S.drafts);
+  /** 入库前查重：全重复就拦一下；部分重复只在确认页顶部提示，可一键移除
+   *  v1.44.0：可只查本次新导入的那批（已有草稿不参与，免得把旧草稿标成重复） */
+  async function gateDuplicates(list) {
+    const r = await dupDraftsOf(list || S.drafts);
     S.dupNote = null;
     if (!r.hit.length) return true;
     if (r.hit.length === r.total) return await askAllDup(r.total);
@@ -7139,11 +7213,12 @@
   /** 文档答案表 → 逐题回填答案框（v1.25.2）
    *  优先按题号对；题号重复（分大题各自从 1 编）或对不上时按顺序填。
    *  已有答案的题不覆盖。返回 { filled, left:[{no,ans}] } */
-  function applyDocAnswers() {
+  function applyDocAnswers(list) {
     const s = S.session;
+    const ds = (list && list.length) ? list : S.drafts;   // v1.44.0：只填本次新导入的题
     if (!s) return { filled: 0, left: [] };
     const blocks = s.docAnsBlocks || [];
-    if (!blocks.length || !S.drafts.length) { S.docAnsLeft = []; return { filled: 0, left: [] }; }
+    if (!blocks.length || !ds.length) { S.docAnsLeft = []; return { filled: 0, left: [] }; }
     const noOf = function (d) {
       const m = String(d && d.no != null ? d.no : '').match(/\d{1,3}/);
       return m ? parseInt(m[0], 10) : 0;
@@ -7155,14 +7230,14 @@
       const map = blocks[0] || {};
       const keys = Object.keys(map).map(Number).filter(function (n) { return n > 0; }).sort(function (a, b) { return a - b; });
       if (!keys.length) { S.docAnsLeft = []; return { filled: 0, left: [] }; }
-      const nos = S.drafts.map(noOf);
+      const nos = ds.map(noOf);
       const pos = nos.filter(function (n) { return n > 0; });
       const uniq = new Set(pos).size === pos.length;
       let byNo = 0;
       nos.forEach(function (n) { if (n && map[n]) byNo++; });
       // 题号可信（不重复且能对上大半）就按题号；否则按顺序
       if (uniq && byNo >= Math.max(1, Math.min(pos.length, keys.length) * 0.8)) {
-        S.drafts.forEach(function (d) {
+        ds.forEach(function (d) {
           const n = noOf(d);
           const a = n ? map[n] : '';
           if (a && !String(d.answer || '').trim()) {
@@ -7172,7 +7247,7 @@
       } else {
         const seq = keys.map(function (k) { return { no: k, ans: map[k] }; });
         seq.forEach(function (it, i) {
-          const d = S.drafts[i];
+          const d = ds[i];
           if (!d) return;
           if (!String(d.answer || '').trim()) {
             d.answer = it.ans; d.answerFromDoc = true; filled++; used[it.no] = 1;
@@ -7191,16 +7266,18 @@
         .forEach(function (k) { flat.push({ no: k, ans: map[k] }); });
     });
     flat.forEach(function (it, i) {
-      const d = S.drafts[i];
+      const d = ds[i];
       if (!d) return;
       if (!String(d.answer || '').trim()) { d.answer = it.ans; d.answerFromDoc = true; filled++; }
     });
-    S.docAnsLeft = flat.slice(S.drafts.length);
+    S.docAnsLeft = flat.slice(ds.length);
     return { filled: filled, left: S.docAnsLeft };
   }
 
   function buildDrafts() {
     const s = S.session;
+    const base = (s.baseDrafts || []).slice();     // v1.44.0：导入前已有的草稿，保持在前
+    const prevPool = (s.imgPool || []).slice();    // 旧草稿/旧一拍的图仍可配
     const drafts = [];
     // 文档识别出的所有图形汇总成"图形池"，供确认页手动配图 / 删除
     const pool = [];
@@ -7209,6 +7286,7 @@
         if (pool.indexOf(src) < 0) pool.push(src);
       });
     });
+    prevPool.forEach(function (src) { if (pool.indexOf(src) < 0) pool.push(src); });
     s.imgPool = pool;
     const usedImg = {};    // 图片序号 → 已归属（一张图只归一道题；同内容的另一张仍可归别的题）
     s.images.forEach(function (im, idx) {
@@ -7253,8 +7331,28 @@
       }
     }
     S.drafts = drafts;
+    /* v1.44.0：已有草稿不丢 —— 新导入的按原顺序接在后面，和旧草稿重复（题干+答案相同）的跳过 */
+    if (base.length) {
+      const seen = {};
+      base.forEach(function (x) { const k = dupKeyOf(x.text).slice(0, 80); if (k) seen[k] = 1; });
+      let nextNo = base.length, skip = 0;
+      const add = [];
+      drafts.forEach(function (d) {
+        const k = dupKeyOf(d.text).slice(0, 80);
+        if (k && seen[k]) { skip++; return; }   // 题干一样就算重复（答案可能一份为空）
+        if (k) seen[k] = 1;
+        d.no = ++nextNo;
+        add.push(d);
+      });
+      S.drafts = base.concat(add);
+      S._lastFresh = add;
+      if (skip) UI.toast('有 ' + skip + ' 道和已有草稿重复，已跳过；新导入的已排在草稿后面', 3600);
+    } else {
+      S.drafts = drafts;
+      S._lastFresh = drafts;
+    }
     // 文档答案表：按题号填进各题答案框（待老师核对），不再集中显示在顶部
-    if (s.docAnsBlocks && s.docAnsBlocks.length) applyDocAnswers();
+    if (s.docAnsBlocks && s.docAnsBlocks.length) applyDocAnswers(S._lastFresh);
   }
 
   async function runOCR() {
@@ -7308,9 +7406,9 @@
 
     buildDrafts();
     // v1.25.1：入库前按题目查重（不看练习名）；全重复会先问一句
-    if (!(await gateDuplicates())) {
+    if (!(await gateDuplicates(S._lastFresh))) {
       UI.toast('已取消，没有导入（题库里已经是这些题）', 2600);
-      clearSession();
+      clearSession(true);   // 旧草稿留着
       await navigate('home');
       return;
     }
@@ -9727,7 +9825,7 @@
         images: [], subject: d.subject || S.defaults.subject, grade: d.grade || S.defaults.grade,
         unit: d.unit || '', batchName: d.batchName || '', batchDate: d.batchDate || '',
         practiceType: d.practiceType || '', pageNo: d.pageNo || '',
-        stage: 'confirm', mode: 'photo', imgPool: []
+        stage: 'confirm', mode: 'photo', imgPool: [], baseDrafts: []
       };
       // 先载入草稿保存的图形池，再合并各题配图（保证后续可重新配图）
       (d.pool || []).forEach(function (src) {
@@ -9755,12 +9853,59 @@
       UI.toast('已恢复草稿（' + S.drafts.length + ' 题）');
     },
     'draft:discard': async function () {
-      const ok = await UI.confirm('丢弃这份草稿？丢弃后无法恢复。');
+      const ok = await UI.confirm('丢弃这份草稿？');
       if (!ok) return;
+      pushDraftBak(readDraftStore());   // v1.44.0：丢弃前留一份，可在「找回更早的草稿」里撤回
       clearDraftStore();
       S.cache.homeDraft = null;
       UI.toast('草稿已丢弃');
       await render();
+    },
+    /* v1.44.0：草稿历史备份 —— 导入覆盖/手滑丢弃后能找回 */
+    'draft:baks': function () {
+      const list = readDraftBaks();
+      if (!list.length) { UI.toast('还没有可以找回的旧草稿'); return; }
+      const body = '<p class="muted" style="margin-bottom:10px">草稿内容每次变化前都会自动留一份（最多 3 份）。导入新文件把旧草稿顶掉、或误点丢弃后，都能从这里找回。</p>' +
+        list.map(function (b, i) {
+          const first = (b.data && b.data.drafts && b.data.drafts[0]) || {};
+          return '<div class="card" style="padding:10px 12px;margin-bottom:8px">' +
+            '<div class="row between" style="gap:8px">' +
+              '<div style="min-width:0"><b>' + b.n + ' 题</b>' +
+                '<p class="muted" style="font-size:12px;margin-top:2px">' + draftTimeStr(b.at) +
+                (b.withImg ? ' · 含配图' : ' · 配图没存下（只有文字）') + '</p></div>' +
+              '<button class="btn primary sm" data-act="draft:bakRestore" data-i="' + i + '">找回这份</button>' +
+            '</div>' +
+            '<p class="muted" style="font-size:12px;margin-top:6px">' + esc(Util.cut(first.text || '', 40)) + '</p>' +
+          '</div>';
+        }).join('');
+      UI.sheet({ title: '找回更早的草稿', body: body });
+    },
+    'draft:bakRestore': async function (d) {
+      const b = readDraftBaks()[+d.i];
+      if (!b || !b.data || !(b.data.drafts || []).length) { UI.toast('这份备份已经不在了'); return; }
+      const data = JSON.parse(JSON.stringify(b.data));
+      const ok = await UI.confirm('找回「' + b.n + ' 题 · ' + draftTimeStr(b.at) + '」这份草稿？\n当前草稿会先自动备份一份，不会丢。');
+      if (!ok) return;
+      S.session = {
+        images: [], subject: data.subject || S.defaults.subject, grade: data.grade || S.defaults.grade,
+        unit: data.unit || '', batchName: data.batchName || '', batchDate: data.batchDate || '',
+        practiceType: data.practiceType || '', pageNo: data.pageNo || '',
+        stage: 'confirm', mode: 'photo', imgPool: [], baseDrafts: []
+      };
+      (data.pool || []).forEach(function (src) {
+        if (S.session.imgPool.indexOf(src) < 0) S.session.imgPool.push(src);
+      });
+      S.drafts = draftsFromStoreData(data);
+      S.drafts.forEach(function (x) {
+        (x.images || []).forEach(function (src) {
+          if (S.session.imgPool.indexOf(src) < 0) S.session.imgPool.push(src);
+        });
+      });
+      S.aiFallback = '';
+      S.cache.homeDraft = null;
+      await navigate('confirm');
+      await classifyDrafts();
+      UI.toast('已找回草稿（' + S.drafts.length + ' 题）', 2600);
     },
     'draft:point': async function (d) {
       const i = +d.i;
@@ -12274,7 +12419,7 @@
       if (!s.batchName) s.batchName = file.name.replace(/\.[a-z0-9]+$/i, '');
       buildDrafts();
       // v1.25.1：查重只看题目本身（题干完全一样），不看练习名/文件名
-      const keep = await gateDuplicates();
+      const keep = await gateDuplicates(S._lastFresh);
       if (!keep) {
         UI.toast('已取消，没有导入（题库里已经是这些题）', 2600);
         clearSession();
@@ -12336,6 +12481,7 @@
   window.__tiku = { S: S, navigate: navigate, UI: UI, ACTIONS: ACTIONS, DB: DB,
     dcodeEncode: dcodeEncode, dcodeDecode: dcodeDecode,
     ensureSession: ensureSession, buildDrafts: buildDrafts, classifyDrafts: classifyDrafts,
+    readDraftStore: readDraftStore, readDraftBaks: readDraftBaks, draftsFromStoreData: draftsFromStoreData, storeDraft: storeDraft,   // v1.44.0 草稿追加/找回
     seedDemo: seedDemo, Store: Store, resolveUnitPoint: resolveUnitPoint, unitSuffixOf: unitSuffixOf,
     dcDaySet: dcDaySet, dcWeightedPool: dcWeightedPool, dcNextMonday: dcNextMonday,
     dcWorkdayIndex: dcWorkdayIndex, dcDateKey: dcDateKey,
