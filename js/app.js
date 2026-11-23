@@ -28,7 +28,7 @@
     solEditQ: null,       // 题库卡片里正在原地编辑思路的题目 id
     solEdit: null,        // 确认页正在原地编辑思路的题下标
     cache: { same: {} },  // same: questionId -> 同考点历史题缓存
-    dcalc: { showAns: false, t0: null, acc: 0, tick: null, base: '00:00' },  // 每日计算 UI 状态
+    dcalc: { showAns: false, t0: null, acc: 0, tick: null, base: '00:00', paused: false, overtime: false, left: 0, end: 0, total: 0, ot0: 0, otPause: 0 },  // 每日计算 UI 状态
     dcalcPick: '',        // 每日计算设置里临时选的年级
     dcalcDirty: false,
     bank: { subject: '全部', grade: '全部', keyword: '', status: '全部', type: '全部', difficulty: '', unit: '', point: '', lesson: '', practice: '', ptype: '', page: '', multiUnit: [], multiPoint: [] },
@@ -212,7 +212,71 @@
   }
   function dcFmtSec(totalSec) {
     const s = Math.max(0, totalSec | 0);
-    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+    const mm = String(m).padStart(2, '0'), ss2 = String(ss).padStart(2, '0');
+    return h > 0 ? h + ':' + mm + ':' + ss2 : m + ':' + ss2;
+  }
+
+  /* v1.38.0：倒计时时长支持 时/分/秒（cfg.timerH/M/S；老配置只有 timerMin，按分钟换算） */
+  function dcTimerSecs() {
+    const cfg = readDcalcCfg() || {};
+    let s;
+    if (cfg.timerH !== undefined || cfg.timerM !== undefined || cfg.timerS !== undefined) {
+      s = (cfg.timerH || 0) * 3600 + (cfg.timerM || 0) * 60 + (cfg.timerS || 0);
+    } else {
+      s = Math.max(1, Math.min(60, cfg.timerMin || 5)) * 60;
+    }
+    return Math.max(1, Math.min(3600 * 5, s));
+  }
+  function dcTimerDesc(sec) {
+    const s = sec === undefined ? dcTimerSecs() : sec;
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+    let out = '';
+    if (h) out += h + ' 时 ';
+    if (m || (h && ss)) out += m + ' 分 ';
+    if (ss || (!h && !m)) out += ss + ' 秒';
+    return out.replace(/\s+$/, '') || (s / 60) + ' 分钟';
+  }
+  /* 倒计时主按钮文案（学生投屏页不带「· 停止」这类操作词，只留大数字） */
+  function dcTimerMainHtml(sec, label) {
+    const suf = (!S.studentMode && label) ? ' · ' + label : '';
+    return '<span id="dcTime" class="dc-time">' + dcFmtSec(sec) + '</span>' + suf;
+  }
+  function dcTimerPauseText() {
+    const b = document.querySelector('[data-act="dcalc:pause"]');
+    if (b) b.textContent = S.dcalc.paused ? '▶ 继续' : '⏸ 暂停';
+  }
+  /* 倒计时心跳：先倒数，到 0 转「超时：」正计时（从 0 秒往上数），直到重置/停止 */
+  function dcTickLoop() {
+    const st = S.dcalc;
+    st.tick = setInterval(function () {
+      const el = document.getElementById('dcTime');
+      const now = Date.now();
+      if (!st.overtime) {
+        const left = Math.round((st.end - now) / 1000);
+        if (left <= 0) {
+          st.overtime = true;
+          st.ot0 = now; st.otPause = 0;
+          if (el) el.textContent = '超时：00:00';
+          UI.toast('⏰ 倒计时结束！开始超时计时');
+          return;
+        }
+        if (el) el.textContent = dcFmtSec(left);
+        return;
+      }
+      const ot = Math.floor((now - st.ot0) / 1000);
+      if (el) el.textContent = '超时：' + dcFmtSec(ot);
+    }, 300);
+  }
+  /* 停止 / 重置：清掉计时，回到设置的初始时长 */
+  function dcTimerStop(msg) {
+    const st = S.dcalc;
+    if (st.tick) { clearInterval(st.tick); st.tick = null; }
+    st.paused = false; st.overtime = false; st.left = 0;
+    const btn = document.querySelector('[data-act="dcalc:timer"]');
+    if (btn) btn.innerHTML = dcTimerMainHtml(dcTimerSecs(), '倒计时开始');
+    dcTimerPauseText();
+    UI.toast(msg || ('已重置到 ' + dcFmtSec(dcTimerSecs())));
   }
 
   /* ---- 计算题型目录（div=true 的题型出现频次自动加倍，默认除法题更多） ---- */
@@ -1294,7 +1358,7 @@
       return '<p class="muted" style="margin-bottom:8px">已经设置好了，下面是当前设置。要改就点「展开修改」。</p>' +
         '<div class="chips" style="flex-wrap:wrap;overflow:visible">' + gradeChips + '</div>' +
         '<div class="dc-sum mt8">' +
-          '<div><span class="k">每天</span><b>' + perNow + '</b> 题　<span class="k">题型</span><b>' + S.dcalcKinds.length + '</b> 种　<span class="k">倒计时</span><b>' + (cfg.timerMin || 5) + '</b> 分钟</div>' +
+          '<div><span class="k">每天</span><b>' + perNow + '</b> 题　<span class="k">题型</span><b>' + S.dcalcKinds.length + '</b> 种　<span class="k">倒计时</span><b>' + dcTimerDesc() + '</b></div>' +
           '<div><span class="k">本周题型（第 ' + dcWeekNoOf(start) + ' 周）</span>' + esc(dcKindsSummary(S.dcalcKinds)) + '</div>' +
           '<div><span class="k">难度</span>' + esc(dcDiffDesc(S.dcalcDiff, perNow)) + '</div>' +
           '<div><span class="k">学期开始</span>' + esc(start) + (S.dcalcNotes.length ? '　<span class="k">备注</span>' + S.dcalcNotes.length + ' 条' : '') + '</div>' +
@@ -1317,8 +1381,12 @@
       '<div class="row mt8" style="gap:8px">' +
         '<div class="field" style="flex:1"><label>每日题数</label>' +
           '<input class="input" type="number" id="dcPerDay" min="1" max="30" value="' + perNow + '"></div>' +
-        '<div class="field" style="flex:1"><label>倒计时（分钟）</label>' +
-          '<input class="input" type="number" id="dcTimerMin" min="1" max="60" value="' + (cfg.timerMin || 5) + '"></div>' +
+        '<div class="field" style="flex:1"><label>倒计时·时</label>' +
+          '<input class="input" type="number" id="dcTimerH" min="0" max="9" value="' + (cfg.timerH || 0) + '"></div>' +
+        '<div class="field" style="flex:1"><label>·分</label>' +
+          '<input class="input" type="number" id="dcTimerM" min="0" max="59" value="' + (cfg.timerM !== undefined ? cfg.timerM : (cfg.timerMin || 5)) + '"></div>' +
+        '<div class="field" style="flex:1"><label>·秒</label>' +
+          '<input class="input" type="number" id="dcTimerS" min="0" max="59" value="' + (cfg.timerS || 0) + '"></div>' +
       '</div>' +
       '<div class="row between mt8" style="align-items:center;margin-bottom:6px">' +
         '<label style="font-weight:600;font-size:13px">难度（看每天几道易错题，不是把数字变大）</label>' +
@@ -1571,7 +1639,7 @@
     }
     // active
     const d = new Date(dc.dateKey + 'T00:00:00');
-    const timerTxt = dc.timerMin + ':00';
+    const timerTxt = dcFmtSec(dcTimerSecs());
     const rows = dc.qs.map(function (g, i) {
       return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span>' +
         '<span class="dc-ans" style="display:none">答案：' + esc(g.a) + '</span></div>';
@@ -1584,6 +1652,10 @@
       '<div class="row mt12" style="gap:8px">' +
         '<button class="btn soft grow" data-act="dcalc:timer"><span id="dcTime" class="dc-time">' + timerTxt + '</span> · 倒计时开始</button>' +
         '<button class="btn primary grow" data-act="dcalc:ans">对答案</button>' +
+      '</div>' +
+      '<div class="row mt8" style="gap:8px">' +
+        '<button class="btn soft grow" data-act="dcalc:pause">⏸ 暂停</button>' +
+        '<button class="btn soft grow" data-act="dcalc:reset">↺ 重置</button>' +
       '</div>' +
       '<button class="btn soft block mt8" data-act="dcalc:student">🖥 学生投屏页（教室浏览器打开，只显示题目和倒计时）</button>' +
     '</section>';
@@ -2456,9 +2528,15 @@
       const d = new Date(dc.dateKey + 'T00:00:00');
       head = '<p class="muted" style="margin-bottom:8px">' + esc(dc.grade) + ' · 第 ' + dc.week + ' 周' + (dc.unit ? ' · ' + esc(dc.unit) : '') + ' · 共 ' + dc.qs.length + ' 题</p>';
       body = dc.qs.map(function (g, i) {
-        return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span></div>';
+        return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span>' +
+          '<span class="dc-ans" style="display:none">答案：' + esc(g.a) + '</span></div>';
       }).join('') +
-        '<button class="btn primary block dc-stu-timer mt12" data-act="dcalc:timer"><span id="dcTime" class="dc-time">' + (dc.timerMin || 5) + ':00</span></button>';
+        '<button class="btn primary block dc-stu-timer mt12" data-act="dcalc:timer"><span id="dcTime" class="dc-time">' + dcFmtSec(dcTimerSecs()) + '</span></button>' +
+        '<div class="row mt8" style="gap:8px">' +
+          '<button class="btn soft grow" data-act="dcalc:pause">⏸ 暂停</button>' +
+          '<button class="btn soft grow" data-act="dcalc:reset">↺ 重置</button>' +
+        '</div>' +
+        '<button class="btn soft block mt8" data-act="dcalc:ans">对答案</button>';
     }
     return '<section class="card" style="border-left:3px solid var(--brand)">' +
       '<button class="stu-exit" data-act="dcalc:stuExit" title="回到完整版">退出</button>' +
@@ -9039,16 +9117,25 @@
       if (!S.dcalcKinds || !S.dcalcKinds.length) { UI.toast('至少选一种计算题型'); return; }
       const startEl = document.getElementById('dcStart');
       const perEl = document.getElementById('dcPerDay');
-      const timerEl = document.getElementById('dcTimerMin');
+      const hEl = document.getElementById('dcTimerH');
+      const mEl = document.getElementById('dcTimerM');
+      const sEl = document.getElementById('dcTimerS');
       const start = (startEl && startEl.value) || cfg.startDate || defaultStartOf(semKeyOf(new Date()));
       const perDay = Math.max(1, Math.min(30, parseInt(perEl && perEl.value, 10) || cfg.perDay || 5));
-      const timerMin = Math.max(1, Math.min(60, parseInt(timerEl && timerEl.value, 10) || cfg.timerMin || 5));
+      /* v1.38.0：倒计时支持 时/分/秒 */
+      const tH = Math.max(0, Math.min(9, parseInt(hEl && hEl.value, 10) || 0));
+      const tM = Math.max(0, Math.min(59, parseInt(mEl && mEl.value, 10) || 0));
+      const tS = Math.max(0, Math.min(59, parseInt(sEl && sEl.value, 10) || 0));
+      const timerTotal = tH * 3600 + tM * 60 + tS;
+      if (timerTotal < 1) { UI.toast('倒计时时长至少 1 秒'); return; }
+      const timerMin = Math.max(1, Math.round(timerTotal / 60));
       const wk = dcWeekKeyOf(start);
       const weekKinds = Object.assign({}, cfg.weekKinds || {});
       weekKinds[wk] = S.dcalcKinds.slice();
       saveDcalcCfg(Object.assign({}, cfg, {
         grade: S.dcalcPick || cfg.grade, term: S.dcalcTerm,
         startDate: start, perDay: perDay, timerMin: timerMin,
+        timerH: tH, timerM: tM, timerS: tS,
         kinds: S.dcalcKinds.slice(), diff: S.dcalcDiff || cfg.diff || 2,
         useBank: dcalcUseBankNow(), notes: (S.dcalcNotes || []).slice(),
         weekKey: wk, weekKinds: weekKinds, kindsSavedAt: Date.now()
@@ -9214,9 +9301,24 @@
       const cfg0 = readDcalcCfg() || {};
       const startEl = document.getElementById('dcStart');
       const perEl = document.getElementById('dcPerDay');
-      const timerEl = document.getElementById('dcTimerMin');
+      const hEl = document.getElementById('dcTimerH');
+      const mEl = document.getElementById('dcTimerM');
+      const sEl = document.getElementById('dcTimerS');
       const perDay = Math.max(1, Math.min(30, parseInt(perEl && perEl.value, 10) || cfg0.perDay || 5));
-      const timerMin = Math.max(1, Math.min(60, parseInt(timerEl && timerEl.value, 10) || cfg0.timerMin || 5));
+      /* v1.38.0：倒计时支持 时/分/秒（表单不在 DOM（折叠）→ 用已存配置） */
+      const tH0 = Math.max(0, Math.min(9, parseInt(hEl && hEl.value, 10) || 0));
+      const tM0 = Math.max(0, Math.min(59, parseInt(mEl && mEl.value, 10) || 0));
+      const tS0 = Math.max(0, Math.min(59, parseInt(sEl && sEl.value, 10) || 0));
+      let timerSec = tH0 * 3600 + tM0 * 60 + tS0;
+      if (!timerSec) {
+        if (cfg0.timerH !== undefined || cfg0.timerM !== undefined || cfg0.timerS !== undefined) {
+          timerSec = (cfg0.timerH || 0) * 3600 + (cfg0.timerM || 0) * 60 + (cfg0.timerS || 0);
+        } else {
+          timerSec = Math.max(1, Math.min(60, cfg0.timerMin || 5)) * 60;
+        }
+      }
+      if (timerSec < 1) timerSec = 300;
+      const timerMin = Math.max(1, Math.round(timerSec / 60));
       const kinds = (S.dcalcKinds && S.dcalcKinds.length) ? S.dcalcKinds.slice()
         : (cfg0.kinds && cfg0.kinds.length ? cfg0.kinds.slice() : dcScopeDefaultKinds(S.dcalcPick || cfg0.grade || S.defaults.grade, S.dcalcTerm || cfg0.term));
       if (!S.dcalcWeak) S.dcalcWeak = await dcCollectWeak();
@@ -9224,7 +9326,9 @@
         grade: S.dcalcPick || cfg0.grade || S.defaults.grade,
         term: S.dcalcTerm || cfg0.term || (S.defaults && S.defaults.term) || '上册',
         startDate: startEl && startEl.value ? startEl.value : (cfg0.startDate || ''),
-        perDay: perDay, timerMin: timerMin, kinds: kinds,
+        perDay: perDay, timerMin: timerMin,
+        timerH: Math.floor(timerSec / 3600), timerM: Math.floor((timerSec % 3600) / 60), timerS: timerSec % 60,
+        kinds: kinds,
         diff: S.dcalcDiff || cfg0.diff || 2,
         useBank: dcalcUseBankNow(),
         weak: S.dcalcWeak,
@@ -9250,6 +9354,7 @@
         grade: draft.grade, term: draft.term || old.term || '上册',
         startDate: draft.startDate, semKey: semKeyOf(new Date()),
         kinds: draft.kinds, perDay: draft.perDay, timerMin: draft.timerMin,
+        timerH: draft.timerH, timerM: draft.timerM, timerS: draft.timerS,
         diff: draft.diff || 2, useBank: draft.useBank !== false, weak: draft.weak || [],
         notes: draft.notes || [],
         confirmed: true, planStart: plan.monday, planSeed: draft.planSeed,
@@ -9384,32 +9489,46 @@
     },
     'dcalc:timer': function () {
       const st = S.dcalc;
-      const btn = document.querySelector('[data-act="dcalc:timer"]');
-      if (st.tick) {   // 倒计时中 → 停止
-        clearInterval(st.tick);
-        st.tick = null;
-        st.left = Math.max(0, Math.round((st.end - Date.now()) / 1000));
-        if (btn) btn.innerHTML = '<span id="dcTime" class="dc-time">' + dcFmtSec(st.left) + '</span> · 倒计时开始';
-        UI.toast('已停止，还剩 ' + dcFmtSec(st.left));
+      if (st.tick || st.paused) {   // 运行中/暂停中 → 停止（回初始时长，同重置）
+        dcTimerStop(st.overtime ? '已停止超时计时' : '已停止');
         return;
       }
-      const cfg = readDcalcCfg() || {};
-      st.total = Math.max(1, Math.min(60, cfg.timerMin || 5)) * 60;
+      st.total = dcTimerSecs();
       st.end = Date.now() + st.total * 1000;
-      st.tick = setInterval(function () {
-        const el = document.getElementById('dcTime');
-        const left = Math.round((st.end - Date.now()) / 1000);
-        if (left <= 0) {
-          clearInterval(st.tick); st.tick = null;
-          if (el) el.textContent = '00:00';
-          UI.toast('⏰ 倒计时结束！');
-          const b2 = document.querySelector('[data-act="dcalc:timer"]');
-          if (b2) b2.innerHTML = '<span id="dcTime" class="dc-time">' + dcFmtSec(st.total) + '</span> · 倒计时开始';
-          return;
-        }
-        if (el) el.textContent = dcFmtSec(left);
-      }, 300);
-      if (btn) btn.innerHTML = '<span id="dcTime" class="dc-time">' + dcFmtSec(st.total) + '</span> · 停止';
+      st.paused = false; st.overtime = false;
+      dcTickLoop();
+      const btn = document.querySelector('[data-act="dcalc:timer"]');
+      if (btn) btn.innerHTML = dcTimerMainHtml(st.total, '停止');
+      dcTimerPauseText();
+    },
+    /* v1.38.0：暂停 ⇄ 继续（倒计时和超时正计时都支持） */
+    'dcalc:pause': function () {
+      const st = S.dcalc;
+      if (st.tick) {   // 运行中 → 暂停
+        const now = Date.now();
+        clearInterval(st.tick); st.tick = null;
+        st.paused = true;
+        if (st.overtime) st.otPause = (now - st.ot0) / 1000;
+        else st.left = Math.max(0, Math.round((st.end - now) / 1000));
+        dcTimerPauseText();
+        UI.toast(st.overtime ? '超时计时已暂停' : '已暂停，还剩 ' + dcFmtSec(st.left));
+        return;
+      }
+      if (st.paused) {   // 暂停中 → 继续
+        const now = Date.now();
+        if (st.overtime) st.ot0 = now - (st.otPause || 0) * 1000;
+        else st.end = now + (st.left || 0) * 1000;
+        st.paused = false;
+        dcTickLoop();
+        dcTimerPauseText();
+        UI.toast('继续');
+        return;
+      }
+      UI.toast('倒计时还没开始');
+    },
+    /* v1.38.0：重置 → 清掉计时/暂停/超时，回到设置的初始时长 */
+    'dcalc:reset': function () {
+      dcTimerStop();
     },
 
     /* ---- 学生投屏页 ---- */
@@ -11923,6 +12042,7 @@
     dcWorkdayIndex: dcWorkdayIndex, dcDateKey: dcDateKey,
     dcCalcAnswer: dcCalcAnswer, dcParseCalcText: dcParseCalcText, calcKindOf: calcKindOf,
     dcOcrSheet: dcOcrSheet, dcalcPlanBody: dcalcPlanBody,
+    dcFmtSec: dcFmtSec, dcTimerSecs: dcTimerSecs, dcTimerDesc: dcTimerDesc,   // v1.38.0 倒计时（时/分/秒 + 暂停/重置/超时）
     dcExtractWeak: dcExtractWeak, dcWeakVaried: dcWeakVaried, dcWeakKind: dcWeakKind,
     dcCollectWeak: dcCollectWeak, readCalcBank: readCalcBank, saveCalcBank: saveCalcBank,
     dcNoteGen: dcNoteGen, dcNoteQs: dcNoteQs, dcEditSheet: dcEditSheet, dcEditApply: dcEditApply,

@@ -1030,3 +1030,25 @@ body.kb-open .sheet { bottom: 272px; max-height: calc(100vh - 330px); }
 }
 .dc-stu-timer { padding: 14px 16px; }
 .dc-stu-timer .dc-time { font-size: 44px; font-weight: 700; letter-spacing: 2px; }
+
+/* v1.38.0：投屏页再放大，题目尽可能铺满整页 */
+.stu-wrap { max-width: 1100px; padding: 14px 18px 48px; }
+.stu-wrap .card {
+  min-height: calc(100vh - 62px);
+  display: flex; flex-direction: column;
+}
+.stu-wrap .card-h h3 { font-size: clamp(20px, 3.2vw, 30px); }
+.stu-wrap .muted { font-size: clamp(14px, 1.8vw, 18px); }
+.stu-wrap .dc-q {
+  font-size: clamp(19px, 2.9vw, 28px);
+  line-height: 1.9;
+  padding: clamp(8px, 1.6vw, 16px) 4px;
+}
+.stu-wrap .dc-num {
+  min-width: clamp(24px, 2.9vw, 34px); height: clamp(24px, 2.9vw, 34px);
+  line-height: calc(clamp(24px, 2.9vw, 34px) - 2px);
+  font-size: clamp(13px, 1.6vw, 17px); margin-right: 12px;
+}
+.stu-wrap .dc-ans { font-size: clamp(15px, 2.1vw, 20px); }
+.stu-wrap .dc-stu-timer { padding: 16px; }
+.stu-wrap .dc-stu-timer .dc-time { font-size: clamp(52px, 8vw, 80px); }
