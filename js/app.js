@@ -237,16 +237,61 @@
     if (ss || (!h && !m)) out += ss + ' 秒';
     return out.replace(/\s+$/, '') || (s / 60) + ' 分钟';
   }
-  /* 倒计时主按钮文案（学生投屏页不带「· 停止」这类操作词，只留大数字） */
-  function dcTimerMainHtml(sec, label) {
+  /* 空闲时主按钮显示的时长：重置面板选过的优先，否则用设置的默认值 */
+  function dcTimerIdleSecs() {
+    return S.dcalc.customSecs || dcTimerSecs();
+  }
+  /* 倒计时主按钮文案（学生投屏页不带「· 暂停」这类操作词，只留大数字） */
+  function dcTimerMainHtml(sec, label, overtime) {
     const suf = (!S.studentMode && label) ? ' · ' + label : '';
-    return '<span id="dcTime" class="dc-time">' + dcFmtSec(sec) + '</span>' + suf;
+    return '<span id="dcTime" class="dc-time">' + (overtime ? '超时：' + dcFmtSec(sec) : dcFmtSec(sec)) + '</span>' + suf;
+  }
+  /* 主按钮按状态刷新：空闲=倒计时开始 / 计时中=暂停 / 暂停中=继续（v1.38.0 点主按钮=暂停/继续） */
+  function dcTimerMainRefresh() {
+    const st = S.dcalc;
+    const btn = document.querySelector('[data-act="dcalc:timer"]');
+    if (!btn) return;
+    const now = Date.now();
+    if (st.tick) {
+      if (st.overtime) btn.innerHTML = dcTimerMainHtml(Math.floor((now - st.ot0) / 1000), '暂停', true);
+      else btn.innerHTML = dcTimerMainHtml(Math.max(0, Math.round((st.end - now) / 1000)), '暂停');
+    } else if (st.paused) {
+      if (st.overtime) btn.innerHTML = dcTimerMainHtml(Math.floor(st.otPause || 0), '继续', true);
+      else btn.innerHTML = dcTimerMainHtml(st.left || 0, '继续');
+    } else {
+      btn.innerHTML = dcTimerMainHtml(dcTimerIdleSecs(), '倒计时开始');
+    }
   }
   function dcTimerPauseText() {
     const b = document.querySelector('[data-act="dcalc:pause"]');
     if (b) b.textContent = S.dcalc.paused ? '▶ 继续' : '⏸ 暂停';
   }
-  /* 倒计时心跳：先倒数，到 0 转「超时：」正计时（从 0 秒往上数），直到重置/停止 */
+  /* 暂停 / 继续：主按钮和暂停按钮共用 */
+  function dcTimerDoPause() {
+    const st = S.dcalc;
+    if (!st.tick) return false;
+    const now = Date.now();
+    clearInterval(st.tick); st.tick = null;
+    st.paused = true;
+    if (st.overtime) st.otPause = (now - st.ot0) / 1000;
+    else st.left = Math.max(0, Math.round((st.end - now) / 1000));
+    dcTimerMainRefresh();
+    dcTimerPauseText();
+    UI.toast(st.overtime ? '超时计时已暂停' : '已暂停，还剩 ' + dcFmtSec(st.left));
+    return true;
+  }
+  function dcTimerDoResume() {
+    const st = S.dcalc;
+    const now = Date.now();
+    if (st.overtime) st.ot0 = now - (st.otPause || 0) * 1000;
+    else st.end = now + (st.left || 0) * 1000;
+    st.paused = false;
+    dcTickLoop();
+    dcTimerMainRefresh();
+    dcTimerPauseText();
+    UI.toast('继续');
+  }
+  /* 倒计时心跳：先倒数，到 0 转「超时：」正计时（从 0 秒往上数），直到重置 */
   function dcTickLoop() {
     const st = S.dcalc;
     st.tick = setInterval(function () {
@@ -268,15 +313,29 @@
       if (el) el.textContent = '超时：' + dcFmtSec(ot);
     }, 300);
   }
-  /* 停止 / 重置：清掉计时，回到设置的初始时长 */
-  function dcTimerStop(msg) {
+  /* v1.38.0：重置面板 —— 「……分……秒」逐位选择（十位分 1-9、个位分 0-9、十位秒 0-5、个位秒 0-9，没选的位按 0） */
+  function dcResetSheetBody() {
     const st = S.dcalc;
-    if (st.tick) { clearInterval(st.tick); st.tick = null; }
-    st.paused = false; st.overtime = false; st.left = 0;
-    const btn = document.querySelector('[data-act="dcalc:timer"]');
-    if (btn) btn.innerHTML = dcTimerMainHtml(dcTimerSecs(), '倒计时开始');
-    dcTimerPauseText();
-    UI.toast(msg || ('已重置到 ' + dcFmtSec(dcTimerSecs())));
+    if (!st.rsel) st.rsel = {};
+    const sel = st.rsel;
+    const m = (sel.m1 || 0) * 10 + (sel.m2 || 0);
+    const s = (sel.s1 || 0) * 10 + (sel.s2 || 0);
+    const col = function (p, opts, lbl) {
+      const chips = opts.map(function (v) {
+        return '<button class="tag' + (sel[p] === v ? ' active' : '') + '" data-act="dcalc:rd" data-p="' + p + '" data-v="' + v + '">' + v + '</button>';
+      }).join('');
+      return '<div class="field" style="flex:1;min-width:56px"><label>' + lbl + '</label>' +
+        '<div style="display:flex;flex-direction:column;gap:6px;max-height:240px;overflow-y:auto;padding:2px">' + chips + '</div></div>';
+    };
+    return '<p class="dc-rst-prev" style="text-align:center;font-size:22px;font-weight:700;margin:0 0 10px">' + m + ' 分 ' + s + ' 秒</p>' +
+      '<div class="row" style="gap:8px;align-items:flex-start">' +
+        col('m1', [1, 2, 3, 4, 5, 6, 7, 8, 9], '分·十位') +
+        col('m2', [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], '分·个位') +
+        col('s1', [0, 1, 2, 3, 4, 5], '秒·十位') +
+        col('s2', [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], '秒·个位') +
+      '</div>' +
+      '<p class="muted" style="font-size:12px;margin:8px 0 0">没选的位默认按 0 算；再点一次可取消。确认后倒计时回到这个时长（不影响设置里的默认值）。</p>' +
+      '<button class="btn primary block mt12" data-act="dcalc:rconfirm">✓ 确认重置</button>';
   }
 
   /* ---- 计算题型目录（div=true 的题型出现频次自动加倍，默认除法题更多） ---- */
@@ -1639,7 +1698,7 @@
     }
     // active
     const d = new Date(dc.dateKey + 'T00:00:00');
-    const timerTxt = dcFmtSec(dcTimerSecs());
+    const timerTxt = dcFmtSec(dcTimerIdleSecs());
     const rows = dc.qs.map(function (g, i) {
       return '<div class="dc-q"><span><span class="dc-num">' + (i + 1) + '</span>' + esc(g.q) + '</span>' +
         '<span class="dc-ans" style="display:none">答案：' + esc(g.a) + '</span></div>';
@@ -9489,46 +9548,49 @@
     },
     'dcalc:timer': function () {
       const st = S.dcalc;
-      if (st.tick || st.paused) {   // 运行中/暂停中 → 停止（回初始时长，同重置）
-        dcTimerStop(st.overtime ? '已停止超时计时' : '已停止');
-        return;
-      }
-      st.total = dcTimerSecs();
+      /* v1.38.0：主按钮 = 开始 / 暂停 / 继续（计时中点它默认暂停，再点继续） */
+      if (st.tick) { dcTimerDoPause(); return; }
+      if (st.paused) { dcTimerDoResume(); return; }
+      st.total = dcTimerIdleSecs();
       st.end = Date.now() + st.total * 1000;
       st.paused = false; st.overtime = false;
       dcTickLoop();
-      const btn = document.querySelector('[data-act="dcalc:timer"]');
-      if (btn) btn.innerHTML = dcTimerMainHtml(st.total, '停止');
+      dcTimerMainRefresh();
       dcTimerPauseText();
     },
-    /* v1.38.0：暂停 ⇄ 继续（倒计时和超时正计时都支持） */
+    /* v1.38.0：暂停 ⇄ 继续（倒计时和超时正计时都支持），与主按钮同逻辑 */
     'dcalc:pause': function () {
       const st = S.dcalc;
-      if (st.tick) {   // 运行中 → 暂停
-        const now = Date.now();
-        clearInterval(st.tick); st.tick = null;
-        st.paused = true;
-        if (st.overtime) st.otPause = (now - st.ot0) / 1000;
-        else st.left = Math.max(0, Math.round((st.end - now) / 1000));
-        dcTimerPauseText();
-        UI.toast(st.overtime ? '超时计时已暂停' : '已暂停，还剩 ' + dcFmtSec(st.left));
-        return;
-      }
-      if (st.paused) {   // 暂停中 → 继续
-        const now = Date.now();
-        if (st.overtime) st.ot0 = now - (st.otPause || 0) * 1000;
-        else st.end = now + (st.left || 0) * 1000;
-        st.paused = false;
-        dcTickLoop();
-        dcTimerPauseText();
-        UI.toast('继续');
-        return;
-      }
+      if (st.tick) { dcTimerDoPause(); return; }
+      if (st.paused) { dcTimerDoResume(); return; }
       UI.toast('倒计时还没开始');
     },
-    /* v1.38.0：重置 → 清掉计时/暂停/超时，回到设置的初始时长 */
+    /* v1.38.0：重置 → 弹「……分……秒」逐位选择面板，确认后回到所选时长 */
     'dcalc:reset': function () {
-      dcTimerStop();
+      S.dcalc.rsel = {};
+      UI.sheet({ title: '重置倒计时 · 选时长', body: dcResetSheetBody() });
+    },
+    /* 重置面板：点某一位数字（再点一次取消该位），顶部预览跟着变 */
+    'dcalc:rd': function (d) {
+      const st = S.dcalc;
+      if (!st.rsel) st.rsel = {};
+      st.rsel[d.p] = (st.rsel[d.p] === +d.v) ? null : +d.v;
+      UI.sheet({ title: '重置倒计时 · 选时长', body: dcResetSheetBody() });
+    },
+    /* 重置面板：确认 → 全 0 拦下；否则清掉计时/暂停/超时，回到所选时长（只影响本次，不动设置默认值） */
+    'dcalc:rconfirm': function () {
+      const st = S.dcalc;
+      const sel = st.rsel || {};
+      const secs = ((sel.m1 || 0) * 10 + (sel.m2 || 0)) * 60 + (sel.s1 || 0) * 10 + (sel.s2 || 0);
+      if (secs < 1) { UI.toast('至少选 1 秒（没选的位按 0 算）'); return; }
+      st.customSecs = secs;
+      st.rsel = null;
+      if (st.tick) { clearInterval(st.tick); st.tick = null; }
+      st.paused = false; st.overtime = false; st.left = 0;
+      UI.close();
+      dcTimerMainRefresh();
+      dcTimerPauseText();
+      UI.toast('已重置为 ' + dcTimerDesc(secs) + '，点「倒计时开始」计时');
     },
 
     /* ---- 学生投屏页 ---- */
