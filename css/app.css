@@ -970,6 +970,27 @@ body.kb-open .sheet { bottom: 272px; max-height: calc(100vh - 330px); }
 .ie-frame { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
 .ie-frame canvas { display: block; border-radius: 4px; background: #fff; }
 .ie-frame .crop-box { box-shadow: 0 0 0 9999px rgba(9, 12, 22, .58); }
+/* v1.43.0：构图 · 绿点旋转手柄（选框上方，长按拖动转到任意角度） */
+.ie-frame .ie-rot {
+  position: absolute; left: 50%; top: -34px; width: 26px; height: 26px;
+  transform: translateX(-50%); cursor: grab; touch-action: none; z-index: 2;
+}
+.ie-frame .ie-rot i {
+  position: absolute; left: 50%; top: 10px; width: 2px; height: 22px;
+  transform: translateX(-50%); background: #34c777;
+}
+.ie-frame .ie-rot::after {
+  content: ""; position: absolute; left: 50%; top: 0; width: 16px; height: 16px;
+  transform: translateX(-50%); border-radius: 50%;
+  background: #34c777; box-shadow: 0 1px 4px rgba(0, 0, 0, .35);
+}
+.ie-frame .ie-rot:active { cursor: grabbing; }
+
+/* v1.43.0：配图长按拖动排序 */
+.dimg-reord .dimg-item { -webkit-touch-callout: none; }
+.dimg-item.dimg-drag { opacity: .55; outline: 2px dashed var(--brand); outline-offset: 2px; cursor: grabbing; }
+body.dimg-reording { user-select: none; -webkit-user-select: none; }
+body.dimg-reording * { cursor: grabbing !important; }
 .ie-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; flex: none; }
 .ie-tools button {
   flex: 1 0 calc(33.33% - 6px); height: 40px; border-radius: 10px;

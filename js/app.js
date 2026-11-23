@@ -2789,20 +2789,24 @@
 
 
   /** 配图缩略图区：1 张整宽；≥2 张自动分列（2 列起随张数上调，最多 3 排）
-   *  opts: { del:'删除动作', id, i, clean, tag } */
+   *  opts: { del:'删除动作', id, i, clean, tag }
+   *  v1.43.0：带 del（可编辑场景）时支持长按拖动排序，data-reord 存保存动作 */
   function imgGridHtml(imgs, opts) {
     opts = opts || {};
     const n = imgs.length;
     const cols = n <= 1 ? 1 : Math.min(4, Math.max(2, Math.ceil(n / 3)));
-    const wrapCls = 'dimg-list ' + (cols > 1 ? 'grid' : 'single') + ' mt8';
+    const wrapCls = 'dimg-list ' + (cols > 1 ? 'grid' : 'single') + ' mt8' + (opts.del ? ' dimg-reord' : '');
     const wrapStyle = cols > 1 ? ' style="grid-template-columns:repeat(' + cols + ',minmax(0,1fr))"' : '';
-    return '<div class="' + wrapCls + '"' + wrapStyle + '>' +
+    const reordAct = opts.del === 'q:imgDel' ? 'q:imgReorder' : 'draft:imgReorder';
+    return '<div class="' + wrapCls + '"' + wrapStyle +
+      (opts.del ? ' data-reord="' + reordAct + '"' + (opts.id ? ' data-id="' + opts.id + '"' : '') +
+        (opts.i !== undefined && opts.i !== null ? ' data-i="' + opts.i + '"' : '') : '') + '>' +
       imgs.map(function (src, k) {
         return '<div class="dimg-item"' + (opts.noZoom ? '' : ' data-act="img:zoom"') +
           (opts.id ? ' data-id="' + opts.id + '"' : '') +
           (opts.draft !== undefined && opts.draft !== null ? ' data-draft="' + opts.draft + '"' : '') +
           ' data-k="' + k + '">' +
-          '<img src="' + src + '" alt="题目图形" loading="lazy">' +
+          '<img src="' + src + '" alt="题目图形" loading="lazy" draggable="false">' +
           (opts.del
             ? '<button class="dimg-x" data-act="' + opts.del + '"' +
                 (opts.id ? ' data-id="' + opts.id + '"' : '') +
@@ -2811,7 +2815,7 @@
             : '') +
           '</div>';
       }).join('') +
-      (cols > 1 ? '<div class="dimg-count" style="grid-column:1/-1">共 ' + n + ' 张配图 · 点任意一张放大</div>' : '') +
+      (cols > 1 ? '<div class="dimg-count" style="grid-column:1/-1">共 ' + n + ' 张配图 · 点任意一张放大' + (opts.del && n > 1 ? ' · 长按拖动排序' : '') + '</div>' : '') +
       '</div>';
   }
 
@@ -7924,10 +7928,11 @@
         '<b>构图</b>' +
         '<button class="ie-t ie-save" data-ie="save">保存</button>' +
       '</div>' +
-      '<p class="ie-hint">拖白框四角裁出要保留的部分；旋转、镜像可以反复点，最后点「保存」替换原图。</p>' +
+      '<p class="ie-hint">拖白框四角裁出要保留的部分；按住上方<b style="color:#34c777">绿点</b>拖动可转到任意角度；旋转、镜像可以反复点，最后点「保存」替换原图。</p>' +
       '<div class="ie-stage"><div class="ie-frame" id="ieFrame">' +
         '<canvas id="ieCanvas"></canvas>' +
         '<div class="crop-box" id="ieBox">' +
+          '<span class="ie-rot" title="按住绿点拖动，转到任意角度"><i></i></span>' +
           '<span class="h nw" data-h="nw"></span><span class="h ne" data-h="ne"></span>' +
           '<span class="h sw" data-h="sw"></span><span class="h se" data-h="se"></span>' +
         '</div>' +
@@ -7942,6 +7947,7 @@
       '<div class="ie-foot"><span id="ieInfo">整图</span>' +
         '<button data-ie="full">选框铺满</button></div>';
     document.body.appendChild(el);
+    ieBindRotate();
 
     IE = { src: src, img: null, rot: 0, flipH: false, flipV: false, onSave: onSave };
 
@@ -7976,13 +7982,43 @@
     });
   }
 
-  /** 把「旋转 + 镜像」画进画布（画布就是输出底图，裁剪在其上量） */
+  /** v1.43.0：构图 · 绿点旋转手柄 —— 按住拖动转到任意角度（靠近 90° 整数倍 4° 内自动吸附） */
+  function ieBindRotate() {
+    const box = document.getElementById('ieBox');
+    const dot = box && box.querySelector('.ie-rot');
+    if (!box || !dot) return;
+    let st = null;   // { cx, cy, startAng, startRot }
+    dot.addEventListener('pointerdown', function (e) {
+      e.preventDefault(); e.stopPropagation();
+      try { dot.setPointerCapture(e.pointerId); } catch (err) {}
+      const r = box.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      st = { cx: cx, cy: cy, startAng: Math.atan2(e.clientY - cy, e.clientX - cx), startRot: IE ? IE.rot : 0 };
+    });
+    dot.addEventListener('pointermove', function (e) {
+      if (!st || !IE) return;
+      e.preventDefault();
+      let deg = st.startRot + (Math.atan2(e.clientY - st.cy, e.clientX - st.cx) - st.startAng) * 180 / Math.PI;
+      const near = Math.round(deg / 90) * 90;
+      if (Math.abs(deg - near) < 4) deg = near;   // 快到正角度时吸附，方便对齐
+      IE.rot = ((deg % 360) + 360) % 360;
+      ieRender();
+      ieInitCrop();
+    });
+    function end() { st = null; }
+    dot.addEventListener('pointerup', end);
+    dot.addEventListener('pointercancel', end);
+  }
+
+  /** 把「旋转（任意角度，v1.43.0）+ 镜像」画进画布（画布就是输出底图，裁剪在其上量） */
   function ieRender() {
     if (!IE || !IE.img) return;
-    const img = IE.img, rot = IE.rot;
-    const swap = rot % 180 !== 0;
-    const W = swap ? img.naturalHeight : img.naturalWidth;
-    const H = swap ? img.naturalWidth : img.naturalHeight;
+    const img = IE.img;
+    const rad = IE.rot * Math.PI / 180;
+    const w = img.naturalWidth, h = img.naturalHeight;
+    /* 任意角度 → 画布取旋转后的外接矩形（90° 整数倍时公式自动退化成交换宽高） */
+    const W = Math.max(1, Math.round(Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad))));
+    const H = Math.max(1, Math.round(Math.abs(w * Math.sin(rad)) + Math.abs(h * Math.cos(rad))));
     const cv = document.getElementById('ieCanvas');
     if (!cv) return;
     cv.width = W; cv.height = H;
@@ -7991,8 +8027,8 @@
     ctx.save();
     ctx.translate(W / 2, H / 2);
     ctx.scale(IE.flipH ? -1 : 1, IE.flipV ? -1 : 1);   // 先镜像再旋转 → 左右/上下按屏幕上看到的来
-    ctx.rotate(rot * Math.PI / 180);
-    ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    ctx.rotate(rad);
+    ctx.drawImage(img, -w / 2, -h / 2);
     ctx.restore();
 
     // 等比缩到舞台内（自己算尺寸，保证白框和画布严格对齐）
@@ -9159,6 +9195,17 @@
       if (!draft) return;
       (draft.images || []).splice(+d.k, 1);
       await render();
+    },
+    /* v1.43.0：确认页草稿配图长按拖动排序 */
+    'draft:imgReorder': function (d) {
+      const draft = S.drafts[+d.i];
+      if (!draft || !draft.images) return;
+      const order = (d.order || '').split(',').map(Number);
+      const imgs = order.map(function (k) { return draft.images[k]; }).filter(Boolean);
+      if (imgs.length !== draft.images.length) return;
+      draft.images = imgs;
+      storeDraft();
+      render();
     },
 
     /* ---- 每日计算（首页） ---- */
@@ -10976,6 +11023,20 @@
       if (d.v) for (let k = 0; k < n; k++) S.imgSel[k] = 1;
       refreshQImgsSheet();
     },
+    /* v1.43.0：长按拖动排序 → 按 DOM 顺序重排一张题的配图（可撤销） */
+    'q:imgReorder': async function (d) {
+      const q = await DB.get('questions', d.id);
+      if (!q || !q.images) return;
+      const order = (d.order || '').split(',').map(Number);
+      const imgs = order.map(function (k) { return q.images[k]; }).filter(Boolean);
+      if (imgs.length !== q.images.length) return;   // 下标异常就不动
+      const before = await Undo.begin([q.id]);
+      await Store.Questions.update(q.id, { images: imgs });
+      await Undo.end('配图排序', before);
+      S.imgSel = {};
+      UI.toast('已保存配图顺序（可撤销）', 2000);
+      await render();
+    },
     'q:imgDel': async function (d) {
       const q = await DB.get('questions', d.id);
       if (!q || !q.images) return;
@@ -12042,6 +12103,97 @@
     document.addEventListener('pointercancel', endDrag, true);
   })();
 
+  /* v1.43.0：配图长按拖动排序 —— 作用于所有 .dimg-reord 容器（题库配图、确认页草稿配图）。
+     长按 350ms 进入拖动；拖到哪张图上就实时交换位置；松手按 DOM 顺序保存。
+     长按前进过的触摸/鼠标拖动不会触发排序（只算普通点击或滚动），拖动结束的那次 click 被拦掉。 */
+  (function () {
+    let st = null;   // { item, cont, timer, dragging, x0, y0, moved, pointerId, touch }
+
+    function items(cont) { return Array.prototype.slice.call(cont.querySelectorAll('.dimg-item')); }
+
+    function startDrag(e) {
+      st.dragging = true;
+      st.item.classList.add('dimg-drag');
+      document.body.classList.add('dimg-reording');
+      st.item.setPointerCapture && (function () { try { st.item.setPointerCapture(st.pointerId); } catch (err) {} })();
+      UI.toast('松手保存顺序', 1200);
+      moveDrag(e);
+    }
+
+    function moveDrag(e) {
+      const cont = st.cont;
+      const els = items(cont).filter(function (el) { return el !== st.item; });
+      let target = null;
+      for (let i = 0; i < els.length; i++) {
+        const r = els[i].getBoundingClientRect();
+        if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) { target = els[i]; break; }
+      }
+      if (target) {
+        const rs = items(cont);
+        const ti = rs.indexOf(target), si = rs.indexOf(st.item);
+        if (ti < si) cont.insertBefore(st.item, target);
+        else if (ti > si) cont.insertBefore(st.item, target.nextSibling);
+      }
+    }
+
+    function finish(cancel) {
+      if (!st) return;
+      clearTimeout(st.timer);
+      document.removeEventListener('touchmove', stopTouch, true);
+      const cont = st.cont, item = st.item, wasDragging = st.dragging;
+      item.classList.remove('dimg-drag');
+      document.body.classList.remove('dimg-reording');
+      st = null;
+      if (!wasDragging) return;
+      /* 拖动过的松手：拦掉随后那次 click（不放大图片） */
+      document.addEventListener('click', function (ev) { ev.stopPropagation(); ev.preventDefault(); },
+        { capture: true, once: true });
+      if (cancel) return;
+      /* 按 DOM 顺序算出新下标，有变化才保存 */
+      const order = items(cont).map(function (el) { return +el.dataset.k; });
+      const changed = order.some(function (k, idx) { return k !== idx; });
+      if (!changed) return;
+      const act = cont.dataset.reord;
+      const d = { order: order.join(',') };
+      if (cont.dataset.id) d.id = cont.dataset.id;
+      if (cont.dataset.i !== undefined) d.i = cont.dataset.i;
+      const fn = ACTIONS[act];
+      if (fn) { try { const r = fn(d); if (r && r.catch) r.catch(function (err) { UI.toast(err.message || '保存失败'); }); } catch (err) { UI.toast(err.message || '保存失败'); } }
+    }
+
+    function stopTouch(e) { if (st && st.dragging) e.preventDefault(); }
+
+    document.addEventListener('pointerdown', function (e) {
+      if (e.button !== 0 && e.pointerType === 'mouse') return;
+      const item = e.target.closest('.dimg-reord .dimg-item');
+      if (!item) return;
+      if (e.target.closest('.dimg-x')) return;          // 删除按钮照常点
+      const cont = item.closest('.dimg-reord');
+      if (items(cont).length < 2) return;               // 只有一张不用排
+      st = { item: item, cont: cont, x0: e.clientX, y0: e.clientY, pointerId: e.pointerId, dragging: false, timer: null };
+      st.timer = setTimeout(function () { if (st) startDrag(e); }, 350);
+      document.addEventListener('touchmove', stopTouch, { capture: true, passive: false });
+    }, { passive: true });
+
+    document.addEventListener('pointermove', function (e) {
+      if (!st) return;
+      if (!st.dragging) {
+        /* 长按前进过 10px 就当普通手势（滚动/点击），取消计时 */
+        if (Math.abs(e.clientX - st.x0) > 10 || Math.abs(e.clientY - st.y0) > 10) { clearTimeout(st.timer); document.removeEventListener('touchmove', stopTouch, true); st = null; }
+        return;
+      }
+      e.preventDefault();
+      moveDrag(e);
+    }, { passive: false });
+
+    document.addEventListener('pointerup', function (e) { finish(false); }, true);
+    document.addEventListener('pointercancel', function (e) { finish(true); }, true);
+    /* 手机长按图片会弹系统菜单，拦掉，让长按专门用于排序 */
+    document.addEventListener('contextmenu', function (e) {
+      if (e.target.closest && e.target.closest('.dimg-reord .dimg-item')) e.preventDefault();
+    });
+  })();
+
   if (window.visualViewport) {
     window.visualViewport.addEventListener('resize', kbKeepVisible);
     window.visualViewport.addEventListener('scroll', kbKeepVisible);
@@ -12196,6 +12348,7 @@
     dcTrapCount: dcTrapCount, dcTrapGen: dcTrapGen, dcFitGrade: dcFitGrade, dcDiffDesc: dcDiffDesc,
     editDraftImage: editDraftImage, dcStudentHtml: dcStudentHtml,
     dcStuZoomGet: dcStuZoomGet,   // v1.42.0 学生页缩放
+    imgGridHtml: imgGridHtml, openImgEditor: openImgEditor, ieRotNow: function () { return IE ? IE.rot : null; },   // v1.43.0 配图排序/构图旋转
     sortPointsAlike: sortPointsAlike, junkPointName: junkPointName, pointUnitIdxOf: pointUnitIdxOf,
     unitFromPointName: unitFromPointName, pointUnitOf: pointUnitOf, pointSuffixUnitOf: pointSuffixUnitOf, unitIdxOf: unitIdxOf,
     pointMgrSheet: pointMgrSheet, pointMgrBase: pointMgrBase, pointMgrRows: pointMgrRows, pmPaintSelection: pmPaintSelection,
